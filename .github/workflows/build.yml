@@ -1,0 +1,40 @@
+# Copyright 2026 514 LLC d/b/a OpenGlow
+# Written by Scott Wiederhold
+# https://community.openglow.org
+# SPDX-License-Identifier:    MIT
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libjansson-dev libarchive-dev libsodium-dev
+      - name: fwup 1.16.0 (the version the image carries)
+        run: |
+          curl -fsSL -o /tmp/fwup.deb https://github.com/fwup-home/fwup/releases/download/v1.16.0/fwup_1.16.0_amd64.deb
+          sudo dpkg -i /tmp/fwup.deb
+          fwup --version
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Werror
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: caps_test (the closed capability list)
+        run: ./build/caps_test
+      - name: manifest_test (the manifest parser, and each way of being wrong)
+        run: ./build/manifest_test
+      - name: state_test (state.json, the account pool, a file this daemon did not write)
+        run: ./build/state_test
+      - name: install_test (the built binary against real archives, hostile ones included)
+        run: |
+          # 77 is the script's "could not run here": on this runner that is a failure.
+          python3 -B tests/install_test.py
