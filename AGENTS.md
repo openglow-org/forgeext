@@ -20,11 +20,15 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Werror
 cmake --build build
 ./build/caps_test && ./build/manifest_test && ./build/state_test
 FWUP=/path/to/fwup python3 -B tests/install_test.py
+sudo ./build/sandbox_test
 ```
 
 A warning is a failure. `tests/install_test.py` drives the built binary
 against real archives made with fwup and throwaway keys, hostile ones
-included; it needs fwup 1.x and exits 77 without it.
+included; it needs fwup 1.x and exits 77 without it. `sandbox_test` starts a
+real child under the launcher and looks at it from inside and from outside;
+it needs root and cgroup v2 and exits 77 without them. What it cannot see on
+a kernel without landlock's TCP rules (ABI 4) it sees on the machine.
 
 ### Rules specific to this repository
 
@@ -48,6 +52,10 @@ included; it needs fwup 1.x and exits 77 without it.
 - **Every path is built to fit.** The root is bounded once and every
   `snprintf` of a path carries precisions, so none can be cut short and act
   on another path.
+- **A step of the launcher that cannot be taken is a failed start**, never
+  a looser sandbox. The child reports the step by name and is killed.
+- **Nothing of a package runs before it is in its cgroup.** The child waits
+  on a pipe until the parent has put it there.
 - **A new check gets a negative control**: break it in a scratch copy and
   see the test fail.
 - `fflog.c` and `fflog.h` are vendored verbatim from forgectrl; keep the
