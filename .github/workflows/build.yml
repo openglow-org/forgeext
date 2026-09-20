@@ -15,10 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout forgefirm (the image's deny rules, which the network allowlist is tested against)
+        uses: actions/checkout@v4
+        with:
+          repository: openglow-org/forgefirm
+          path: forgefirm-rules
       - name: Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libjansson-dev libarchive-dev libsodium-dev
+          sudo apt-get install -y -qq libjansson-dev libarchive-dev libsodium-dev nftables
       - name: fwup 1.16.0 (the version the image carries)
         run: |
           curl -fsSL -o /tmp/fwup.deb https://github.com/fwup-home/fwup/releases/download/v1.16.0/fwup_1.16.0_amd64.deb
@@ -38,6 +43,10 @@ jobs:
         run: |
           # 77 is the test's "could not run here": on this runner that is a failure.
           sudo ./build/sandbox_test
+      - name: netrules_test (net-check, net-allow, net-revoke against the image's rule file, with a peer namespace)
+        run: |
+          sudo FORGEEXT=build/forgeext FFX_RULES=forgefirm-rules/meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files/ffx.nft \
+            python3 -B tests/netrules_test.py
       - name: install_test (the built binary against real archives, hostile ones included)
         run: |
           # 77 is the script's "could not run here": on this runner that is a failure.

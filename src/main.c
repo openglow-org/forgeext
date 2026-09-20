@@ -17,6 +17,7 @@
 #include "fflog.h"
 #include "install.h"
 #include "manifest.h"
+#include "netrules.h"
 #include "pkg.h"
 #include "state.h"
 
@@ -30,11 +31,16 @@ static int usage(void)
             "  check [<id>]                       do the installed files still match what was installed\n"
             "  remove <id> [--keep-data]\n"
             "  caps                               the capabilities a manifest may ask for\n"
+            "  net-check                          is the image's deny table loaded, and the image's\n"
+            "  net-allow <uid> [--listen <port>] [--dns] [<host>:<port>]...\n"
+            "                                     give a pool account its way through (what a service start does)\n"
+            "  net-revoke <uid>                   and take it away\n"
             "options:\n"
             "  --root <dir>            the extension root (default " EXT_ROOT_DEFAULT ")\n"
             "  --fwup <path>           the fwup binary (default: fwup on PATH)\n"
             "  --official-key <file>   the OpenGlow extension public key\n"
             "  --firmware-key <path>   a key, or a directory of keys, that signs firmware (twice at most)\n"
+            "  --nft <path>            the nft binary (default /usr/sbin/nft)\n"
             "  --budget-mib <n>        what every installed package may hold together (default %lld)\n"
             "  --no-reserve            do not keep free space back for a firmware update\n",
             EXT_BUDGET_DEFAULT >> 20);
@@ -176,6 +182,7 @@ int main(int argc, char **argv)
 {
     char err[768] = "", keys_dir[512];
     ext_env_t env;
+    net_env_t net = { NULL };
     int i = 1, nfw = 0;
 
     ext_env_defaults(&env);
@@ -194,6 +201,8 @@ int main(int argc, char **argv)
             env.trust.owner_keys_dir = keys_dir;
         } else if (strcmp(opt, "--fwup") == 0) {
             env.trust.fwup = val;
+        } else if (strcmp(opt, "--nft") == 0) {
+            net.nft = val;
         } else if (strcmp(opt, "--budget-mib") == 0) {
             env.budget_bytes = atoll(val) << 20;
             if (env.budget_bytes <= 0)
@@ -219,6 +228,34 @@ int main(int argc, char **argv)
         return cmd_list(&env, NULL, 0);
     if (strcmp(cmd, "check") == 0)
         return cmd_list(&env, i < argc ? argv[i] : NULL, 1);
+
+    if (strcmp(cmd, "net-check") == 0) {
+        if (net_base_ok(&net, err, sizeof(err)) != 0)
+            return refuse(err);
+        return answer(json_object(), 1);
+    }
+    if ((strcmp(cmd, "net-allow") == 0 || strcmp(cmd, "net-revoke") == 0) && i < argc) {
+        int allow = strcmp(cmd, "net-allow") == 0, listen_port = 0, dns = 0, n = 0;
+        uid_t uid = (uid_t)atoi(argv[i++]);
+        static net_dest_t dests[NET_MAX_DESTS];
+        for (; allow && i < argc; i++) {
+            if (strcmp(argv[i], "--dns") == 0) {
+                dns = 1;
+            } else if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
+                listen_port = atoi(argv[++i]);
+            } else if (n < NET_MAX_DESTS && caps_outbound_parse(argv[i], dests[n].host, sizeof(dests[n].host), &dests[n].port) == 0) {
+                n++;
+            } else {
+                return refuse("a destination is host:port, the host a lowercase DNS name, an IPv4 address, or an "
+                              "IPv6 address in brackets");
+            }
+        }
+        if (net_base_ok(&net, err, sizeof(err)) != 0
+            || (allow ? net_allow(&net, uid, dests, n, listen_port, dns, err, sizeof(err))
+                      : net_revoke(&net, uid, err, sizeof(err))) != 0)
+            return refuse(err);
+        return answer(json_object(), 1);
+    }
 
     if (strcmp(cmd, "inspect") == 0 && i < argc) {
         install_result_t *res = calloc(1, sizeof(*res));

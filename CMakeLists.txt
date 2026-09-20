@@ -22,6 +22,7 @@ add_library(forgeext_core STATIC
   src/install.c
   src/cgroup.c
   src/sandbox.c
+  src/netrules.c
   src/fflog.c)
 target_include_directories(forgeext_core PUBLIC src
   ${JANSSON_INCLUDE_DIRS} ${LIBARCHIVE_INCLUDE_DIRS} ${SODIUM_INCLUDE_DIRS})

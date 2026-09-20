@@ -21,6 +21,7 @@ cmake --build build
 ./build/caps_test && ./build/manifest_test && ./build/state_test
 FWUP=/path/to/fwup python3 -B tests/install_test.py
 sudo ./build/sandbox_test
+sudo FORGEEXT=build/forgeext python3 -B tests/netrules_test.py
 ```
 
 A warning is a failure. `tests/install_test.py` drives the built binary
@@ -29,6 +30,10 @@ included; it needs fwup 1.x and exits 77 without it. `sandbox_test` starts a
 real child under the launcher and looks at it from inside and from outside;
 it needs root and cgroup v2 and exits 77 without them. What it cannot see on
 a kernel without landlock's TCP rules (ABI 4) it sees on the machine.
+`tests/netrules_test.py` loads the image's rule file (`ffx.nft`, from a
+sibling `forgefirm` checkout or `FFX_RULES`) into a network namespace with a
+peer on a veth pair and drives `net-check`, `net-allow`, and `net-revoke`;
+it needs root, nft, ip, and nsenter.
 
 ### Rules specific to this repository
 
@@ -56,6 +61,10 @@ a kernel without landlock's TCP rules (ABI 4) it sees on the machine.
   a looser sandbox. The child reports the step by name and is killed.
 - **Nothing of a package runs before it is in its cgroup.** The child waits
   on a pipe until the parent has put it there.
+- **A network rule names an address, never a name**: what was resolved and
+  judged is what is allowed. `netrules.c` is the only writer of the image
+  table's `allow` map, and no service starts unless `net_base_ok` finds the
+  table loaded and the image's.
 - **A new check gets a negative control**: break it in a scratch copy and
   see the test fail.
 - `fflog.c` and `fflog.h` are vendored verbatim from forgectrl; keep the
