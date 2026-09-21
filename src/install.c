@@ -50,6 +50,23 @@ void ext_env_defaults(ext_env_t *env)
     env->trust.firmware_keys[1] = KEY_FW_FACTORY;
     env->budget_bytes = EXT_BUDGET_DEFAULT;
     env->reserve_bytes = EXT_RESERVE_DEFAULT;
+    ext_read_core_version(env->core_version, sizeof(env->core_version));
+}
+
+void ext_read_core_version(char *out, size_t olen)
+{
+    FILE *f = fopen(EXT_VERSION_FILE, "re");
+    char line[128];
+    out[0] = '\0';
+    if (!f)
+        return;
+    if (fgets(line, sizeof(line), f)) {
+        /* "0.0.7", or "20260921190848 (dev)": the first word either way. */
+        size_t n = strcspn(line, " \t\r\n");
+        if (n < olen)
+            snprintf(out, olen, "%.*s", (int)n, line);
+    }
+    fclose(f);
 }
 
 int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
@@ -190,6 +207,21 @@ static int judge(const ext_env_t *env, state_t *st, install_result_t *res, char 
     if (manifest_id_reserved(m->id) && res->info.tier != TIER_OFFICIAL)
         return fail(err, elen, "the id %s is in OpenGlow's namespace, and this archive is not signed with "
                                "the OpenGlow extension key", m->id);
+
+    /* The firmware range the package says it needs. A dev image's version
+     * is a build stamp and no version at all, so there is nothing to
+     * compare against and the range is not judged; res->core_checked says
+     * which of the two happened, so that an operator is never left to
+     * guess whether the range was honored. */
+    res->core_checked = manifest_version_ok(env->core_version);
+    if (res->core_checked) {
+        if (m->core_min[0] && manifest_version_cmp(env->core_version, m->core_min) < 0)
+            return fail(err, elen, "this package needs firmware %s or newer, and this is %s",
+                        m->core_min, env->core_version);
+        if (m->core_max[0] && manifest_version_cmp(env->core_version, m->core_max) > 0)
+            return fail(err, elen, "this package needs firmware %s or older, and this is %s",
+                        m->core_max, env->core_version);
+    }
 
     state_pkg_t *have = state_find(st, m->id);
     res->update = have != NULL;

@@ -50,6 +50,7 @@ static int usage(void)
             "  --firmware-key <path>   a key, or a directory of keys, that signs firmware (twice at most)\n"
             "  --nft <path>            the nft binary (default /usr/sbin/nft)\n"
             "  --budget-mib <n>        what every installed package may hold together (default %lld)\n"
+            "  --core-version <v>  this firmware's version, for a package's core range\n"
             "  --no-reserve            do not keep free space back for a firmware update\n",
             EXT_BUDGET_DEFAULT >> 20);
     return 2;
@@ -114,6 +115,10 @@ static json_t *result_json(install_result_t *r)
     json_object_set_new(j, "from_version", json_string(r->from_version));
     json_object_set_new(j, "needs_grant", strings(r->needs_grant, r->nneeds));
     json_object_set_new(j, "new_capabilities", strings(r->new_caps, r->nnew));
+    /* Whether the package's "core" range was judged at all. A dev image's
+     * version is a build stamp, so there is nothing to compare against;
+     * saying so beats leaving an operator to guess. */
+    json_object_set_new(j, "core_checked", json_boolean(r->core_checked));
     return j;
 }
 
@@ -217,6 +222,8 @@ int main(int argc, char **argv)
             env.budget_bytes = atoll(val) << 20;
             if (env.budget_bytes <= 0)
                 return usage();
+        } else if (strcmp(opt, "--core-version") == 0) {
+            snprintf(env.core_version, sizeof(env.core_version), "%s", val);
         } else if (strcmp(opt, "--official-key") == 0) {
             env.trust.official_key = val;
         } else if (strcmp(opt, "--firmware-key") == 0 && nfw < 2) {

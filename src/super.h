@@ -105,6 +105,18 @@ void super_tick(super_t *sv, const super_inputs_t *in, double now);
 void super_child_exited(super_t *sv, pid_t pid, int status, double now);
 void super_stop_all(super_t *sv, const char *why);
 
+/* Set one service aside for a reason of the caller's, as the supervisor
+ * sets aside one that keeps ending: it is stopped, it is remembered as
+ * quarantined across restarts, and the operator's enable is what lets it
+ * out. 0 when there is no such running service. */
+int super_quarantine(super_t *sv, const char *id, const char *why);
+
+/* Set one service aside for a reason of the caller's, as the supervisor
+ * sets aside one that keeps ending: it is stopped, it is remembered as
+ * quarantined across restarts, and the operator's enable is what lets it
+ * out. 0 when there is no such running service. */
+int super_quarantine(super_t *sv, const char *id, const char *why);
+
 int super_running(const super_t *sv);
 const char *super_state_name(svc_state_t s);
 

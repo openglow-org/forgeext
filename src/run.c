@@ -53,6 +53,7 @@ typedef struct {
     char last_status[8192];
     char unreachable[300];                      /* the last word on a root no account can walk to, said once */
     holdkeep_t holds;
+    double quota_at;                            /* when the data directories were last measured */
     evfeed_t feed;
     api_t api;
     char dropped[SUPER_MAX_SERVICES][64];       /* the advisory holds dropped at the last turn, each said once */
@@ -330,6 +331,44 @@ static void op_log(void *ctx, int prio, const char *text)
 }
 
 static const super_ops_t OPS = { op_start, op_stop, op_freeze, op_job_limits, op_quarantine, op_healthy, op_log };
+
+/* ---- the storage quota --------------------------------------------------------- */
+
+/* Each running service's data directory, measured on its own slow
+ * cadence. A service over what its manifest asked for is quarantined:
+ * stopped, remembered, and shown with the reason. The host does not
+ * delete a package's data - that is the operator's to do, by removing
+ * the package or by clearing the directory and enabling it again. */
+static void quota_turn(run_t *r, super_t *sv, double now)
+{
+    if (now - r->quota_at < QUOTA_EVERY_S)
+        return;
+    r->quota_at = now;
+    for (int i = 0; i < sv->n; i++) {
+        svc_t *s = &sv->svc[i];
+        manifest_t m;
+        char data[420], err[300];
+        if (s->state != SVC_RUNNING)
+            continue;
+        if (ext_manifest_of(&r->cfg->ext, s->id, &m, err, sizeof(err)) != 0)
+            continue;
+        snprintf(data, sizeof(data), "%.255s/data/%.63s", r->cfg->ext.root, s->id);
+        long long used = quota_dir_bytes(data), may = quota_of(&m);
+        if (used < 0 || used <= may)
+            continue;
+        fflog(LOG_WARNING, "%s: its data directory holds %lld MiB and it may hold %lld: set aside",
+              s->id, used >> 20, may >> 20);
+        /* The reason is built here and not in s->reason: the supervisor
+         * stops the service first, which writes its own words there, and
+         * a reason that pointed at that buffer would be gone by the time
+         * it was copied back. */
+        char why[160];
+        snprintf(why, sizeof(why),
+                 "its data directory holds %lld MiB and it may hold %lld: remove the package, or clear "
+                 "its data and enable it again", used >> 20, may >> 20);
+        super_quarantine(sv, s->id, why);
+    }
+}
 
 /* ---- a package's own settings ------------------------------------------------- */
 
@@ -634,6 +673,7 @@ int run_daemon(const run_cfg_t *cfg)
         super_inputs_t in = { mc.enabled, mc.may_start, mc.armed, mc.mode_cloud, mc.off_reason };
         if (!stopping)
             super_tick(&sv, &in, mono());
+        quota_turn(&r, &sv, mono());
         holds_turn(&r, &sv, &in);
         /* The machine's stream is held while somebody reads it and let go
          * when nobody does: forgectrl samples its own state only while a

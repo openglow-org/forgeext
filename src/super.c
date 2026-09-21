@@ -105,6 +105,24 @@ static void stop(super_t *sv, svc_t *s, const char *reason)
     why(s, "%s", reason);
 }
 
+int super_quarantine(super_t *sv, const char *id, const char *reason)
+{
+    for (int i = 0; i < sv->n; i++) {
+        svc_t *s = &sv->svc[i];
+        if (strcmp(s->id, id) != 0 || s->state != SVC_RUNNING)
+            continue;
+        stop(sv, s, reason);
+        s->state = SVC_QUARANTINED;
+        s->wanted = 0;                                  /* until a sync finds the operator has let it out */
+        snprintf(s->reason, sizeof(s->reason), "%s", reason);
+        say(sv, LOG_ERR, "%s: %s", s->id, s->reason);
+        if (sv->ops->quarantine)
+            sv->ops->quarantine(sv->ctx, s, s->reason);
+        return 1;
+    }
+    return 0;
+}
+
 void super_stop_all(super_t *sv, const char *reason)
 {
     for (int i = 0; i < sv->n; i++)

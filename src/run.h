@@ -13,6 +13,7 @@
 #include "install.h"
 #include "machine.h"
 #include "netrules.h"
+#include "quota.h"
 #include "settings.h"
 
 #define RUN_DIR_DEFAULT     "/run/forgefirm/ext"

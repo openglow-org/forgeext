@@ -66,10 +66,11 @@ class World:
     def pub(self, name):
         return self.keys[name][:-5] + ".pub"
 
-    def run(self, *args, budget=None):
+    def run(self, *args, budget=None, core=None):
         cmd = [FORGEEXT, "--root", self.root, "--fwup", FWUP, "--official-key", self.pub("official"),
                "--firmware-key", self.pub("firmware"), "--no-reserve"]
-        cmd += (["--budget-mib", str(budget)] if budget else []) + list(args)
+        cmd += (["--budget-mib", str(budget)] if budget else [])
+        cmd += (["--core-version", core] if core else []) + list(args)
         p = subprocess.run(cmd, capture_output=True, text=True)
         try:
             out = json.loads(p.stdout)
@@ -154,6 +155,46 @@ def member(name, data=b"x", type_=tarfile.REGTYPE, linkname="", mode=0o644):
 
 def manifest_member(m):
     return member("manifest.json", json.dumps(m).encode())
+
+
+def core_range(t):
+    """A package's "core" range against the firmware's own version. The
+    version comes from the command line here; on a machine it is read from
+    /etc/forgefirm-version, which on a dev image holds a build stamp and no
+    version at all, and then there is nothing to compare and nothing is
+    refused."""
+    a = t.pack(t.tree(manifest("org.example.core", core={"min": "0.0.7"}), RUN), "owner")
+    r = t.run("inspect", a, core="0.0.9")
+    check(r.get("ok") is True and r.get("core_checked") is True,
+          "core.min 0.0.7 on firmware 0.0.9 is taken: %s" % r.get("error"))
+    r = t.run("inspect", a, core="0.0.5")
+    check(r.get("ok") is False and "0.0.7 or newer" in (r.get("error") or ""),
+          "core.min 0.0.7 on firmware 0.0.5 is refused: %s" % r.get("error"))
+    r = t.run("inspect", a, core="0.0.7")
+    check(r.get("ok") is True, "core.min is a floor the firmware may stand on: %s" % r.get("error"))
+
+    b = t.pack(t.tree(manifest("org.example.core2", core={"max": "0.0.7"}), RUN), "owner")
+    r = t.run("inspect", b, core="0.0.9")
+    check(r.get("ok") is False and "0.0.7 or older" in (r.get("error") or ""),
+          "core.max 0.0.7 on firmware 0.0.9 is refused: %s" % r.get("error"))
+    r = t.run("inspect", b, core="0.0.5")
+    check(r.get("ok") is True, "core.max 0.0.7 on firmware 0.0.5 is taken: %s" % r.get("error"))
+
+    # A build stamp is no version: nothing to compare against, and the
+    # answer says so rather than leaving it to be guessed at.
+    r = t.run("inspect", a, core="20260921190848")
+    check(r.get("ok") is True and r.get("core_checked") is False,
+          "a build stamp judges nothing, and says so: %s" % r)
+    r = t.run("inspect", a, core="")
+    check(r.get("ok") is True and r.get("core_checked") is False,
+          "no firmware version judges nothing: %s" % r)
+
+    # It is a gate on installing, not only on looking.
+    r = t.run("install", a, core="0.0.5")
+    check(r.get("ok") is False and "0.0.7 or newer" in (r.get("error") or ""),
+          "the range is a gate on the install too: %s" % r.get("error"))
+    check("org.example.core" not in [x.get("id") for x in t.run("list").get("packages", [])],
+          "a package refused by its core range was installed anyway")
 
 
 def main():
@@ -449,6 +490,9 @@ def run_all(w, top):
     check(w.run("inspect", community).get("tier") == "unverified", "without it the same package is unverified")
     check(w.run("key-remove", "maker").get("ok") is False, "removing a key that is not there")
     check(w.run("key-remove", "../../etc/passwd").get("ok") is False, "removing a path")
+
+    print("the firmware range a package says it needs")
+    core_range(w)
 
 
 if __name__ == "__main__":

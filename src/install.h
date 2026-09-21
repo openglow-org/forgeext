@@ -37,7 +37,19 @@ typedef struct {
     pkg_trust_t trust;
     long long budget_bytes;
     long long reserve_bytes;
+    /* This firmware's version, for a package's "core" range. A release
+     * image writes a version here (0.0.7); a dev image writes its build
+     * stamp, which is no version at all, and then the range cannot be
+     * judged and is not. */
+    char core_version[33];
 } ext_env_t;
+
+#define EXT_VERSION_FILE "/etc/forgefirm-version"
+
+/* The firmware's version as EXT_VERSION_FILE has it, or "" when the file
+ * says nothing. What it holds may be a version or a build stamp; telling
+ * them apart is manifest_version_ok()'s job. */
+void ext_read_core_version(char *out, size_t olen);
 
 typedef struct {
     const char *grants[MANIFEST_MAX_CAPS];  /* what the operator granted, of the capabilities that need it */
@@ -51,6 +63,7 @@ typedef struct {
     pkg_info_t info;
     pkg_tree_t tree;
     int update;                             /* a version of this id is installed */
+    int core_checked;                       /* the "core" range was judged: 0 when this firmware has no version to judge it by */
     int downgrade;
     char from_version[33];
     char needs_grant[MANIFEST_MAX_CAPS][CAP_MAX_LEN];   /* asked for, needs the operator's grant */
