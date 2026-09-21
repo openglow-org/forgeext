@@ -59,6 +59,20 @@ int machine_get(const machine_cfg_t *cfg, const char *path, char *out, size_t ol
 int machine_get_blob(const machine_cfg_t *cfg, const char *path, unsigned char **out, size_t *len,
                      char *ctype, size_t clen);
 
+/* The extension host's own credential, as forgectrl minted it for this
+ * run and left in a file only root can read. It holds only what the host
+ * may relay, and forgectrl takes it from a loopback peer alone. "" when
+ * there is none, which is a machine whose forgectrl has not started or
+ * is older than this file. */
+#define MACHINE_HOST_TOKEN_FILE "/run/forgefirm/ext-host.token"
+
+void machine_host_token(char *out, size_t olen);
+
+/* A POST the host makes on a package's behalf, with that credential.
+ * The answer's JSON into out. 0 on a 200, or minus the status, or -1
+ * when the machine could not be reached. */
+int machine_post(const machine_cfg_t *cfg, const char *path, char *out, size_t olen);
+
 /* `key=value` out of a settings file: 1 when the key is there. */
 int machine_conf_value(const char *conf, const char *key, char *out, size_t olen);
 

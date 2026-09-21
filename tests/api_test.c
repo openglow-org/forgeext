@@ -68,6 +68,19 @@ static int fake_settings(void *ctx, const char *id, const char *patch, size_t pl
 static api_world_t world;
 static api_shot_t shot;
 
+/* The motion side, faked: the path the broker would have sent. */
+static int motion_calls;
+static char motion_path[256];
+
+static int fake_motion(void *ctx, const char *path, char *out, size_t olen)
+{
+    (void)ctx;
+    motion_calls++;
+    snprintf(motion_path, sizeof(motion_path), "%s", path);
+    snprintf(out, olen, "{\"ok\":true}");
+    return 200;
+}
+
 static int call(const api_who_t *who, api_hold_t *hold, const char *text)
 {
     httpreq_t req;
@@ -110,6 +123,7 @@ int main(void)
     world.machine = fake_machine;
     world.settings = fake_settings;
     world.camera = fake_camera;
+    world.motion = fake_motion;
     world.feed = &feed;
     api_who_t reader = { .id = "org.example.reader", .version = "1.2.0", .uid = 800, .caps = { "machine.read", "events" }, .ncaps = 2 };
     api_who_t holder = { .id = "org.example.badge", .version = "1.0.0", .uid = 801, .caps = { "hold" }, .ncaps = 1 };
@@ -370,6 +384,71 @@ int main(void)
                                      "Content-Length: %zu\r\n\r\n%s", strlen(want2), want2);
         CHECK(call(&looker, &hold, text) == 502, "with no way to the cameras");
         world.camera = fake_camera;
+    }
+
+    /* A jog: the one call that moves the machine. */
+    api_who_t jogger = { .id = "org.example.jogger", .version = "1.0.0", .uid = 805,
+                         .caps = { "motion.jog" }, .ncaps = 1 };
+    {
+        char text[400];
+        #define JOG(who_, json_) (snprintf(text, sizeof(text), \
+            "POST /v0/motion/jog HTTP/1.1\r\nContent-Type: application/json\r\n" \
+            "Content-Length: %zu\r\n\r\n%s", strlen(json_), json_), call(who_, &hold, text))
+
+        motion_calls = 0;
+        rc = JOG(&reader, "{\"x\": 10}");
+        CHECK(rc == 403 && motion_calls == 0 && strstr(error_words(), "motion.jog"),
+              "a jog without the capability: %d, the machine asked %d times", rc, motion_calls);
+
+        rc = JOG(&jogger, "{\"x\": 10, \"y\": -5, \"feed\": 2000}");
+        CHECK(rc == 200 && motion_calls == 1 && strstr(motion_path, "x=10.000")
+              && strstr(motion_path, "y=-5.000") && strstr(motion_path, "feed=2000.000"),
+              "a jog inside the bounds: %d %s", rc, motion_path);
+
+        /* The bounds, each one at its edge and just past it. */
+        static const struct { const char *json, *name; int ok; } jogs[] = {
+            { "{\"x\": 100}", "X at its bound", 1 },
+            { "{\"x\": 100.1}", "X past its bound", 0 },
+            { "{\"x\": -100.1}", "X past its bound the other way", 0 },
+            { "{\"y\": 100}", "Y at its bound", 1 },
+            { "{\"y\": 101}", "Y past its bound", 0 },
+            { "{\"z\": 5}", "Z at its bound", 1 },
+            { "{\"z\": 5.5}", "Z past its bound", 0 },
+            { "{\"x\": 1, \"feed\": 10}", "the slowest feed", 1 },
+            { "{\"x\": 1, \"feed\": 9}", "a feed below the floor", 0 },
+            { "{\"x\": 1, \"feed\": 12000}", "the fastest feed", 1 },
+            { "{\"x\": 1, \"feed\": 12001}", "a feed above the ceiling", 0 },
+            { "{\"x\": 0, \"y\": 0, \"z\": 0}", "a jog that moves nothing", 0 },
+            { "{}", "a jog that names nothing", 0 },
+            { "{\"x\": \"10\"}", "an axis that is a string", 0 },
+            { "{\"x\": true}", "an axis that is a bool", 0 },
+            { "{\"a\": 10}", "an axis there is none of", 0 },
+            { "{\"x\": 10, \"laser\": 1}", "a key the form does not have", 0 },
+            { "{\"x\": 1, \"x\": 2}", "a key twice", 0 },
+            { "[10]", "an array", 0 },
+        };
+        for (size_t i = 0; i < sizeof(jogs) / sizeof(jogs[0]); i++) {
+            int before = motion_calls;
+            rc = JOG(&jogger, jogs[i].json);
+            if (jogs[i].ok) {
+                CHECK(rc == 200 && motion_calls == before + 1, "%s: %d", jogs[i].name, rc);
+            } else {
+                CHECK(rc == 400 && motion_calls == before && error_words()[0],
+                      "%s: %d, and the machine was asked %d times", jogs[i].name, rc,
+                      motion_calls - before);
+            }
+        }
+
+        CHECK(call(&jogger, &hold, "GET /v0/motion/jog HTTP/1.1\r\n\r\n") == 405, "a jog is a POST");
+        rc = call(&jogger, &hold, "POST /v0/motion/cancel HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        CHECK(rc == 200 && strstr(motion_path, "/motion/cancel"), "a cancel: %d %s", rc, motion_path);
+        rc = call(&reader, &hold, "POST /v0/motion/cancel HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        CHECK(rc == 403, "a cancel without the capability: %d", rc);
+        world.motion = NULL;
+        rc = JOG(&jogger, "{\"x\": 1}");
+        CHECK(rc == 502, "with no way to the machine's motion: %d", rc);
+        world.motion = fake_motion;
+        #undef JOG
     }
 
     /* Everything else. */

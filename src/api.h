@@ -25,6 +25,15 @@
  *   GET  /v0/settings          its own settings, its schema's defaults filling what is unset (settings.own)
  *   POST /v0/settings          a patch of them, all applied or none (settings.own)
  *   POST /v0/camera            {"camera": "lid"|"head", ...}: one frame (camera.lid, camera.head)
+ *   POST /v0/motion/jog        {"x":, "y":, "z":, "feed":}: one bounded dark jog (motion.jog)
+ *   POST /v0/motion/cancel     ends a jog this package started (motion.jog)
+ *
+ * A jog moves the machine, so it is the one call here that does. It is
+ * bounded twice - once by this host, and again by the machine, which
+ * owns the bounds and is the only thing that can enforce them - and it
+ * is a jog and nothing else, which is the one motion that ships dark
+ * whatever the laser's modal state is. A sender at the controller port
+ * always wins: a line from LightBurn cancels a package's jog.
  *
  * The camera answer is a JPEG and not JSON, and a capture takes seconds,
  * so it is neither answered from the JSON buffer nor waited for on this
@@ -98,6 +107,10 @@ typedef struct {
 /* One GET of the machine: the body into out, 0 on a 200. */
 typedef int (*api_upstream_fn)(void *ctx, const char *path, char *out, size_t olen);
 
+/* One motion request relayed to the machine: the path, and the answer's
+ * JSON into out. Returns the status. */
+typedef int (*api_motion_fn)(void *ctx, const char *path, char *out, size_t olen);
+
 /* A package's own settings (settings.h). patch is NULL to read them, or
  * the request's body to apply. The whole answer, JSON either way, into
  * out; the return is the status to send. */
@@ -122,8 +135,20 @@ typedef struct {
     void *settings_ctx;
     api_camera_fn camera;
     void *camera_ctx;
+    api_motion_fn motion;
+    void *motion_ctx;
     evfeed_t *feed;
 } api_world_t;
+
+/* A package's jog, in millimetres and mm/min. The bounds are the
+ * machine's; these are the host's copy of them, so that a request past
+ * them is refused here rather than carried to the machine and refused
+ * there. Kept the same as the machine's on purpose: if they ever
+ * disagree, the machine's answer is the one that stands. */
+#define API_JOG_MAX_XY_MM   100.0
+#define API_JOG_MAX_Z_MM    5.0
+#define API_JOG_FEED_MIN    10.0
+#define API_JOG_FEED_MAX    12000.0
 
 /* What a package asked a camera for, once the broker has judged it. */
 typedef struct {
@@ -204,7 +229,8 @@ typedef struct {
 /* Make the directory, remove the sockets a previous host left, start the thread. */
 int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed,
               api_settings_fn settings, void *settings_ctx,
-              api_camera_fn camera, void *camera_ctx, char *err, size_t elen);
+              api_camera_fn camera, void *camera_ctx,
+              api_motion_fn motion, void *motion_ctx, char *err, size_t elen);
 void api_stop(api_t *a);
 
 /* A service is about to start: its socket exists before it does, and its

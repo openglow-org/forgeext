@@ -224,6 +224,81 @@ done:
     return rc;
 }
 
+void machine_host_token(char *out, size_t olen)
+{
+    FILE *f = fopen(MACHINE_HOST_TOKEN_FILE, "re");
+    out[0] = '\0';
+    if (!f)
+        return;
+    if (fgets(out, (int)olen, f)) {
+        size_t n = strcspn(out, " \t\r\n");
+        out[n] = '\0';
+    }
+    fclose(f);
+}
+
+int machine_post(const machine_cfg_t *cfg, const char *path, char *out, size_t olen)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)cfg->port) };
+    struct timespec ts;
+    char token[64];
+    int rc = -1;
+
+    out[0] = '\0';
+    machine_host_token(token, sizeof(token));
+    if (!token[0])
+        return -1;
+    if (inet_pton(AF_INET, cfg->host, &a.sin_addr) != 1)
+        return -1;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long deadline = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L + HTTP_TIMEOUT_MS;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char *buf = NULL;
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        int soerr = 0;
+        socklen_t sl = sizeof(soerr);
+        if (errno != EINPROGRESS || wait_fd(fd, POLLOUT, deadline) != 0
+            || getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0 || soerr != 0)
+            goto done;
+    }
+    char req[700];
+    /* The credential goes in a header and never in the path: a path
+     * ends up in a log. */
+    int rlen = snprintf(req, sizeof(req),
+                        "POST %s HTTP/1.0\r\nHost: %s\r\nX-ForgeFIRM-Token: %s\r\n"
+                        "Content-Length: 0\r\nConnection: close\r\n\r\n", path, cfg->host, token);
+    if (rlen <= 0 || (size_t)rlen >= sizeof(req) || wait_fd(fd, POLLOUT, deadline) != 0
+        || send(fd, req, (size_t)rlen, MSG_NOSIGNAL) != rlen)
+        goto done;
+    buf = malloc(HTTP_MAX + 1);
+    if (!buf)
+        goto done;
+    size_t got = 0;
+    while (got < HTTP_MAX && wait_fd(fd, POLLIN, deadline) == 0) {
+        ssize_t k = recv(fd, buf + got, HTTP_MAX - got, 0);
+        if (k < 0 && (errno == EAGAIN || errno == EINTR))
+            continue;
+        if (k <= 0)
+            break;
+        got += (size_t)k;
+    }
+    buf[got] = '\0';
+    const char *body = strstr(buf, "\r\n\r\n");
+    if (got < 12 || strncmp(buf, "HTTP/1.", 7) != 0 || !body)
+        goto done;
+    int status = atoi(buf + 9);
+    body += 4;
+    if (strlen(body) < olen)
+        memcpy(out, body, strlen(body) + 1);
+    rc = status == 200 ? 0 : -status;
+done:
+    free(buf);
+    close(fd);
+    return rc;
+}
+
 static json_t *get_json(const machine_cfg_t *cfg, const char *path)
 {
     static char body[HTTP_MAX];

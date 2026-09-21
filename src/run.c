@@ -370,7 +370,7 @@ static void quota_turn(run_t *r, super_t *sv, double now)
     }
 }
 
-/* ---- the cameras --------------------------------------------------------------- */
+/* ---- motion ------------------------------------------------------------------- */
 
 /* One JSON answer into the broker's buffer: the status, or 500 when it
  * does not fit. */
@@ -387,6 +387,35 @@ static int say_json(char *out, size_t olen, int status, json_t *j)
     free(text);
     return status;
 }
+
+/* One motion request on a package's behalf, with the host's own
+ * credential. The machine judges it again - its bounds, its mode, its
+ * lease, and the sender at the controller port who always wins - and
+ * whatever it says is what the package is told. */
+static int motion_call(void *ctx, const char *path, char *out, size_t olen)
+{
+    const run_cfg_t *cfg = ctx;
+    char answer[2048] = "";
+    int rc = machine_post(&cfg->machine, path, answer, sizeof(answer));
+    if (rc == 0) {
+        snprintf(out, olen, "%s", answer[0] ? answer : "{\"ok\":true}");
+        return 200;
+    }
+    int status = rc < -1 ? -rc : 502;
+    json_t *j = answer[0] ? json_loads(answer, 0, NULL) : NULL;
+    const char *why = j ? json_string_value(json_object_get(j, "error")) : NULL;
+    if (!why)
+        why = j ? json_string_value(json_object_get(j, "message")) : NULL;
+    char words[240];
+    snprintf(words, sizeof(words), "%s", why ? why : (answer[0] ? answer : "the machine did not answer"));
+    for (char *p = words; *p; p++)
+        if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f)
+            *p = ' ';
+    json_decref(j);
+    return say_json(out, olen, status, json_pack("{s:s}", "error", words));
+}
+
+/* ---- the cameras --------------------------------------------------------------- */
 
 /* One frame for a package, from forgectrl's own camera route. It is
  * always asked for as a background capture: a package is never the
@@ -673,7 +702,7 @@ int run_daemon(const run_cfg_t *cfg)
         return 1;
     }
     if (api_start(&r.api, cfg->api_dir, &cfg->machine, &r.feed, settings_call, (void *)cfg,
-                  camera_call, (void *)cfg, err, sizeof(err)) != 0) {
+                  camera_call, (void *)cfg, motion_call, (void *)cfg, err, sizeof(err)) != 0) {
         fflog(LOG_ERR, "not starting: %s", err);
         evfeed_stop(&r.feed);
         holdkeep_stop(&r.holds);

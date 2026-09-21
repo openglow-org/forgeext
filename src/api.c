@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <jansson.h>
+#include <math.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -256,6 +257,63 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
         }
         json_decref(j);
         return 200;
+    }
+    if (strcmp(p, "/v0/motion/jog") == 0 || strcmp(p, "/v0/motion/cancel") == 0) {
+        int cancel = strcmp(p, "/v0/motion/cancel") == 0;
+        if (req->method != HTTPREQ_POST)
+            return refuse(body, blen, 405, "a jog is a POST");
+        if (!api_may(who, "motion.jog"))
+            return refuse(body, blen, 403, "this package does not hold motion.jog");
+        if (!world || !world->motion)
+            return refuse(body, blen, 502, "the host cannot reach the machine's motion");
+        if (cancel)
+            return world->motion(world->motion_ctx, "/motion/cancel", body, blen);
+        if (!req->json_body)
+            return refuse(body, blen, 415, "POST /v0/motion/jog takes application/json");
+
+        json_error_t je;
+        json_t *j = json_loadb(req->body, req->body_len, JSON_REJECT_DUPLICATES, &je);
+        const char *key;
+        json_t *v;
+        double axis[3] = { 0, 0, 0 }, feed = 0;
+        const char *why = "the body is a JSON object: {\"x\": 10, \"feed\": 3000}";
+        int bad = !json_is_object(j);
+        if (!bad) {
+            json_object_foreach(j, key, v) {
+                double *at = strcmp(key, "x") == 0 ? &axis[0]
+                           : strcmp(key, "y") == 0 ? &axis[1]
+                           : strcmp(key, "z") == 0 ? &axis[2]
+                           : strcmp(key, "feed") == 0 ? &feed : NULL;
+                if (!at || !json_is_number(v) || json_is_boolean(v)) {
+                    why = "the body holds x, y, z, and feed, each a number, and nothing else";
+                    bad = 1;
+                    break;
+                }
+                *at = json_number_value(v);
+            }
+        }
+        json_decref(j);
+        if (bad)
+            return refuse(body, blen, 400, why);
+        /* The machine owns these bounds; this is the host keeping to
+         * them too, so a request past them never becomes a line the
+         * machine has to refuse. */
+        if (!(axis[0] == axis[0]) || !(axis[1] == axis[1]) || !(axis[2] == axis[2]) || !(feed == feed))
+            return refuse(body, blen, 400, "x, y, z, and feed must be numbers");
+        if (fabs(axis[0]) > API_JOG_MAX_XY_MM || fabs(axis[1]) > API_JOG_MAX_XY_MM)
+            return refuse(body, blen, 400, "one jog moves X and Y at most 100 mm");
+        if (fabs(axis[2]) > API_JOG_MAX_Z_MM)
+            return refuse(body, blen, 400, "one jog moves Z at most 5 mm");
+        if (feed != 0 && (feed < API_JOG_FEED_MIN || feed > API_JOG_FEED_MAX))
+            return refuse(body, blen, 400, "feed must be 10 to 12000 mm/min");
+        if (axis[0] == 0 && axis[1] == 0 && axis[2] == 0)
+            return refuse(body, blen, 400, "a jog moves at least one axis");
+
+        char path[200];
+        int n = snprintf(path, sizeof(path), "/motion/jog?x=%.3f&y=%.3f&z=%.3f", axis[0], axis[1], axis[2]);
+        if (feed != 0 && n > 0 && (size_t)n < sizeof(path))
+            snprintf(path + n, sizeof(path) - (size_t)n, "&feed=%.3f", feed);
+        return world->motion(world->motion_ctx, path, body, blen);
     }
     if (strcmp(p, "/v0/camera") == 0) {
         if (req->method != HTTPREQ_POST)
@@ -674,7 +732,8 @@ static void sock_path(const api_t *a, const char *id, char *p, size_t plen)
 
 int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed,
               api_settings_fn settings, void *settings_ctx,
-              api_camera_fn camera, void *camera_ctx, char *err, size_t elen)
+              api_camera_fn camera, void *camera_ctx,
+              api_motion_fn motion, void *motion_ctx, char *err, size_t elen)
 {
     memset(a, 0, sizeof(*a));
     pthread_mutex_init(&a->mu, NULL);
@@ -687,6 +746,8 @@ int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t
     a->world.settings_ctx = settings_ctx;
     a->world.camera = camera;
     a->world.camera_ctx = camera_ctx;
+    a->world.motion = motion;
+    a->world.motion_ctx = motion_ctx;
     if (strlen(dir) >= sizeof(a->dir) - 72) {
         snprintf(err, elen, "the API directory's path is too long");
         return -1;
