@@ -98,4 +98,15 @@ void ext_unlock(int lock);
 int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen);
 int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
 
+/* Mark a package's hold required or advisory. Only a package that has the
+ * operator's hold grant has a hold to mark. */
+int ext_set_hold_required(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
+
+/* <root>/required-holds holds one empty file named after each enabled
+ * package whose hold is granted and marked required, and nothing else.
+ * forgectrl reads the names: a required hold nobody speaks for (no host
+ * since the boot) stands. Made to match the state, by every command that
+ * changes it and by the host on every turn. */
+int ext_required_holds_sync(const ext_env_t *env, const state_t *st);
+
 #endif

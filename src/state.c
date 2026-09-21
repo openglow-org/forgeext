@@ -119,6 +119,7 @@ static int pkg_from_json(const char *id, json_t *j, state_pkg_t *p)
     p->slot = (int)json_integer_value(slot);
     p->enabled = json_is_true(json_object_get(j, "enabled"));
     p->quarantined = json_is_true(json_object_get(j, "quarantined"));
+    p->hold_required = json_is_true(json_object_get(j, "hold_required"));
     json_t *grants = json_object_get(j, "grants");
     if (!json_is_array(grants) || json_array_size(grants) > MANIFEST_MAX_CAPS)
         return -1;
@@ -187,6 +188,7 @@ int state_save(const char *root, const state_t *s, char *err, size_t elen)
         json_object_set_new(j, "slot", json_integer(p->slot));
         json_object_set_new(j, "enabled", json_boolean(p->enabled));
         json_object_set_new(j, "quarantined", json_boolean(p->quarantined));
+        json_object_set_new(j, "hold_required", json_boolean(p->hold_required));
         for (int k = 0; k < p->ngrants; k++)
             json_array_append_new(grants, json_string(p->grants[k]));
         json_object_set_new(j, "grants", grants);

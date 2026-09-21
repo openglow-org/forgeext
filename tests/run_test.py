@@ -180,11 +180,32 @@ def main():
         check(r.get("ok") is True, "installed %s: %s", id_, r.get("error", ""))
 
     print("four packages")
-    package("org.example.beat", "shell", "#!/bin/sh\nwhile true; do echo beat; sleep 1; done\n")
+    package("org.example.beat", "shell", "#!/bin/sh\nwhile true; do echo beat; sleep 1; done\n", caps=["hold"], grants=["hold"])
     package("org.example.dial", "python", DIAL, caps=["net.outbound:peer.test:%d" % pport], args=["peer.test", str(pport), str(fport)])
     package("org.example.jobtime", "shell", "#!/bin/sh\nwhile true; do echo through the job; sleep 1; done\n",
             caps=["job_time.run"], grants=["job_time.run"])
-    package("org.example.crash", "shell", "#!/bin/sh\necho about to end\nexit 3\n")
+    package("org.example.crash", "shell", "#!/bin/sh\necho about to end\nexit 3\n", caps=["hold"], grants=["hold"])
+
+    print("a hold is the operator's to mark, and only where there is one")
+    holds_dir, marks = os.path.join(top, "holds"), os.path.join(root, "required-holds")
+    r = fx("hold", "org.example.dial", "required")
+    check(r.get("ok") is False and "has no hold" in r.get("error", ""), "no grant, no hold to mark: %s", r.get("error"))
+    r = fx("hold", "org.example.crash", "required")
+    check(r.get("ok") is True and os.listdir(marks) == ["org.example.crash"], "marked required, and named for forgectrl: %s %s",
+          r.get("error", ""), os.listdir(marks))
+    listed = {x["id"]: x.get("hold") for x in fx("list").get("packages", [])}
+    check(listed == {"org.example.beat": "advisory", "org.example.dial": None, "org.example.jobtime": None,
+                     "org.example.crash": "required"}, "the list says which hold is which: %s", listed)
+
+    def held(id_):
+        """The hold file of a package: None, or its fields with the age of its timestamp."""
+        try:
+            with open(os.path.join(holds_dir, id_ + ".json")) as f:
+                h = json.load(f)
+        except (OSError, ValueError):
+            return None
+        h["age"] = time.monotonic() - h["ts_mono"]
+        return h
 
     abi = int(subprocess.run([sys.executable, "-c", "import ctypes;print(ctypes.CDLL(None).syscall(444,None,0,1))"],
                              capture_output=True, text=True).stdout.strip() or 0)
@@ -195,7 +216,8 @@ def main():
 
     def start_daemon():
         return subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "run", "--conf", conf, "--safe-file", safe,
-                                 "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir]
+                                 "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir,
+                                 "--holds-dir", holds_dir]
                                 + (["--landlock-fs-only"] if abi < 4 else []),
                                 stderr=log, stdout=log, env=dict(os.environ, FFLOG_STDERR="1", FFLOG_SOCK="/nonexistent"))
 
@@ -228,6 +250,10 @@ def main():
         print("off, then not ready")
         check(wait_for(lambda: status().get("pid") == daemon.pid, 10), "the status file names the host that wrote it")
         check(wait_for(lambda: status().get("off_reason"), 10) and not running(), "off: %s", status().get("off_reason"))
+        check(sorted(os.listdir(root)) == ["data", "keys", "lock", "pkg", "required-holds", "state.json", "tmp"],
+              "the extension root holds what it should and nothing else: %s", sorted(os.listdir(root)))
+        check(os.path.isdir(holds_dir) and not os.listdir(holds_dir), "extensions off: no hold has a file: %s",
+              os.path.isdir(holds_dir) and os.listdir(holds_dir))
         with open(conf, "w") as f:
             f.write("log_forgeext_disk=info\next_enabled = 1\n")
         check(wait_for(lambda: "motion is unverified" in status().get("not_ready", ""), 10) and not running(),
@@ -269,6 +295,27 @@ def main():
               "the dialer reaches its declared destination and not the machine")
         check(cg("org.example.beat", "cpu.max").split() == ["25000", "100000"] and cg("org.example.beat", "pids.max").strip() == "32",
               "its limits: cpu.max %s pids.max %s", cg("org.example.beat", "cpu.max").strip(), cg("org.example.beat", "pids.max").strip())
+
+        print("the holds: kept by the host, fresh, and failing closed for the one marked required")
+        b, c = held("org.example.beat"), None
+        check(b and b["required"] is False and b["raised"] is False and b["age"] < 1.5,
+              "a running package's advisory hold: clear and fresh: %s", b)
+        check(wait_for(lambda: (held("org.example.crash") or {}).get("raised"), 10), "the package that keeps ending has its hold raised")
+        c = held("org.example.crash")
+        check(c and c["required"] is True and c["age"] < 1.5
+              and c["reason"] in ("the extension is not running", "the extension has only just started"),
+              "required and not running: raised by the host, in the host's words: %s", c)
+        check(sorted(os.listdir(holds_dir)) == ["org.example.beat.json", "org.example.crash.json"],
+              "a package without the grant has no file: %s", sorted(os.listdir(holds_dir)))
+        ages, clear = [], 0
+        for _ in range(8):
+            time.sleep(0.4)
+            ages.append((held("org.example.beat") or {"age": 99})["age"])
+            clear += not (held("org.example.crash") or {}).get("raised")
+        check(max(ages) < 1.5, "kept fresh between the host's turns: the oldest of eight looks was %.2f s", max(ages))
+        check(clear == 0, "the required hold of the package that ends at every start never reads clear: %d of 8 looks did", clear)
+        check(svc("org.example.crash").get("hold") == "required" and svc("org.example.beat").get("hold") == "advisory"
+              and "hold" not in svc("org.example.dial"), "the status file says which hold is which")
 
         print("the armed window")
         facts["armed"] = True
@@ -313,6 +360,10 @@ def main():
               "and the first one's services are untouched by it")
         daemon.kill()
         daemon.wait(timeout=10)
+        time.sleep(2.6)
+        stale = held("org.example.crash")
+        check(stale and stale["age"] > 2.0 and stale["required"], "a killed host's required hold stays and goes stale, which "
+              "is what forgectrl holds on: %s", stale)
         alive = [i for i, pid in mine.items() if os.path.exists("/proc/%d" % pid)]
         chains = subprocess.run([NFT, "list", "chains", "inet"], capture_output=True, text=True).stdout
         check(alive and "chain u8" in chains, "a killed daemon leaves its services running and their chains in place "
@@ -327,13 +378,18 @@ def main():
         chains = subprocess.run([NFT, "list", "chains", "inet"], capture_output=True, text=True).stdout
         check(gone and not left and "chain u8" not in chains, "and what it found is gone: processes %s, groups %s",
               "gone" if gone else "alive", left)
+        check(wait_for(lambda: not os.listdir(holds_dir), 5), "extensions off under the new host: every hold file is gone: %s",
+              os.listdir(holds_dir))
         with open(conf, "w") as f:
             f.write("ext_enabled=1\n")
         check(wait_for(lambda: len(running()) >= 1, 30), "turned on again, the services start under the new daemon")
 
+        check(wait_for(lambda: held("org.example.crash") is not None, 10), "on again: the required hold has its file again")
+
         print("safe mode, and the end")
         open(safe, "w").close()
         check(wait_for(lambda: not running() and "safe mode" in status().get("off_reason", ""), 10), "safe mode stops everything")
+        check(wait_for(lambda: not os.listdir(holds_dir), 5), "and ends every hold: %s", os.listdir(holds_dir))
         left = [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))]
         chains = subprocess.run([NFT, "list", "table", "inet", "ffx"], capture_output=True, text=True).stdout
         check(not left and "chain u8" not in chains, "no group and no chain stays behind: %s", left)
@@ -345,6 +401,11 @@ def main():
         chains = subprocess.run([NFT, "list", "table", "inet", "ffx"], capture_output=True, text=True).stdout
         check(rc == 0 and not left and "chain u8" not in chains and not running(),
               "SIGTERM: exit %s, groups left %s, the status says nothing runs", rc, left)
+        check(os.listdir(holds_dir) == ["org.example.crash.json"], "a clean stop takes the advisory hold's file and leaves the "
+              "required one to go stale: %s", os.listdir(holds_dir))
+        r = fx("remove", "org.example.crash")
+        check(r.get("ok") is True and not os.listdir(marks), "removing the package takes its name out of the required holds: %s",
+              os.listdir(marks))
         check(time.time() - t0 < 400, "the whole run took %.0f s", time.time() - t0)
     finally:
         if daemon.poll() is None:

@@ -7,6 +7,7 @@
 #ifndef FORGEEXT_RUN_H
 #define FORGEEXT_RUN_H
 
+#include "holdkeep.h"
 #include "install.h"
 #include "machine.h"
 #include "netrules.h"
@@ -26,6 +27,7 @@ typedef struct {
     net_env_t net;
     const char *cg_parent;
     const char *run_dir;                        /* status.json */
+    const char *holds_dir;                      /* the hold files forgectrl's cooling engine reads */
     int landlock_fs_only;                       /* a kernel older than landlock's TCP rules (tests on a host) */
     int ticks;                                  /* stop after this many seconds; 0 runs until a signal */
 } run_cfg_t;

@@ -41,6 +41,8 @@ jobs:
         run: ./build/state_test
       - name: super_test (the supervisor's policy over fake operations)
         run: ./build/super_test
+      - name: holdkeep_test (what the host says for a package's hold, and how it keeps the files fresh)
+        run: ./build/holdkeep_test
       - name: sandbox_test (a real child under the launcher, seen from inside and from outside)
         run: |
           # 77 is the test's "could not run here": on this runner that is a failure.

@@ -53,14 +53,15 @@ void ext_env_defaults(ext_env_t *env)
 int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
 {
     static const struct { const char *name; mode_t mode; } dirs[] = {
-        { "", 0755 }, { "/pkg", 0755 }, { "/data", 0755 }, { "/keys", 0755 }, { "/tmp", 0700 },
+        { "", 0755 }, { "/pkg", 0755 }, { "/data", 0755 }, { "/keys", 0755 }, { "/required-holds", 0755 },
+        { "/tmp", 0700 },
     };
     if (!env->root || !env->root[0] || strlen(env->root) > EXT_ROOT_MAX)
         return fail(err, elen, "the extension root is a path of at most %d bytes", EXT_ROOT_MAX);
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
         char p[512];
         struct stat st;
-        snprintf(p, sizeof(p), "%.255s%.8s", env->root, dirs[i].name);
+        snprintf(p, sizeof(p), "%.255s%.24s", env->root, dirs[i].name);
         if (mkdir(p, dirs[i].mode) != 0 && errno != EEXIST)
             return fail(err, elen, "cannot make %s: %s", p, strerror(errno));
         if (lstat(p, &st) != 0 || !S_ISDIR(st.st_mode))
@@ -477,6 +478,8 @@ int ext_remove(const ext_env_t *env, const char *id, int keep_data, char *err, s
         } else {
             state_remove(st, id);
             rc = state_save(env->root, st, err, elen);      /* forgotten first: a half-removed tree is never started */
+            if (rc == 0)
+                ext_required_holds_sync(env, st);           /* and its hold goes with it: removal is the operator's exit */
             snprintf(p, sizeof(p), "%.255s/pkg/%.63s", env->root, id);
             if (rc == 0 && pkg_rmtree(p) != 0)
                 rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
@@ -491,6 +494,46 @@ int ext_remove(const ext_env_t *env, const char *id, int keep_data, char *err, s
 }
 
 /* Load, change one package's entry, save: under the lock. */
+int ext_required_holds_sync(const ext_env_t *env, const state_t *st)
+{
+    char dir[300], p[400];
+    snprintf(dir, sizeof(dir), "%.255s/required-holds", env->root);
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+        return -1;
+    int bad = 0;
+    for (int i = 0; i < st->n; i++) {
+        const state_pkg_t *pk = &st->pkgs[i];
+        if (!(pk->enabled && pk->hold_required && state_granted(pk, "hold")))
+            continue;
+        snprintf(p, sizeof(p), "%.299s/%.63s", dir, pk->id);
+        int fd = open(p, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+        if (fd < 0)
+            bad = 1;
+        else
+            close(fd);
+    }
+    DIR *d = opendir(dir);
+    if (!d)
+        return -1;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
+            continue;
+        int wanted = 0;
+        for (int i = 0; i < st->n; i++) {
+            const state_pkg_t *pk = &st->pkgs[i];
+            wanted |= pk->enabled && pk->hold_required && state_granted(pk, "hold") && !strcmp(pk->id, de->d_name);
+        }
+        if (!wanted) {
+            snprintf(p, sizeof(p), "%.299s/%.90s", dir, de->d_name);
+            if (unlink(p) != 0)
+                bad = 1;
+        }
+    }
+    closedir(d);
+    return bad ? -1 : 0;
+}
+
 static int change(const ext_env_t *env, const char *id, int drop_previous, int quarantined, char *err, size_t elen)
 {
     char pkgdir[340];
@@ -526,4 +569,28 @@ int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t el
 int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen)
 {
     return change(env, id, 0, on ? 1 : 0, err, elen);
+}
+
+int ext_set_hold_required(const ext_env_t *env, const char *id, int on, char *err, size_t elen)
+{
+    state_t *st = calloc(1, sizeof(*st));
+    if (!st)
+        return fail(err, elen, "out of memory");
+    int lock = ext_lock(env, err, elen), rc = -1;
+    if (lock >= 0 && state_load(env->root, st, err, elen) == 0) {
+        state_pkg_t *p = state_find(st, id);
+        if (!p) {
+            fail(err, elen, "%s is not installed", id);
+        } else if (!state_granted(p, "hold")) {
+            fail(err, elen, "%s has no hold: the operator did not grant it one", id);
+        } else {
+            p->hold_required = on ? 1 : 0;
+            rc = state_save(env->root, st, err, elen);
+            if (rc == 0 && ext_required_holds_sync(env, st) != 0)
+                rc = fail(err, elen, "the required holds under %s could not be made to match", env->root);
+        }
+    }
+    ext_unlock(lock);
+    free(st);
+    return rc;
 }

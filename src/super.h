@@ -49,6 +49,8 @@ typedef struct {
     char id[64];
     int slot;                           /* the pool account */
     int job_time;                       /* the operator granted job_time.run */
+    int hold, hold_required;            /* the operator granted it a hold, and marked it required */
+    int pkg_enabled;                    /* enabled by the operator, quarantined or not */
     int mode_grbl, mode_cloud;          /* the controller modes it runs in */
     int present;                        /* the package is installed (set by every sync) */
     int wanted;                         /* enabled and not quarantined (from state.json) */

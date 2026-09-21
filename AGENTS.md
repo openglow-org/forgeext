@@ -18,7 +18,7 @@ space with the cooling engine and the supervisor.
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Werror
 cmake --build build
-./build/caps_test && ./build/manifest_test && ./build/state_test && ./build/super_test
+./build/caps_test && ./build/manifest_test && ./build/state_test && ./build/super_test && ./build/holdkeep_test
 FWUP=/path/to/fwup python3 -B tests/install_test.py
 sudo ./build/sandbox_test
 sudo FORGEEXT=build/forgeext python3 -B tests/netrules_test.py
@@ -80,6 +80,14 @@ included.
   host's reach is outside the freeze: a starting host sweeps the pool's
   groups and chains, there is one host at a time (`daemon.lock`), and the
   init wrapper kills the pool the moment the host ends abnormally.
+- **The host owns a hold, and a required one fails closed.** What the
+  cooling engine reads is the host's word (`holdkeep.c`), kept fresh by a
+  thread that writes only while the main loop is alive. A required hold
+  stands for a package that does not run or has not yet run healthy, for a
+  host that is gone however it went (a clean stop leaves the file to go
+  stale), and for a host that never came up (the names under
+  `required-holds`). The operator's exits are extensions off, safe mode,
+  and removal, never a quieter failure.
 - **A network rule names an address, never a name**: what was resolved and
   judged is what is allowed. `netrules.c` is the only writer of the image
   table's `allow` map, and no service starts unless `net_base_ok` finds the

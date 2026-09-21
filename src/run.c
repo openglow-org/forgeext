@@ -52,6 +52,9 @@ typedef struct {
     logpipe_t logs[SUPER_MAX_SERVICES];
     char last_status[8192];
     char unreachable[300];                      /* the last word on a root no account can walk to, said once */
+    holdkeep_t holds;
+    char dropped[SUPER_MAX_SERVICES][64];       /* the advisory holds dropped at the last turn, each said once */
+    int ndropped;
 } run_t;
 
 void run_cfg_defaults(run_cfg_t *cfg)
@@ -61,6 +64,7 @@ void run_cfg_defaults(run_cfg_t *cfg)
     machine_cfg_defaults(&cfg->machine);
     cfg->cg_parent = CG_PARENT_DEFAULT;
     cfg->run_dir = RUN_DIR_DEFAULT;
+    cfg->holds_dir = HOLDKEEP_DIR_DEFAULT;
 }
 
 static double mono(void)
@@ -303,6 +307,37 @@ static const super_ops_t OPS = { op_start, op_stop, op_freeze, op_job_limits, op
 
 /* ---- one turn ---------------------------------------------------------------- */
 
+/* The holds, as they stand after this turn's policy. A package that is
+ * enabled and runs in this controller mode has a file while extensions are
+ * on; every other case has none, and that is the operator's exit. The
+ * package's own word arrives over the API socket; until it has spoken, a
+ * running package's hold is clear. */
+static void holds_turn(run_t *r, const super_t *sv, const super_inputs_t *in)
+{
+    static hold_entry_t e[HOLDKEEP_MAX];
+    char now_dropped[SUPER_MAX_SERVICES][64];
+    int n = 0, nd = 0;
+    for (int i = 0; in->enabled && i < sv->n && n < HOLDKEEP_MAX; i++) {
+        const svc_t *s = &sv->svc[i];
+        int mode_ok = in->mode_cloud < 0 ? 1 : in->mode_cloud ? s->mode_cloud : s->mode_grbl;
+        if (!s->present || !s->hold || !s->pkg_enabled || !mode_ok)
+            continue;
+        if (hold_decide(s->id, s->hold_required, s->state == SVC_RUNNING, s->healthy, 0, NULL, &e[n]))
+            snprintf(now_dropped[nd++], sizeof(now_dropped[0]), "%s", s->id);
+        n++;
+    }
+    holdkeep_set(&r->holds, e, n);
+    for (int i = 0; i < nd; i++) {
+        int said = 0;
+        for (int k = 0; k < r->ndropped; k++)
+            said |= strcmp(r->dropped[k], now_dropped[i]) == 0;
+        if (!said)
+            fflog(LOG_WARNING, "%s: its advisory hold is dropped while it is not running", now_dropped[i]);
+    }
+    memcpy(r->dropped, now_dropped, sizeof(now_dropped[0]) * (size_t)nd);
+    r->ndropped = nd;
+}
+
 /* What is installed, into the policy's table. */
 static void sync_installed(run_t *r, super_t *sv)
 {
@@ -324,6 +359,9 @@ static void sync_installed(run_t *r, super_t *sv)
         s->present = 1;
         s->slot = p->slot;
         s->job_time = state_granted(p, "job_time.run");
+        s->hold = state_granted(p, "hold");
+        s->hold_required = s->hold && p->hold_required;
+        s->pkg_enabled = p->enabled;
         if (s->state != SVC_RUNNING && ext_manifest_of(&r->cfg->ext, p->id, &m, err, sizeof(err)) == 0) {
             s->mode_grbl = m.mode_grbl;
             s->mode_cloud = m.mode_cloud;
@@ -336,6 +374,8 @@ static void sync_installed(run_t *r, super_t *sv)
         }
     }
     super_sync_end(sv);
+    if (ext_required_holds_sync(&r->cfg->ext, &st) != 0)
+        fflog(LOG_WARNING, "the required holds under %s could not be made to match the state", r->cfg->ext.root);
 }
 
 static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
@@ -358,6 +398,8 @@ static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
         json_object_set_new(j, "frozen", json_boolean(s->frozen));
         json_object_set_new(j, "job_limited", json_boolean(s->job_limited));
         json_object_set_new(j, "healthy", json_boolean(s->healthy));
+        if (s->hold)
+            json_object_set_new(j, "hold", json_string(s->hold_required ? "required" : "advisory"));
         json_object_set_new(j, "reason", json_string(s->reason));
         json_array_append_new(list, j);
     }
@@ -439,6 +481,11 @@ int run_daemon(const run_cfg_t *cfg)
     int sfd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
     if (sfd < 0)
         return 1;
+    if (holdkeep_start(&r.holds, cfg->holds_dir, HOLDKEEP_MAIN_S, err, sizeof(err)) != 0) {
+        fflog(LOG_ERR, "not starting: %s", err);
+        close(lfd);
+        return 1;
+    }
     super_init(&sv, &OPS, &r);
     fflog(LOG_NOTICE, "started: extension root %s, groups under %s", cfg->ext.root, cfg->cg_parent);
 
@@ -497,11 +544,13 @@ int run_daemon(const run_cfg_t *cfg)
         super_inputs_t in = { mc.enabled, mc.may_start, mc.armed, mc.mode_cloud, mc.off_reason };
         if (!stopping)
             super_tick(&sv, &in, mono());
+        holds_turn(&r, &sv, &in);
         write_status(&r, &sv, &mc);
         if (cfg->ticks && ++turns >= cfg->ticks)
             stopping = 1;
     }
     super_stop_all(&sv, "the extension host is stopping");
+    holdkeep_stop(&r.holds);
     machine_t off;
     memset(&off, 0, sizeof(off));
     snprintf(off.off_reason, sizeof(off.off_reason), "the extension host is not running");

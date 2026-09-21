@@ -31,9 +31,10 @@ static int usage(void)
             "  list                               what is installed\n"
             "  check [<id>]                       do the installed files still match what was installed\n"
             "  remove <id> [--keep-data]\n"
+            "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
             "  caps                               the capabilities a manifest may ask for\n"
             "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
-            "      [--run-dir <dir>] [--landlock-fs-only] [--ticks <n>]\n"
+            "      [--run-dir <dir>] [--holds-dir <dir>] [--landlock-fs-only] [--ticks <n>]\n"
             "                                     the daemon: run what is installed and enabled, in the sandbox\n"
             "  net-check                          is the image's deny table loaded, and the image's\n"
             "  net-allow <uid> [--listen <port>] [--dns] [<host>:<port>]...\n"
@@ -156,6 +157,8 @@ static int cmd_list(const ext_env_t *env, const char *only, int check)
         json_object_set_new(j, "enabled", json_boolean(p->enabled));
         json_object_set_new(j, "quarantined", json_boolean(p->quarantined));
         json_object_set_new(j, "grants", strings(p->grants, p->ngrants));
+        if (state_granted(p, "hold"))
+            json_object_set_new(j, "hold", json_string(p->hold_required ? "required" : "advisory"));
         if (p->slot >= 0)
             json_object_set_new(j, "account", json_sprintf("ffx%d", p->slot));
         if (ext_manifest_of(env, p->id, &m, err, sizeof(err)) == 0)
@@ -256,6 +259,8 @@ int main(int argc, char **argv)
                 rc.cg_parent = val;
             } else if (strcmp(opt, "--run-dir") == 0) {
                 rc.run_dir = val;
+            } else if (strcmp(opt, "--holds-dir") == 0) {
+                rc.holds_dir = val;
             } else if (strcmp(opt, "--ticks") == 0) {
                 rc.ticks = atoi(val);
             } else if (strcmp(opt, "--forgectrl") == 0) {
@@ -343,6 +348,19 @@ int main(int argc, char **argv)
         return answer(obj, 1);
     }
 
+    if (strcmp(cmd, "hold") == 0 && i + 1 < argc) {
+        const char *id = argv[i], *kind = argv[i + 1];
+        int required = strcmp(kind, "required") == 0;
+        if (!required && strcmp(kind, "advisory") != 0)
+            return usage();
+        if (ext_set_hold_required(&env, id, required, err, sizeof(err)) != 0)
+            return refuse(err);
+        fflog(LOG_NOTICE, "%s: its hold is now %s", id, kind);
+        json_t *obj = json_object();
+        json_object_set_new(obj, "id", json_string(id));
+        json_object_set_new(obj, "hold", json_string(kind));
+        return answer(obj, 1);
+    }
     if (strcmp(cmd, "remove") == 0 && i < argc) {
         const char *id = argv[i++];
         int keep = i < argc && strcmp(argv[i], "--keep-data") == 0;

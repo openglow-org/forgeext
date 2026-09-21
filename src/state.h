@@ -32,6 +32,7 @@ typedef struct {
     int slot;                       /* the pool account, or -1 for a package with no service */
     int enabled;
     int quarantined;
+    int hold_required;              /* the operator marked its hold required: it fails closed (holdkeep.h) */
     char grants[MANIFEST_MAX_CAPS][CAP_MAX_LEN];
     int ngrants;
 } state_pkg_t;
