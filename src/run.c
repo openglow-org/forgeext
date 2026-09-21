@@ -370,11 +370,11 @@ static void quota_turn(run_t *r, super_t *sv, double now)
     }
 }
 
-/* ---- a package's own settings ------------------------------------------------- */
+/* ---- the cameras --------------------------------------------------------------- */
 
 /* One JSON answer into the broker's buffer: the status, or 500 when it
  * does not fit. */
-static int settings_say(char *out, size_t olen, int status, json_t *j)
+static int say_json(char *out, size_t olen, int status, json_t *j)
 {
     char *text = j ? json_dumps(j, JSON_COMPACT) : NULL;
     json_decref(j);
@@ -388,6 +388,70 @@ static int settings_say(char *out, size_t olen, int status, json_t *j)
     return status;
 }
 
+/* One frame for a package, from forgectrl's own camera route. It is
+ * always asked for as a background capture: a package is never the
+ * person standing at the machine, so it yields to an operator who is
+ * watching rather than stuttering their stream. Runs on the broker's
+ * camera thread. */
+static int camera_call(void *ctx, const char *cam, int full, int quality,
+                       unsigned char **jpeg, size_t *len, char *ctype, size_t clen,
+                       char *out, size_t olen)
+{
+    const run_cfg_t *cfg = ctx;
+    char path[160];
+    int n = snprintf(path, sizeof(path), "/cam/snapshot?cam=%.8s&res=%s&background=1",
+                     cam, full ? "full" : "half");
+    if (quality > 0 && n > 0 && (size_t)n < sizeof(path))
+        snprintf(path + n, sizeof(path) - (size_t)n, "&q=%d", quality);
+
+    int rc = machine_get_blob(&cfg->machine, path, jpeg, len, ctype, clen);
+    if (rc == 0 && *len > 2 && (*jpeg)[0] == 0xff && (*jpeg)[1] == 0xd8)
+        return 200;
+    if (rc == 0) {
+        /* A 200 that is not a JPEG is not passed on as one. */
+        free(*jpeg);
+        *jpeg = NULL;
+        *len = 0;
+        snprintf(out, olen, "{\"error\":\"the machine's answer was not a frame\"}");
+        return 502;
+    }
+    /* The machine's own refusal, in its own words: the lid is open, or
+     * somebody is watching. It answers a refusal as plain text on this
+     * route and as JSON on others, so both are read and whichever it
+     * sent is what the package is told. */
+    int status = rc < -1 ? -rc : 502;
+    char words[200] = "";
+    json_t *j = *jpeg && *len ? json_loadb((const char *)*jpeg, *len, 0, NULL) : NULL;
+    const char *why = j ? json_string_value(json_object_get(j, "error")) : NULL;
+    if (!why)
+        why = j ? json_string_value(json_object_get(j, "message")) : NULL;
+    if (why) {
+        snprintf(words, sizeof(words), "%s", why);
+    } else if (*jpeg && *len) {
+        /* Plain text, as far as it is printable: what the machine said
+         * goes on, and nothing that is not text does. */
+        size_t n = *len < sizeof(words) - 1 ? *len : sizeof(words) - 1;
+        size_t k = 0;
+        for (size_t i = 0; i < n; i++) {
+            unsigned char ch = (*jpeg)[i];
+            if (ch >= 0x20 && ch < 0x7f)
+                words[k++] = (char)ch;
+            else if (ch == '\n' || ch == '\t')
+                words[k++] = ' ';
+        }
+        words[k] = '\0';
+    }
+    say_json(out, olen, status, json_pack("{s:s}", "error",
+                                          words[0] ? words : "the machine did not answer the camera"));
+    json_decref(j);
+    free(*jpeg);
+    *jpeg = NULL;
+    *len = 0;
+    return status;
+}
+
+/* ---- a package's own settings ------------------------------------------------- */
+
 /* The broker's way to a package's own settings. The schema is the
  * package's installed manifest, read afresh each time: an update that
  * changes the schema changes what its settings are from that moment, and
@@ -399,9 +463,9 @@ static int settings_call(void *ctx, const char *id, const char *patch, size_t pl
     char err[300];
 
     if (ext_manifest_of(&cfg->ext, id, &m, err, sizeof(err)) != 0)
-        return settings_say(out, olen, 502, json_pack("{s:s}", "error", err));
+        return say_json(out, olen, 502, json_pack("{s:s}", "error", err));
     if (m.nsettings == 0)
-        return settings_say(out, olen, 404, json_pack("{s:s}", "error", "this package declares no settings"));
+        return say_json(out, olen, 404, json_pack("{s:s}", "error", "this package declares no settings"));
     if (patch) {
         json_error_t je;
         json_t *body = json_loadb(patch, plen, JSON_REJECT_DUPLICATES, &je);
@@ -409,10 +473,10 @@ static int settings_call(void *ctx, const char *id, const char *patch, size_t pl
                       : (snprintf(err, sizeof(err), "the body is a JSON object of settings"), -1);
         json_decref(body);
         if (rc != 0)
-            return settings_say(out, olen, 400, json_pack("{s:s}", "error", err));
+            return say_json(out, olen, 400, json_pack("{s:s}", "error", err));
         fflog(LOG_NOTICE, "%s: it changed its own settings", id);
     }
-    return settings_say(out, olen, 200,
+    return say_json(out, olen, 200,
                         json_pack("{s:o, s:o}", "settings", settings_read(cfg->ext.root, id, &m),
                                   "schema", settings_schema_json(&m)));
 }
@@ -608,7 +672,8 @@ int run_daemon(const run_cfg_t *cfg)
         close(lfd);
         return 1;
     }
-    if (api_start(&r.api, cfg->api_dir, &cfg->machine, &r.feed, settings_call, (void *)cfg, err, sizeof(err)) != 0) {
+    if (api_start(&r.api, cfg->api_dir, &cfg->machine, &r.feed, settings_call, (void *)cfg,
+                  camera_call, (void *)cfg, err, sizeof(err)) != 0) {
         fflog(LOG_ERR, "not starting: %s", err);
         evfeed_stop(&r.feed);
         holdkeep_stop(&r.holds);

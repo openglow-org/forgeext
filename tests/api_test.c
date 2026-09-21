@@ -46,6 +46,14 @@ static int set_calls;
 static char set_id[64], set_patch[256];
 static int set_status = 200;
 
+static int fake_camera(void *ctx, const char *cam, int full, int quality, unsigned char **jpeg,
+                       size_t *len, char *ctype, size_t clen, char *out, size_t olen)
+{
+    (void)ctx; (void)cam; (void)full; (void)quality; (void)jpeg; (void)len;
+    (void)ctype; (void)clen; (void)out; (void)olen;
+    return 200;                                     /* the broker never calls it in this test */
+}
+
 static int fake_settings(void *ctx, const char *id, const char *patch, size_t plen, char *out, size_t olen)
 {
     (void)ctx;
@@ -58,6 +66,7 @@ static int fake_settings(void *ctx, const char *id, const char *patch, size_t pl
 }
 
 static api_world_t world;
+static api_shot_t shot;
 
 static int call(const api_who_t *who, api_hold_t *hold, const char *text)
 {
@@ -68,7 +77,7 @@ static int call(const api_who_t *who, api_hold_t *hold, const char *text)
         CHECK(0, "the test's own request does not read: %.40s", text);
         return 0;
     }
-    return api_dispatch(who, hold, &req, &world, &park, body, sizeof(body));
+    return api_dispatch(who, hold, &req, &world, &park, &shot, body, sizeof(body));
 }
 
 static int post_events(const api_who_t *who, api_hold_t *hold, const char *json, const char *type)
@@ -100,6 +109,7 @@ int main(void)
 {
     world.machine = fake_machine;
     world.settings = fake_settings;
+    world.camera = fake_camera;
     world.feed = &feed;
     api_who_t reader = { .id = "org.example.reader", .version = "1.2.0", .uid = 800, .caps = { "machine.read", "events" }, .ncaps = 2 };
     api_who_t holder = { .id = "org.example.badge", .version = "1.0.0", .uid = 801, .caps = { "hold" }, .ncaps = 1 };
@@ -305,6 +315,62 @@ int main(void)
     rc = call(&setter, &hold, "GET /v0/settings HTTP/1.1\r\n\r\n");
     CHECK(rc == 502, "with no way to the settings: %d", rc);
     world.settings = fake_settings;
+
+    /* A camera: the capability is the one for the camera it asked for. */
+    api_who_t looker = { .id = "org.example.looker", .version = "1.0.0", .uid = 804,
+                         .caps = { "camera.lid" }, .ncaps = 1 };
+    {
+        char text[400];
+        const char *want = "{\"camera\": \"lid\", \"resolution\": \"half\"}";
+        snprintf(text, sizeof(text), "POST /v0/camera HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                     "Content-Length: %zu\r\n\r\n%s", strlen(want), want);
+        rc = call(&looker, &hold, text);
+        CHECK(rc == API_SHOOT && !strcmp(shot.cam, "lid") && shot.full == 0,
+              "the lid camera, asked for by a package that holds it: %d %s", rc, shot.cam);
+
+        want = "{\"camera\": \"lid\", \"resolution\": \"full\", \"quality\": 80}";
+        snprintf(text, sizeof(text), "POST /v0/camera HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                     "Content-Length: %zu\r\n\r\n%s", strlen(want), want);
+        rc = call(&looker, &hold, text);
+        CHECK(rc == API_SHOOT && shot.full == 1 && shot.quality == 80,
+              "the whole frame at a quality it named: %d full %d q %d", rc, shot.full, shot.quality);
+
+        /* The head camera is a capability of its own. */
+        want = "{\"camera\": \"head\"}";
+        snprintf(text, sizeof(text), "POST /v0/camera HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                     "Content-Length: %zu\r\n\r\n%s", strlen(want), want);
+        rc = call(&looker, &hold, text);
+        CHECK(rc == 403 && strstr(error_words(), "camera"),
+              "the head camera, held by a package that holds only the lid's: %d", rc);
+        rc = call(&reader, &hold, text);
+        CHECK(rc == 403, "a camera at all, without either capability: %d", rc);
+
+        CHECK(call(&looker, &hold, "GET /v0/camera HTTP/1.1\r\n\r\n") == 405, "a camera is a POST");
+
+        static const struct { const char *json, *name; } badshot[] = {
+            { "{}", "no camera named" },
+            { "{\"camera\": \"bed\"}", "a camera there is none of" },
+            { "{\"camera\": \"lid\", \"resolution\": \"huge\"}", "a resolution there is none of" },
+            { "{\"camera\": \"lid\", \"quality\": 0}", "a quality below the range" },
+            { "{\"camera\": \"lid\", \"quality\": 101}", "a quality above the range" },
+            { "{\"camera\": \"lid\", \"lamp\": 500}", "a key the form does not have" },
+            { "{\"camera\": \"lid\", \"camera\": \"head\"}", "a key twice" },
+            { "[\"lid\"]", "an array" },
+        };
+        for (size_t i = 0; i < sizeof(badshot) / sizeof(badshot[0]); i++) {
+            snprintf(text, sizeof(text), "POST /v0/camera HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                         "Content-Length: %zu\r\n\r\n%s",
+                     strlen(badshot[i].json), badshot[i].json);
+            rc = call(&looker, &hold, text);
+            CHECK(rc == 400 && error_words()[0], "%s: %d", badshot[i].name, rc);
+        }
+        world.camera = NULL;
+        const char *want2 = "{\"camera\": \"lid\"}";
+        snprintf(text, sizeof(text), "POST /v0/camera HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                     "Content-Length: %zu\r\n\r\n%s", strlen(want2), want2);
+        CHECK(call(&looker, &hold, text) == 502, "with no way to the cameras");
+        world.camera = fake_camera;
+    }
 
     /* Everything else. */
     CHECK(call(&reader, &hold, "GET / HTTP/1.1\r\n\r\n") == 404, "the root");

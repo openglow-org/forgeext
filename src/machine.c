@@ -128,6 +128,102 @@ done:
     return rc;
 }
 
+/* One header's value out of a response head, or "". */
+static void head_value(const char *head, const char *name, char *out, size_t olen)
+{
+    size_t n = strlen(name);
+    out[0] = '\0';
+    for (const char *p = head; p && *p; p = strchr(p, '\n')) {
+        while (*p == '\n' || *p == '\r')
+            p++;
+        if (strncasecmp(p, name, n) != 0 || p[n] != ':')
+            continue;
+        const char *v = p + n + 1;
+        while (*v == ' ')
+            v++;
+        size_t k = strcspn(v, "\r\n");
+        if (k >= olen)
+            k = olen - 1;
+        memcpy(out, v, k);
+        out[k] = '\0';
+        return;
+    }
+}
+
+int machine_get_blob(const machine_cfg_t *cfg, const char *path, unsigned char **out, size_t *len,
+                     char *ctype, size_t clen)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)cfg->port) };
+    struct timespec ts;
+    unsigned char *buf = NULL;
+    size_t got = 0, cap = 64 * 1024;
+    int rc = -1, status = 0;
+
+    *out = NULL;
+    *len = 0;
+    if (ctype && clen)
+        ctype[0] = '\0';
+    if (inet_pton(AF_INET, cfg->host, &a.sin_addr) != 1)
+        return -1;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long deadline = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L + MACHINE_BLOB_TIMEOUT_MS;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        int soerr = 0;
+        socklen_t sl = sizeof(soerr);
+        if (errno != EINPROGRESS || wait_fd(fd, POLLOUT, deadline) != 0
+            || getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0 || soerr != 0)
+            goto done;
+    }
+    char req[300];
+    int rlen = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
+                        path, cfg->host);
+    if (rlen <= 0 || (size_t)rlen >= sizeof(req) || wait_fd(fd, POLLOUT, deadline) != 0
+        || send(fd, req, (size_t)rlen, MSG_NOSIGNAL) != rlen)
+        goto done;
+    buf = malloc(cap);
+    if (!buf)
+        goto done;
+    while (got < MACHINE_BLOB_MAX && wait_fd(fd, POLLIN, deadline) == 0) {
+        if (got + 16384 > cap) {
+            size_t want = cap * 2 > MACHINE_BLOB_MAX + 16384 ? MACHINE_BLOB_MAX + 16384 : cap * 2;
+            unsigned char *bigger = realloc(buf, want);
+            if (!bigger)
+                goto done;
+            buf = bigger;
+            cap = want;
+        }
+        ssize_t k = recv(fd, buf + got, cap - got, 0);
+        if (k < 0 && (errno == EAGAIN || errno == EINTR))
+            continue;
+        if (k <= 0)
+            break;
+        got += (size_t)k;
+    }
+    /* The head, then the body: the body is bytes and is never a string. */
+    unsigned char *end = memmem(buf, got, "\r\n\r\n", 4);
+    if (got < 12 || strncmp((char *)buf, "HTTP/1.", 7) != 0 || !end)
+        goto done;
+    status = atoi((char *)buf + 9);
+    size_t hlen = (size_t)(end - buf);
+    char head[2048];
+    snprintf(head, sizeof(head), "%.*s", (int)(hlen < sizeof(head) - 1 ? hlen : sizeof(head) - 1), (char *)buf);
+    if (ctype && clen)
+        head_value(head, "Content-Type", ctype, clen);
+    size_t blen = got - hlen - 4;
+    memmove(buf, end + 4, blen);
+    *out = buf;
+    *len = blen;
+    buf = NULL;                                     /* the caller's now */
+    rc = status == 200 ? 0 : -status;
+done:
+    free(buf);
+    close(fd);
+    return rc;
+}
+
 static json_t *get_json(const machine_cfg_t *cfg, const char *path)
 {
     static char body[HTTP_MAX];

@@ -176,8 +176,53 @@ int api_events_answer(evfeed_t *feed, unsigned long since, char *body, size_t bl
                                           "connected", feed ? evfeed_connected(feed) : 0, "events", list));
 }
 
+/* {"camera": "lid"|"head", "resolution": "full"|"half", "quality": n}:
+ * those three keys, the camera required, and no other. */
+static int shot_from(const httpreq_t *req, api_shot_t *out, const char **why)
+{
+    json_error_t je;
+    json_t *j = json_loadb(req->body, req->body_len, JSON_REJECT_DUPLICATES, &je);
+    const char *key;
+    json_t *v;
+    int bad = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->full = 0;                                  /* half a frame unless it asks for the whole */
+    out->quality = 0;                               /* the machine's own default */
+    *why = "the body is a JSON object: {\"camera\": \"lid\", \"resolution\": \"half\"}";
+    if (!json_is_object(j)) {
+        json_decref(j);
+        return -1;
+    }
+    json_object_foreach(j, key, v) {
+        const char *sv = json_string_value(v);
+        if (strcmp(key, "camera") == 0 && sv && (strcmp(sv, "lid") == 0 || strcmp(sv, "head") == 0)) {
+            snprintf(out->cam, sizeof(out->cam), "%s", sv);
+        } else if (strcmp(key, "resolution") == 0 && sv
+                   && (strcmp(sv, "full") == 0 || strcmp(sv, "half") == 0)) {
+            out->full = strcmp(sv, "full") == 0;
+        } else if (strcmp(key, "quality") == 0 && json_is_integer(v)
+                   && json_integer_value(v) >= 1 && json_integer_value(v) <= 100) {
+            out->quality = (int)json_integer_value(v);
+        } else {
+            *why = "the body holds camera (lid or head), resolution (full or half), and quality "
+                   "(1 to 100), and nothing else";
+            bad = 1;
+            break;
+        }
+    }
+    json_decref(j);
+    if (bad)
+        return -1;
+    if (!out->cam[0]) {
+        *why = "camera is lid or head";
+        return -1;
+    }
+    return 0;
+}
+
 int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, const api_world_t *world,
-                 api_park_t *park, char *body, size_t blen)
+                 api_park_t *park, api_shot_t *shot, char *body, size_t blen)
 {
     evfeed_t *feed = world ? world->feed : NULL;
     static const struct { const char *path, *upstream; } machine[] = {
@@ -211,6 +256,26 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
         }
         json_decref(j);
         return 200;
+    }
+    if (strcmp(p, "/v0/camera") == 0) {
+        if (req->method != HTTPREQ_POST)
+            return refuse(body, blen, 405, "POST /v0/camera with {\"camera\": \"lid\"}");
+        if (!req->json_body)
+            return refuse(body, blen, 415, "POST /v0/camera takes application/json");
+        api_shot_t want;
+        const char *why;
+        if (shot_from(req, &want, &why) != 0)
+            return refuse(body, blen, 400, why);
+        /* The capability is the one for the camera it asked for, so a
+         * package granted the lid camera cannot reach the head's. */
+        char cap[16];
+        snprintf(cap, sizeof(cap), "camera.%.7s", want.cam);
+        if (!api_may(who, cap))
+            return refuse(body, blen, 403, "this package does not hold that camera");
+        if (!world || !world->camera || !shot)
+            return refuse(body, blen, 502, "the host cannot reach the cameras");
+        *shot = want;
+        return API_SHOOT;
     }
     if (strcmp(p, "/v0/settings") == 0) {
         if (!api_may(who, "settings.own"))
@@ -290,16 +355,39 @@ static const char *status_text(int code)
 
 /* The whole reply, then the connection is done with. The socket is
  * non-blocking: a peer that does not read loses the rest. */
-static void answer(int fd, int status, const char *body)
+static void answer_typed(int fd, int status, const char *type, const void *body, size_t blen)
 {
     char head[256];
-    size_t blen = strlen(body);
     int n = snprintf(head, sizeof(head),
-                     "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-                     status, status_text(status), blen);
+                     "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                     status, status_text(status), type, blen);
+    /* A frame is larger than one send takes, so it goes out in turns
+     * rather than in one that would be cut short. */
     struct iovec iov[2] = { { head, (size_t)n }, { (void *)body, blen } };
     struct msghdr msg = { .msg_iov = iov, .msg_iovlen = 2 };
-    (void)sendmsg(fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    ssize_t sent = sendmsg(fd, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (sent < 0)
+        return;
+    size_t done = (size_t)sent;
+    if (done < (size_t)n)
+        return;                                     /* not even the head went: the peer is gone */
+    done -= (size_t)n;
+    double until = mono() + 5.0;
+    while (done < blen && mono() < until) {
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        if (poll(&pfd, 1, 200) != 1)
+            continue;
+        ssize_t k = send(fd, (const unsigned char *)body + done, blen - done, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (k > 0)
+            done += (size_t)k;
+        else if (k < 0 && errno != EAGAIN && errno != EINTR)
+            break;
+    }
+}
+
+static void answer(int fd, int status, const char *body)
+{
+    answer_typed(fd, status, "application/json", body, strlen(body));
 }
 
 static void answer_error(int fd, int status, const char *words)
@@ -333,6 +421,53 @@ static int upstream_get(void *ctx, const char *path, char *out, size_t olen)
     return machine_get(ctx, path, out, olen);
 }
 
+/* One capture at a time, off the broker's thread. The connection it is
+ * for is held open meanwhile; if it goes away first, the frame is taken
+ * and thrown away, which is the cheapest way to be sure the machine is
+ * never left mid-capture. */
+static void *camera_thread(void *arg)
+{
+    api_t *a = arg;
+    for (;;) {
+        pthread_mutex_lock(&a->mu);
+        while (!a->stop && !a->cam_busy)
+            pthread_cond_wait(&a->cam_wake, &a->mu);
+        if (a->stop) {
+            pthread_mutex_unlock(&a->mu);
+            return NULL;
+        }
+        api_shot_t shot = a->cam_shot;
+        api_who_t who = a->cam_who;
+        api_camera_fn fn = a->world.camera;
+        void *ctx = a->world.camera_ctx;
+        int idx = a->cam_conn;
+        pthread_mutex_unlock(&a->mu);
+
+        unsigned char *jpeg = NULL;
+        size_t len = 0;
+        char ctype[64] = "", body[1024];
+        int status = fn ? fn(ctx, shot.cam, shot.full, shot.quality, &jpeg, &len, ctype, sizeof(ctype),
+                             body, sizeof(body))
+                        : 502;
+        if (!fn)
+            snprintf(body, sizeof(body), "{\"error\":\"the host cannot reach the cameras\"}");
+
+        pthread_mutex_lock(&a->mu);
+        api_conn_t *c = idx >= 0 && idx < API_MAX_CONNS ? &a->conn[idx] : NULL;
+        if (c && c->fd > 0 && c->shooting && strcmp(a->svc[c->svc].who.id, who.id) == 0) {
+            if (status == 200 && jpeg)
+                answer_typed(c->fd, 200, ctype[0] ? ctype : "image/jpeg", jpeg, len);
+            else
+                answer(c->fd, status, body);
+            conn_drop(c);
+        }
+        a->cam_busy = 0;
+        a->cam_conn = -1;
+        pthread_mutex_unlock(&a->mu);
+        free(jpeg);
+    }
+}
+
 /* One whole request is in the buffer: judge it and answer. Called with the
  * lock held; the lock is let go for the one call that can wait. */
 /* 0 when the connection was answered and is done with, 1 when it was
@@ -344,10 +479,12 @@ static int serve(api_t *a, api_conn_t *c, const httpreq_t *req)
     api_who_t who = s->who;
     api_hold_t hold = s->hold;
     api_park_t park = { 0, 0 };
+    api_shot_t shot;
     int fd = c->fd;
 
+    memset(&shot, 0, sizeof(shot));
     pthread_mutex_unlock(&a->mu);
-    int status = api_dispatch(&who, &hold, req, &a->world, &park, body, sizeof(body));
+    int status = api_dispatch(&who, &hold, req, &a->world, &park, &shot, body, sizeof(body));
     pthread_mutex_lock(&a->mu);
     /* The service may have ended while forgectrl was being asked. */
     if (s->used && strcmp(s->who.id, who.id) == 0) {
@@ -366,6 +503,22 @@ static int serve(api_t *a, api_conn_t *c, const httpreq_t *req)
         c->ev_since = park.since;
         c->ev_until = mono() + park.seconds;
         c->len = 0;
+        return 1;
+    }
+    if (status == API_SHOOT) {
+        if (a->cam_busy) {
+            answer_error(fd, 503, "a capture is already under way: try again");
+            return 0;
+        }
+        a->cam_busy = 1;
+        a->cam_shot = shot;
+        a->cam_who = who;
+        a->cam_conn = (int)(c - a->conn);
+        c->shooting = 1;
+        c->parked = 1;                              /* the loop leaves it alone; the camera answers it */
+        c->ev_until = mono() + API_SHOT_TIMEOUT_S;
+        c->len = 0;
+        pthread_cond_signal(&a->cam_wake);
         return 1;
     }
     answer(fd, status, body);
@@ -487,6 +640,13 @@ static void *broker(void *arg)
             api_conn_t *c = &a->conn[i];
             if (c->fd <= 0)
                 continue;
+            if (c->shooting) {
+                if (now >= c->ev_until) {
+                    answer_error(c->fd, 504, "the capture did not come back in time");
+                    conn_drop(c);
+                }
+                continue;
+            }
             if (c->parked) {
                 if (head > c->ev_since || now >= c->ev_until) {
                     static char body[API_BODY_MAX];
@@ -513,15 +673,20 @@ static void sock_path(const api_t *a, const char *id, char *p, size_t plen)
 }
 
 int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed,
-              api_settings_fn settings, void *settings_ctx, char *err, size_t elen)
+              api_settings_fn settings, void *settings_ctx,
+              api_camera_fn camera, void *camera_ctx, char *err, size_t elen)
 {
     memset(a, 0, sizeof(*a));
     pthread_mutex_init(&a->mu, NULL);
+    pthread_cond_init(&a->cam_wake, NULL);
+    a->cam_conn = -1;
     a->world.feed = feed;
     a->world.machine = upstream_get;
     a->world.machine_ctx = &a->upstream;
     a->world.settings = settings;
     a->world.settings_ctx = settings_ctx;
+    a->world.camera = camera;
+    a->world.camera_ctx = camera_ctx;
     if (strlen(dir) >= sizeof(a->dir) - 72) {
         snprintf(err, elen, "the API directory's path is too long");
         return -1;
@@ -551,6 +716,15 @@ int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t
         snprintf(err, elen, "cannot start the broker's thread");
         return -1;
     }
+    if (pthread_create(&a->cam_thread, NULL, camera_thread, a) != 0) {
+        snprintf(err, elen, "cannot start the camera's thread");
+        pthread_mutex_lock(&a->mu);
+        a->stop = 1;
+        pthread_mutex_unlock(&a->mu);
+        pthread_join(a->thread, NULL);
+        return -1;
+    }
+    a->cam_started = 1;
     a->started = 1;
     return 0;
 }
@@ -575,8 +749,12 @@ void api_stop(api_t *a)
         return;
     pthread_mutex_lock(&a->mu);
     a->stop = 1;
+    pthread_cond_broadcast(&a->cam_wake);
     pthread_mutex_unlock(&a->mu);
     pthread_join(a->thread, NULL);
+    if (a->cam_started)
+        pthread_join(a->cam_thread, NULL);
+    a->cam_started = 0;
     for (int i = 0; i < API_MAX_SERVICES; i++)
         if (a->svc[i].used)
             svc_shut(a, i);

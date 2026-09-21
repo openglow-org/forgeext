@@ -24,6 +24,14 @@
  *   POST /v0/events            {"since": n, "wait": s}: the machine's events after n (events)
  *   GET  /v0/settings          its own settings, its schema's defaults filling what is unset (settings.own)
  *   POST /v0/settings          a patch of them, all applied or none (settings.own)
+ *   POST /v0/camera            {"camera": "lid"|"head", ...}: one frame (camera.lid, camera.head)
+ *
+ * The camera answer is a JPEG and not JSON, and a capture takes seconds,
+ * so it is neither answered from the JSON buffer nor waited for on this
+ * thread: the request is parked as an events poll is, one capture runs at
+ * a time on a thread of its own, and the bytes go out when it is done. A
+ * package's capture is always a background one, so it yields to an
+ * operator who is watching a camera rather than stuttering their stream.
  *
  * The events call is a poll and not a stream: it says the sequence number
  * it has and is answered with what came after it, waiting up to `wait`
@@ -71,6 +79,7 @@
 #define API_EVENTS_MAX      32              /* events in one answer: the rest waits for the next call */
 #define API_EVENTS_WAIT_MAX 30.0            /* seconds a poll may wait */
 #define API_PARK            (-1)            /* dispatch's word for "this one waits" */
+#define API_SHOT_TIMEOUT_S  25.0            /* a capture that never comes back frees its connection */
 
 /* What the broker knows of a package: what it may use. */
 typedef struct {
@@ -95,6 +104,14 @@ typedef int (*api_upstream_fn)(void *ctx, const char *path, char *out, size_t ol
 typedef int (*api_settings_fn)(void *ctx, const char *id, const char *patch, size_t plen,
                                char *out, size_t olen);
 
+/* One frame from a camera. Returns the status; on 200 *jpeg and *len are
+ * the frame (malloc'd, the caller frees) and ctype its type, otherwise
+ * out holds the JSON error. Runs on the camera thread, never the
+ * broker's. */
+typedef int (*api_camera_fn)(void *ctx, const char *cam, int full, int quality,
+                             unsigned char **jpeg, size_t *len, char *ctype, size_t clen,
+                             char *out, size_t olen);
+
 /* What the broker can reach past itself. api_dispatch() does no I/O but
  * through this, so a test hands it fakes and the daemon hands it the
  * machine. */
@@ -103,8 +120,17 @@ typedef struct {
     void *machine_ctx;
     api_settings_fn settings;
     void *settings_ctx;
+    api_camera_fn camera;
+    void *camera_ctx;
     evfeed_t *feed;
 } api_world_t;
+
+/* What a package asked a camera for, once the broker has judged it. */
+typedef struct {
+    char cam[8];
+    int full;
+    int quality;
+} api_shot_t;
 
 /* A request that is to wait: from which event, and until when. */
 typedef struct {
@@ -112,11 +138,22 @@ typedef struct {
     double seconds;
 } api_park_t;
 
+/* An answer that is bytes rather than JSON. When bytes is set the caller
+ * sends them with this type and frees them. */
+typedef struct {
+    unsigned char *bytes;
+    size_t len;
+    char type[64];
+} api_bin_t;
+
+
 /* The broker's judgment of one request: the status, and the JSON body into
  * body. hold is the package's word, changed by a POST /v0/hold. No I/O but
  * through up. */
 int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, const api_world_t *world,
-                 api_park_t *park, char *body, size_t blen);
+                 api_park_t *park, api_shot_t *shot, char *body, size_t blen);
+
+#define API_SHOOT (-2)          /* dispatch's word for "this one wants a camera frame" */
 
 /* The answer to an events poll: what the feed holds after `since`. The
  * broker builds it when the wait is over, or at once when it need not
@@ -137,6 +174,7 @@ typedef struct {
     int fd, svc;
     int limited;                        /* over its rate: the request is read, and answered 429 */
     int parked;                         /* an events poll, waiting for an event or its deadline */
+    int shooting;                       /* a camera request, waiting for the camera thread */
     unsigned long ev_since;
     double ev_until;
     double since;
@@ -150,14 +188,23 @@ typedef struct {
     int started, stop;
     char dir[256];
     machine_cfg_t upstream;
-    api_world_t world;                  /* the feed, the machine, and a package's own settings */
+    api_world_t world;                  /* the feed, the machine, a package's settings, the cameras */
+    /* One capture at a time, on its own thread: a capture takes seconds
+     * and the broker carries holds and event polls that cannot wait for
+     * it. The connection waiting for it is remembered by index. */
+    pthread_t cam_thread;
+    int cam_started, cam_busy, cam_conn;
+    api_shot_t cam_shot;
+    api_who_t cam_who;
+    pthread_cond_t cam_wake;
     api_svc_t svc[API_MAX_SERVICES];
     api_conn_t conn[API_MAX_CONNS];
 } api_t;
 
 /* Make the directory, remove the sockets a previous host left, start the thread. */
 int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed,
-              api_settings_fn settings, void *settings_ctx, char *err, size_t elen);
+              api_settings_fn settings, void *settings_ctx,
+              api_camera_fn camera, void *camera_ctx, char *err, size_t elen);
 void api_stop(api_t *a);
 
 /* A service is about to start: its socket exists before it does, and its

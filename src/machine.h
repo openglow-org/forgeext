@@ -46,6 +46,19 @@ void machine_read(const machine_cfg_t *cfg, machine_t *m, int with_start_facts);
 /* One GET of forgectrl: the body into out. 0 on a 200, else -1. */
 int machine_get(const machine_cfg_t *cfg, const char *path, char *out, size_t olen);
 
+/* A GET whose body is too large for a buffer and too slow for the
+ * ordinary timeout: a camera frame. The body is malloc'd into *out and
+ * is the caller's to free; *len is its length and ctype the answer's
+ * Content-Type. Returns 0 on a 200, or minus the status the machine
+ * gave (with its JSON body in *out when it sent one), or -1 when it
+ * could not be reached at all. Nothing larger than MACHINE_BLOB_MAX is
+ * read. */
+#define MACHINE_BLOB_MAX      (8 * 1024 * 1024)
+#define MACHINE_BLOB_TIMEOUT_MS 20000
+
+int machine_get_blob(const machine_cfg_t *cfg, const char *path, unsigned char **out, size_t *len,
+                     char *ctype, size_t clen);
+
 /* `key=value` out of a settings file: 1 when the key is there. */
 int machine_conf_value(const char *conf, const char *key, char *out, size_t olen);
 
