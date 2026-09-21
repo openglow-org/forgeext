@@ -176,9 +176,10 @@ int api_events_answer(evfeed_t *feed, unsigned long since, char *body, size_t bl
                                           "connected", feed ? evfeed_connected(feed) : 0, "events", list));
 }
 
-int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, api_upstream_fn up, void *upctx,
-                 evfeed_t *feed, api_park_t *park, char *body, size_t blen)
+int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, const api_world_t *world,
+                 api_park_t *park, char *body, size_t blen)
 {
+    evfeed_t *feed = world ? world->feed : NULL;
     static const struct { const char *path, *upstream; } machine[] = {
         { "/v0/machine/status", "/status" }, { "/v0/machine/cool", "/cool/status" }, { "/v0/machine/mode", "/mode" },
     };
@@ -200,7 +201,7 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, a
             return refuse(body, blen, 405, "the machine is read with GET");
         if (!api_may(who, "machine.read"))
             return refuse(body, blen, 403, "this package does not hold machine.read");
-        if (!up || up(upctx, machine[i].upstream, body, blen) != 0)
+        if (!world || !world->machine || world->machine(world->machine_ctx, machine[i].upstream, body, blen) != 0)
             return refuse(body, blen, 502, "forgectrl does not answer");
         /* What goes on to the package is JSON, or nothing. */
         json_t *j = json_loads(body, JSON_REJECT_DUPLICATES, NULL);
@@ -210,6 +211,17 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, a
         }
         json_decref(j);
         return 200;
+    }
+    if (strcmp(p, "/v0/settings") == 0) {
+        if (!api_may(who, "settings.own"))
+            return refuse(body, blen, 403, "this package does not hold settings.own");
+        if (!world || !world->settings)
+            return refuse(body, blen, 502, "the host cannot reach this package's settings");
+        if (req->method == HTTPREQ_GET)
+            return world->settings(world->settings_ctx, who->id, NULL, 0, body, blen);
+        if (!req->json_body)
+            return refuse(body, blen, 415, "POST /v0/settings takes application/json");
+        return world->settings(world->settings_ctx, who->id, req->body, req->body_len, body, blen);
     }
     if (strcmp(p, "/v0/events") == 0) {
         if (req->method != HTTPREQ_POST)
@@ -335,7 +347,7 @@ static int serve(api_t *a, api_conn_t *c, const httpreq_t *req)
     int fd = c->fd;
 
     pthread_mutex_unlock(&a->mu);
-    int status = api_dispatch(&who, &hold, req, upstream_get, &a->upstream, a->feed, &park, body, sizeof(body));
+    int status = api_dispatch(&who, &hold, req, &a->world, &park, body, sizeof(body));
     pthread_mutex_lock(&a->mu);
     /* The service may have ended while forgectrl was being asked. */
     if (s->used && strcmp(s->who.id, who.id) == 0) {
@@ -470,7 +482,7 @@ static void *broker(void *arg)
         /* A parked poll is answered when the feed moves past it, or when
          * its own wait runs out - with an empty list, which is how a
          * reader learns that nothing happened. */
-        unsigned long head = a->feed ? evfeed_head(a->feed) : 0;
+        unsigned long head = a->world.feed ? evfeed_head(a->world.feed) : 0;
         for (int i = 0; i < API_MAX_CONNS; i++) {
             api_conn_t *c = &a->conn[i];
             if (c->fd <= 0)
@@ -478,7 +490,7 @@ static void *broker(void *arg)
             if (c->parked) {
                 if (head > c->ev_since || now >= c->ev_until) {
                     static char body[API_BODY_MAX];
-                    int status = api_events_answer(a->feed, c->ev_since, body, sizeof(body));
+                    int status = api_events_answer(a->world.feed, c->ev_since, body, sizeof(body));
                     answer(c->fd, status, body);
                     conn_drop(c);
                 }
@@ -500,11 +512,16 @@ static void sock_path(const api_t *a, const char *id, char *p, size_t plen)
     snprintf(p, plen, "%.255s/%.63s.sock", a->dir, id);
 }
 
-int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed, char *err, size_t elen)
+int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed,
+              api_settings_fn settings, void *settings_ctx, char *err, size_t elen)
 {
     memset(a, 0, sizeof(*a));
     pthread_mutex_init(&a->mu, NULL);
-    a->feed = feed;
+    a->world.feed = feed;
+    a->world.machine = upstream_get;
+    a->world.machine_ctx = &a->upstream;
+    a->world.settings = settings;
+    a->world.settings_ctx = settings_ctx;
     if (strlen(dir) >= sizeof(a->dir) - 72) {
         snprintf(err, elen, "the API directory's path is too long");
         return -1;

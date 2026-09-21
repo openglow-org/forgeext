@@ -7,6 +7,8 @@
 #define _GNU_SOURCE
 #include "install.h"
 
+#include "settings.h"
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -54,7 +56,7 @@ int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
 {
     static const struct { const char *name; mode_t mode; } dirs[] = {
         { "", 0755 }, { "/pkg", 0755 }, { "/data", 0755 }, { "/keys", 0755 }, { "/required-holds", 0755 },
-        { "/tmp", 0700 },
+        { "/" SETTINGS_DIR, 0700 }, { "/tmp", 0700 },
     };
     if (!env->root || !env->root[0] || strlen(env->root) > EXT_ROOT_MAX)
         return fail(err, elen, "the extension root is a path of at most %d bytes", EXT_ROOT_MAX);
@@ -477,6 +479,7 @@ int ext_remove(const ext_env_t *env, const char *id, int keep_data, char *err, s
             fail(err, elen, "%s is not installed", id);
         } else {
             state_remove(st, id);
+            settings_forget(env->root, id);                 /* its settings are its own: they go with it */
             rc = state_save(env->root, st, err, elen);      /* forgotten first: a half-removed tree is never started */
             if (rc == 0)
                 ext_required_holds_sync(env, st);           /* and its hold goes with it: removal is the operator's exit */

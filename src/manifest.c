@@ -15,8 +15,10 @@
 
 static const char *const known_keys[] = {
     "manifest", "id", "name", "version", "description", "author", "license", "homepage",
-    "api", "core", "runtime", "service", "modes", "capabilities", "conflicts",
+    "api", "core", "runtime", "service", "modes", "capabilities", "conflicts", "settings",
 };
+
+static const char *const setting_types[] = { "string", "number", "bool", "choice" };
 
 static const char *const runtime_names[] = { "data", "ui", "shell", "native", "python" };
 
@@ -46,6 +48,14 @@ const char *manifest_runtime_name(manifest_runtime_t r)
 int manifest_has_service(const manifest_t *m)
 {
     return m->runtime == RUNTIME_SHELL || m->runtime == RUNTIME_NATIVE || m->runtime == RUNTIME_PYTHON;
+}
+
+const setting_t *manifest_setting(const manifest_t *m, const char *name)
+{
+    for (int i = 0; i < m->nsettings; i++)
+        if (strcmp(m->settings[i].name, name) == 0)
+            return &m->settings[i];
+    return NULL;
 }
 
 int manifest_has_cap(const manifest_t *m, const char *cap)
@@ -355,6 +365,162 @@ static int take_caps(json_t *root, manifest_t *m, char *err, size_t elen)
     return 0;
 }
 
+/* A settings key: a lower-case word, so it is a file key and a panel
+ * field without quoting anywhere. */
+static int setting_name_ok(const char *s)
+{
+    size_t n = strlen(s);
+    if (n == 0 || n >= SETTING_NAME_MAX || s[0] < 'a' || s[0] > 'z')
+        return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= '0' && s[i] <= '9') || s[i] == '_'))
+            return 0;
+    return 1;
+}
+
+static int take_choices(json_t *o, setting_t *t, const char *name, char *err, size_t elen)
+{
+    json_t *list = json_object_get(o, "choices");
+    if (!json_is_array(list) || json_array_size(list) < 2 || json_array_size(list) > SETTING_CHOICES_MAX)
+        return fail(err, elen, "setting \"%.32s\": a choice has 2 to %d choices", name, SETTING_CHOICES_MAX);
+    for (size_t i = 0; i < json_array_size(list); i++) {
+        json_t *c = json_array_get(list, i);
+        const char *v = json_string_value(c);
+        if (!v || json_string_length(c) != strlen(v) || strlen(v) >= SETTING_CHOICE_MAX || !v[0])
+            return fail(err, elen, "setting \"%.32s\": choice %zu is not a string of 1 to %d bytes", name, i,
+                        SETTING_CHOICE_MAX - 1);
+        for (int k = 0; k < t->nchoices; k++)
+            if (strcmp(t->choices[k], v) == 0)
+                return fail(err, elen, "setting \"%.32s\": the choice \"%.32s\" is named twice", name, v);
+        snprintf(t->choices[t->nchoices++], SETTING_CHOICE_MAX, "%s", v);
+    }
+    return 0;
+}
+
+/* One declared setting. The default is required and is held to the same
+ * rule as any value the package will later set, so a package cannot
+ * declare a default its own schema refuses. */
+static int take_setting(const char *name, json_t *o, setting_t *t, char *err, size_t elen)
+{
+    static const char *const known[] = { "type", "default", "label", "min", "max", "choices" };
+    const char *key;
+    json_t *val;
+
+    memset(t, 0, sizeof(*t));
+    if (!setting_name_ok(name))
+        return fail(err, elen, "setting \"%.32s\": a name is a to z, 0 to 9 and _, starting with a letter, "
+                               "at most %d bytes", name, SETTING_NAME_MAX - 1);
+    if (!json_is_object(o))
+        return fail(err, elen, "setting \"%.32s\" is not an object", name);
+    json_object_foreach(o, key, val) {
+        size_t i = 0;
+        while (i < sizeof(known) / sizeof(known[0]) && strcmp(known[i], key) != 0)
+            i++;
+        if (i == sizeof(known) / sizeof(known[0]))
+            return fail(err, elen, "setting \"%.32s\" has an unknown key \"%.32s\"", name, key);
+    }
+    snprintf(t->name, sizeof(t->name), "%s", name);
+    const char *type = json_string_value(json_object_get(o, "type"));
+    size_t ti = 0;
+    while (type && ti < sizeof(setting_types) / sizeof(setting_types[0]) && strcmp(setting_types[ti], type) != 0)
+        ti++;
+    if (!type || ti == sizeof(setting_types) / sizeof(setting_types[0]))
+        return fail(err, elen, "setting \"%.32s\": \"type\" is string, number, bool, or choice", name);
+    t->type = (setting_type_t)ti;
+    json_t *label = json_object_get(o, "label");
+    if (label) {
+        const char *l = json_string_value(label);
+        if (!l || json_string_length(label) != strlen(l) || strlen(l) >= SETTING_LABEL_MAX)
+            return fail(err, elen, "setting \"%.32s\": \"label\" is a string of at most %d bytes", name,
+                        SETTING_LABEL_MAX - 1);
+        snprintf(t->label, sizeof(t->label), "%s", l);
+    } else {
+        snprintf(t->label, sizeof(t->label), "%s", name);
+    }
+    json_t *def = json_object_get(o, "default");
+    if (!def)
+        return fail(err, elen, "setting \"%.32s\": \"default\" is missing (a setting is never unset)", name);
+    json_t *mn = json_object_get(o, "min"), *mx = json_object_get(o, "max");
+
+    if (t->type == SETTING_NUMBER) {
+        if (!json_is_number(def))
+            return fail(err, elen, "setting \"%.32s\": its default is not a number", name);
+        if (mn && !json_is_number(mn))
+            return fail(err, elen, "setting \"%.32s\": \"min\" is not a number", name);
+        if (mx && !json_is_number(mx))
+            return fail(err, elen, "setting \"%.32s\": \"max\" is not a number", name);
+        t->has_min = mn != NULL;
+        t->has_max = mx != NULL;
+        t->min = mn ? json_number_value(mn) : 0;
+        t->max = mx ? json_number_value(mx) : 0;
+        if (t->has_min && t->has_max && t->min > t->max)
+            return fail(err, elen, "setting \"%.32s\": its min is above its max", name);
+        t->number = json_number_value(def);
+        if ((t->has_min && t->number < t->min) || (t->has_max && t->number > t->max))
+            return fail(err, elen, "setting \"%.32s\": its default is outside its own bounds", name);
+        return 0;
+    }
+    if (mn)
+        return fail(err, elen, "setting \"%.32s\": \"min\" belongs to a number", name);
+    if (t->type == SETTING_BOOL) {
+        if (mx)
+            return fail(err, elen, "setting \"%.32s\": \"max\" belongs to a number or a string", name);
+        if (!json_is_boolean(def))
+            return fail(err, elen, "setting \"%.32s\": its default is not true or false", name);
+        t->boolean = json_is_true(def);
+        return 0;
+    }
+    /* string and choice */
+    const char *d = json_string_value(def);
+    if (!d || json_string_length(def) != strlen(d))
+        return fail(err, elen, "setting \"%.32s\": its default is not a string", name);
+    if (t->type == SETTING_CHOICE) {
+        if (mx)
+            return fail(err, elen, "setting \"%.32s\": \"max\" belongs to a number or a string", name);
+        if (take_choices(o, t, name, err, elen) != 0)
+            return -1;
+        for (int i = 0; i < t->nchoices; i++)
+            if (strcmp(t->choices[i], d) == 0) {
+                snprintf(t->text, sizeof(t->text), "%s", d);
+                return 0;
+            }
+        return fail(err, elen, "setting \"%.32s\": its default is not one of its choices", name);
+    }
+    if (json_object_get(o, "choices"))
+        return fail(err, elen, "setting \"%.32s\": \"choices\" belongs to a choice", name);
+    t->text_max = SETTING_TEXT_MAX - 1;
+    if (mx) {
+        if (!json_is_integer(mx) || json_integer_value(mx) < 1
+            || json_integer_value(mx) > (json_int_t)(SETTING_TEXT_MAX - 1))
+            return fail(err, elen, "setting \"%.32s\": \"max\" is a whole number of bytes, 1 to %d", name,
+                        SETTING_TEXT_MAX - 1);
+        t->text_max = (size_t)json_integer_value(mx);
+    }
+    if (strlen(d) > t->text_max)
+        return fail(err, elen, "setting \"%.32s\": its default is longer than its own max", name);
+    snprintf(t->text, sizeof(t->text), "%s", d);
+    return 0;
+}
+
+static int take_settings(json_t *root, manifest_t *m, char *err, size_t elen)
+{
+    json_t *o = json_object_get(root, "settings");
+    const char *key;
+    json_t *val;
+
+    m->nsettings = 0;
+    if (!o)
+        return 0;
+    if (!json_is_object(o))
+        return fail(err, elen, "\"settings\" is an object of named settings");
+    if (json_object_size(o) > MANIFEST_MAX_SETTINGS)
+        return fail(err, elen, "\"settings\" has at most %d keys", MANIFEST_MAX_SETTINGS);
+    json_object_foreach(o, key, val)
+        if (take_setting(key, val, &m->settings[m->nsettings++], err, elen) != 0)
+            return -1;
+    return 0;
+}
+
 static int take_conflicts(json_t *root, manifest_t *m, char *err, size_t elen)
 {
     json_t *list = json_object_get(root, "conflicts");
@@ -430,7 +596,7 @@ int manifest_parse(const char *text, size_t len, manifest_t *m, char *err, size_
     if (take_api(root, m, err, elen) != 0 || take_core(root, m, err, elen) != 0
         || take_runtime(root, m, err, elen) != 0 || take_service(root, m, err, elen) != 0
         || take_modes(root, m, err, elen) != 0 || take_caps(root, m, err, elen) != 0
-        || take_conflicts(root, m, err, elen) != 0)
+        || take_conflicts(root, m, err, elen) != 0 || take_settings(root, m, err, elen) != 0)
         goto out;
     rc = 0;
 out:

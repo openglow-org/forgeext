@@ -41,6 +41,24 @@ static char body[API_BODY_MAX];
 static evfeed_t feed;
 static api_park_t park;
 
+/* The settings side, faked: what the broker asked for, and a fixed answer. */
+static int set_calls;
+static char set_id[64], set_patch[256];
+static int set_status = 200;
+
+static int fake_settings(void *ctx, const char *id, const char *patch, size_t plen, char *out, size_t olen)
+{
+    (void)ctx;
+    set_calls++;
+    snprintf(set_id, sizeof(set_id), "%s", id);
+    snprintf(set_patch, sizeof(set_patch), "%.*s", patch ? (int)plen : 0, patch ? patch : "");
+    snprintf(out, olen, set_status == 200 ? "{\"settings\":{\"loud\":true},\"schema\":[]}"
+                                          : "{\"error\":\"no\"}");
+    return set_status;
+}
+
+static api_world_t world;
+
 static int call(const api_who_t *who, api_hold_t *hold, const char *text)
 {
     httpreq_t req;
@@ -50,7 +68,7 @@ static int call(const api_who_t *who, api_hold_t *hold, const char *text)
         CHECK(0, "the test's own request does not read: %.40s", text);
         return 0;
     }
-    return api_dispatch(who, hold, &req, fake_machine, NULL, &feed, &park, body, sizeof(body));
+    return api_dispatch(who, hold, &req, &world, &park, body, sizeof(body));
 }
 
 static int post_events(const api_who_t *who, api_hold_t *hold, const char *json, const char *type)
@@ -80,6 +98,9 @@ static const char *error_words(void)
 
 int main(void)
 {
+    world.machine = fake_machine;
+    world.settings = fake_settings;
+    world.feed = &feed;
     api_who_t reader = { .id = "org.example.reader", .version = "1.2.0", .uid = 800, .caps = { "machine.read", "events" }, .ncaps = 2 };
     api_who_t holder = { .id = "org.example.badge", .version = "1.0.0", .uid = 801, .caps = { "hold" }, .ncaps = 1 };
     api_who_t nobody = { .id = "org.example.plain", .version = "1.0.0", .uid = 802, .ncaps = 0 };
@@ -251,10 +272,44 @@ int main(void)
         CHECK(rc == 400 && error_words()[0], "%s: %d", badpoll[i].name, rc);
     }
 
+    /* A package's own settings: the capability, and what the broker hands on. */
+    api_who_t setter = { .id = "org.example.setter", .version = "1.0.0", .uid = 803,
+                         .caps = { "settings.own" }, .ncaps = 1 };
+    set_calls = 0;
+    rc = call(&reader, &hold, "GET /v0/settings HTTP/1.1\r\n\r\n");
+    CHECK(rc == 403 && set_calls == 0 && strstr(error_words(), "settings.own"),
+          "settings without the capability: %d, asked %d times", rc, set_calls);
+    rc = call(&setter, &hold, "GET /v0/settings HTTP/1.1\r\n\r\n");
+    CHECK(rc == 200 && set_calls == 1 && !strcmp(set_id, "org.example.setter") && !set_patch[0]
+          && strstr(body, "loud"), "the read: %d %s", rc, body);
+    {
+        const char *patch = "{\"loud\": true}";
+        char text[256];
+        snprintf(text, sizeof(text), "POST /v0/settings HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                     "Content-Length: %zu\r\n\r\n%s", strlen(patch), patch);
+        rc = call(&setter, &hold, text);
+        CHECK(rc == 200 && set_calls == 2 && !strcmp(set_patch, patch),
+              "the patch reaches the host as it was sent: %d %s", rc, set_patch);
+        snprintf(text, sizeof(text), "POST /v0/settings HTTP/1.1\r\nContent-Length: %zu\r\n\r\n%s",
+                 strlen(patch), patch);
+        rc = call(&setter, &hold, text);
+        CHECK(rc == 415 && set_calls == 2, "a patch that is not JSON: %d, asked %d times", rc, set_calls);
+        set_status = 400;
+        snprintf(text, sizeof(text), "POST /v0/settings HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                     "Content-Length: %zu\r\n\r\n%s", strlen(patch), patch);
+        rc = call(&setter, &hold, text);
+        CHECK(rc == 400 && strstr(body, "\"error\""), "the host's refusal is passed on whole: %d %s", rc, body);
+        set_status = 200;
+    }
+    world.settings = NULL;
+    rc = call(&setter, &hold, "GET /v0/settings HTTP/1.1\r\n\r\n");
+    CHECK(rc == 502, "with no way to the settings: %d", rc);
+    world.settings = fake_settings;
+
     /* Everything else. */
     CHECK(call(&reader, &hold, "GET / HTTP/1.1\r\n\r\n") == 404, "the root");
     CHECK(call(&reader, &hold, "GET /v1/self HTTP/1.1\r\n\r\n") == 404, "another version of the API");
-    CHECK(call(&reader, &hold, "GET /v0/settings HTTP/1.1\r\n\r\n") == 404, "a path the API does not have");
+    CHECK(call(&reader, &hold, "GET /v0/cameras HTTP/1.1\r\n\r\n") == 404, "a path the API does not have");
 
     printf("%s: api_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

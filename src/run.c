@@ -331,6 +331,53 @@ static void op_log(void *ctx, int prio, const char *text)
 
 static const super_ops_t OPS = { op_start, op_stop, op_freeze, op_job_limits, op_quarantine, op_healthy, op_log };
 
+/* ---- a package's own settings ------------------------------------------------- */
+
+/* One JSON answer into the broker's buffer: the status, or 500 when it
+ * does not fit. */
+static int settings_say(char *out, size_t olen, int status, json_t *j)
+{
+    char *text = j ? json_dumps(j, JSON_COMPACT) : NULL;
+    json_decref(j);
+    if (!text || strlen(text) >= olen) {
+        free(text);
+        snprintf(out, olen, "{\"error\":\"the answer did not fit\"}");
+        return 500;
+    }
+    snprintf(out, olen, "%s", text);
+    free(text);
+    return status;
+}
+
+/* The broker's way to a package's own settings. The schema is the
+ * package's installed manifest, read afresh each time: an update that
+ * changes the schema changes what its settings are from that moment, and
+ * the host never holds a schema the package no longer ships. */
+static int settings_call(void *ctx, const char *id, const char *patch, size_t plen, char *out, size_t olen)
+{
+    const run_cfg_t *cfg = ctx;
+    manifest_t m;
+    char err[300];
+
+    if (ext_manifest_of(&cfg->ext, id, &m, err, sizeof(err)) != 0)
+        return settings_say(out, olen, 502, json_pack("{s:s}", "error", err));
+    if (m.nsettings == 0)
+        return settings_say(out, olen, 404, json_pack("{s:s}", "error", "this package declares no settings"));
+    if (patch) {
+        json_error_t je;
+        json_t *body = json_loadb(patch, plen, JSON_REJECT_DUPLICATES, &je);
+        int rc = body ? settings_write(cfg->ext.root, id, &m, body, err, sizeof(err))
+                      : (snprintf(err, sizeof(err), "the body is a JSON object of settings"), -1);
+        json_decref(body);
+        if (rc != 0)
+            return settings_say(out, olen, 400, json_pack("{s:s}", "error", err));
+        fflog(LOG_NOTICE, "%s: it changed its own settings", id);
+    }
+    return settings_say(out, olen, 200,
+                        json_pack("{s:o, s:o}", "settings", settings_read(cfg->ext.root, id, &m),
+                                  "schema", settings_schema_json(&m)));
+}
+
 /* ---- one turn ---------------------------------------------------------------- */
 
 /* The holds, as they stand after this turn's policy. A package that is
@@ -522,7 +569,7 @@ int run_daemon(const run_cfg_t *cfg)
         close(lfd);
         return 1;
     }
-    if (api_start(&r.api, cfg->api_dir, &cfg->machine, &r.feed, err, sizeof(err)) != 0) {
+    if (api_start(&r.api, cfg->api_dir, &cfg->machine, &r.feed, settings_call, (void *)cfg, err, sizeof(err)) != 0) {
         fflog(LOG_ERR, "not starting: %s", err);
         evfeed_stop(&r.feed);
         holdkeep_stop(&r.holds);

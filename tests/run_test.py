@@ -303,7 +303,8 @@ def main():
         print("off, then not ready")
         check(wait_for(lambda: status().get("pid") == daemon.pid, 10), "the status file names the host that wrote it")
         check(wait_for(lambda: status().get("off_reason"), 10) and not running(), "off: %s", status().get("off_reason"))
-        check(sorted(os.listdir(root)) == ["data", "keys", "lock", "pkg", "required-holds", "state.json", "tmp"],
+        check(sorted(os.listdir(root)) == ["data", "keys", "lock", "pkg", "required-holds", "settings",
+                                           "state.json", "tmp"],
               "the extension root holds what it should and nothing else: %s", sorted(os.listdir(root)))
         check(os.path.isdir(holds_dir) and not os.listdir(holds_dir), "extensions off: no hold has a file: %s",
               os.path.isdir(holds_dir) and os.listdir(holds_dir))

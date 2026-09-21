@@ -22,6 +22,8 @@
  *   GET  /v0/hold              the package's own hold      (hold, granted)
  *   POST /v0/hold              {"raised": bool, "reason": "..."}: raise it, or clear it
  *   POST /v0/events            {"since": n, "wait": s}: the machine's events after n (events)
+ *   GET  /v0/settings          its own settings, its schema's defaults filling what is unset (settings.own)
+ *   POST /v0/settings          a patch of them, all applied or none (settings.own)
  *
  * The events call is a poll and not a stream: it says the sequence number
  * it has and is answered with what came after it, waiting up to `wait`
@@ -87,6 +89,23 @@ typedef struct {
 /* One GET of the machine: the body into out, 0 on a 200. */
 typedef int (*api_upstream_fn)(void *ctx, const char *path, char *out, size_t olen);
 
+/* A package's own settings (settings.h). patch is NULL to read them, or
+ * the request's body to apply. The whole answer, JSON either way, into
+ * out; the return is the status to send. */
+typedef int (*api_settings_fn)(void *ctx, const char *id, const char *patch, size_t plen,
+                               char *out, size_t olen);
+
+/* What the broker can reach past itself. api_dispatch() does no I/O but
+ * through this, so a test hands it fakes and the daemon hands it the
+ * machine. */
+typedef struct {
+    api_upstream_fn machine;
+    void *machine_ctx;
+    api_settings_fn settings;
+    void *settings_ctx;
+    evfeed_t *feed;
+} api_world_t;
+
 /* A request that is to wait: from which event, and until when. */
 typedef struct {
     unsigned long since;
@@ -96,8 +115,8 @@ typedef struct {
 /* The broker's judgment of one request: the status, and the JSON body into
  * body. hold is the package's word, changed by a POST /v0/hold. No I/O but
  * through up. */
-int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, api_upstream_fn up, void *upctx,
-                 evfeed_t *feed, api_park_t *park, char *body, size_t blen);
+int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, const api_world_t *world,
+                 api_park_t *park, char *body, size_t blen);
 
 /* The answer to an events poll: what the feed holds after `since`. The
  * broker builds it when the wait is over, or at once when it need not
@@ -131,13 +150,14 @@ typedef struct {
     int started, stop;
     char dir[256];
     machine_cfg_t upstream;
-    evfeed_t *feed;                     /* the one subscription every package reads from */
+    api_world_t world;                  /* the feed, the machine, and a package's own settings */
     api_svc_t svc[API_MAX_SERVICES];
     api_conn_t conn[API_MAX_CONNS];
 } api_t;
 
 /* Make the directory, remove the sockets a previous host left, start the thread. */
-int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed, char *err, size_t elen);
+int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed,
+              api_settings_fn settings, void *settings_ctx, char *err, size_t elen);
 void api_stop(api_t *a);
 
 /* A service is about to start: its socket exists before it does, and its
