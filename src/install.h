@@ -94,6 +94,17 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
 /* Remove a package and, unless keep_data, its data. */
 int ext_remove(const ext_env_t *env, const char *id, int keep_data, char *err, size_t elen);
 
+/* A package's interface: one self-contained HTML file at this path
+ * inside the package, at most this large. It renders in a sandboxed
+ * frame that can reach nothing of its own accord, so it is one file -
+ * there is nothing to load a second one with. */
+#define EXT_UI_FILE     "ui/index.html"
+#define EXT_UI_MAX      (512 * 1024)
+
+/* An installed package's interface, read from its current version. The
+ * bytes are malloc'd and the caller frees. 0, or -1 with the reason. */
+int ext_ui_html(const ext_env_t *env, const char *id, char **html, size_t *len, char *err, size_t elen);
+
 /* An installed package's manifest, from its current version. */
 int ext_manifest_of(const ext_env_t *env, const char *id, manifest_t *m, char *err, size_t elen);
 

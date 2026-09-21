@@ -163,6 +163,42 @@ static long long tree_bytes(const char *dir, int depth)
     return total;
 }
 
+int ext_ui_html(const ext_env_t *env, const char *id, char **html, size_t *len, char *err, size_t elen)
+{
+    char p[900], cur[600];
+    struct stat st;
+    FILE *f;
+
+    *html = NULL;
+    *len = 0;
+    snprintf(cur, sizeof(cur), "%.255s/pkg/%.63s/current", env->root, id);
+    snprintf(p, sizeof(p), "%.600s/%s", cur, EXT_UI_FILE);
+    f = fopen(p, "re");
+    if (!f)
+        return fail(err, elen, "this package has no interface");
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > EXT_UI_MAX) {
+        fclose(f);
+        return fail(err, elen, "this package's interface is not a file of a size that is served");
+    }
+    char *buf = malloc((size_t)st.st_size + 1);
+    if (!buf) {
+        fclose(f);
+        return fail(err, elen, "out of memory");
+    }
+    size_t got = fread(buf, 1, (size_t)st.st_size, f);
+    fclose(f);
+    buf[got] = '\0';
+    /* A NUL inside would cut the page short wherever it landed, and what
+     * is served has to be the whole file or nothing. */
+    if (got != (size_t)st.st_size || strlen(buf) != got) {
+        free(buf);
+        return fail(err, elen, "this package's interface is not text");
+    }
+    *html = buf;
+    *len = got;
+    return 0;
+}
+
 int ext_manifest_of(const ext_env_t *env, const char *id, manifest_t *m, char *err, size_t elen)
 {
     char p[512];
@@ -284,6 +320,30 @@ static int judge(const ext_env_t *env, state_t *st, install_result_t *res, char 
 
 /* The service's entry point is a file of the package, and executable
  * where the runtime runs it directly. */
+/* A package that asks for `ui` ships one, and it is one file of a size
+ * a panel can hold. A package that ships one without asking for `ui`
+ * would render nothing, so that is refused too rather than left to
+ * puzzle its author. */
+static int judge_ui(const char *tree, const manifest_t *m, char *err, size_t elen)
+{
+    char p[1024];
+    struct stat st;
+    int wants = manifest_has_cap(m, "ui");
+
+    snprintf(p, sizeof(p), "%.400s/%s", tree, EXT_UI_FILE);
+    int have = lstat(p, &st) == 0 && S_ISREG(st.st_mode);
+    if (wants && !have)
+        return fail(err, elen, "this package asks for ui and has no %s", EXT_UI_FILE);
+    if (!wants && have)
+        return fail(err, elen, "this package has a %s and does not ask for ui", EXT_UI_FILE);
+    if (have && st.st_size > EXT_UI_MAX)
+        return fail(err, elen, "%s is %lld bytes and at most %d are taken", EXT_UI_FILE,
+                    (long long)st.st_size, EXT_UI_MAX);
+    if (have && st.st_size == 0)
+        return fail(err, elen, "%s is empty", EXT_UI_FILE);
+    return 0;
+}
+
 static int judge_exec(const char *tree, const manifest_t *m, char *err, size_t elen)
 {
     char p[1024];
@@ -325,6 +385,8 @@ static int stage(const ext_env_t *env, const char *file, state_t *st, install_re
         rc = manifest_load(mf, &res->manifest, err, elen);
     if (rc == 0)
         rc = judge_exec(tree, &res->manifest, err, elen);
+        if (rc == 0)
+            rc = judge_ui(tree, &res->manifest, err, elen);
     if (rc == 0)
         rc = judge(env, st, res, err, elen);
     unlink(payload);

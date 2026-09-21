@@ -33,6 +33,7 @@ static int usage(void)
             "  remove <id> [--keep-data]\n"
             "  enable <id> | disable <id>         the operator's switch for one package; enabling lets it out of quarantine\n"
             "  keys | key-add <name> <file.pub> | key-remove <name>\n"
+            "  ui <id>             the package's interface, as JSON\n"
             "                                     the owner's keys: what makes a package community rather than unverified\n"
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
             "  caps                               the capabilities a manifest may ask for\n"
@@ -360,6 +361,21 @@ int main(int argc, char **argv)
         return answer(obj, 1);
     }
 
+    if (strcmp(cmd, "ui") == 0 && i < argc) {
+        /* The page itself, as JSON, so that whatever is in it is a
+         * string and never markup this program emitted. */
+        char *html = NULL;
+        size_t len = 0;
+        char why[300];
+        if (ext_ui_html(&env, argv[i], &html, &len, why, sizeof(why)) != 0)
+            return answer(json_pack("{s:s}", "error", why), 0);
+        json_t *obj = json_object();
+        json_object_set_new(obj, "id", json_string(argv[i]));
+        json_object_set_new(obj, "bytes", json_integer((json_int_t)len));
+        json_object_set_new(obj, "html", json_stringn(html, len));
+        free(html);
+        return answer(obj, 1);
+    }
     if (strcmp(cmd, "keys") == 0) {
         json_t *obj = json_object();
         json_object_set_new(obj, "keys", ext_keys_json(&env));
