@@ -1,0 +1,52 @@
+/*
+ * machine.h - the machine's facts, as the supervisor needs them
+ * Copyright 2026 514 LLC d/b/a OpenGlow
+ * Written by Scott Wiederhold
+ * SPDX-License-Identifier: MIT
+ *
+ * Read, never written: the master switch out of the machine's settings
+ * file, safe mode from a flag file made at the console, and the rest from
+ * forgectrl's read-only routes on loopback, which answer a local peer with
+ * no token. What cannot be read is reported as such, and the supervisor
+ * takes the careful side of it (an armed window it cannot see is open; a
+ * machine it cannot ask is not ready for a new process).
+ */
+#ifndef FORGEEXT_MACHINE_H
+#define FORGEEXT_MACHINE_H
+
+#include <stddef.h>
+
+#define MACHINE_CONF_DEFAULT  "/data/forgefirm/forgefirm.conf"
+#define MACHINE_SAFE_DEFAULT  "/run/forgefirm/ext-safe"
+#define MACHINE_HOST_DEFAULT  "127.0.0.1"
+#define MACHINE_PORT_DEFAULT  80
+
+typedef struct {
+    const char *conf;           /* the settings file: ext_enabled=1 turns extensions on */
+    const char *safe_file;      /* its presence is safe mode */
+    const char *host;           /* forgectrl */
+    int port;
+} machine_cfg_t;
+
+typedef struct {
+    int enabled;                /* the master switch is on and safe mode is not */
+    char off_reason[96];
+    int armed;                  /* 1, 0, or -1 when it could not be read */
+    int mode_cloud;             /* 1 cloud, 0 grbl, -1 when it could not be read */
+    int may_start;              /* the controller up, motion verified, no diagnostic, no flash */
+    char not_ready[96];         /* why may_start is 0 */
+} machine_t;
+
+void machine_cfg_defaults(machine_cfg_t *cfg);
+
+/* with_start_facts: also ask what a start needs to know (two more
+ * requests); without it may_start is 0. */
+void machine_read(const machine_cfg_t *cfg, machine_t *m, int with_start_facts);
+
+/* One GET of forgectrl: the body into out. 0 on a 200, else -1. */
+int machine_get(const machine_cfg_t *cfg, const char *path, char *out, size_t olen);
+
+/* `key=value` out of a settings file: 1 when the key is there. */
+int machine_conf_value(const char *conf, const char *key, char *out, size_t olen);
+
+#endif

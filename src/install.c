@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
@@ -68,6 +69,29 @@ int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
             return fail(err, elen, "cannot set the mode of %s: %s", p, strerror(errno));
     }
     return 0;
+}
+
+int ext_lock(const ext_env_t *env, char *err, size_t elen)
+{
+    char p[300];
+    if (!env->root || strlen(env->root) > EXT_ROOT_MAX)
+        return fail(err, elen, "the extension root is a path of at most %d bytes", EXT_ROOT_MAX);
+    snprintf(p, sizeof(p), "%.255s/lock", env->root);
+    int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return fail(err, elen, "cannot open %s: %s", p, strerror(errno));
+    if (flock(fd, LOCK_EX) != 0) {
+        int saved = errno;
+        close(fd);
+        return fail(err, elen, "cannot lock %s: %s", p, strerror(saved));
+    }
+    return fd;
+}
+
+void ext_unlock(int lock)
+{
+    if (lock >= 0)
+        close(lock);                                    /* the lock goes with the descriptor */
 }
 
 /* The bytes of the regular files under a directory (0 when absent). */
@@ -302,7 +326,17 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
     state_t *st = calloc(1, sizeof(*st));
     if (!st)
         return fail(err, elen, "out of memory");
+    if (ext_root_prepare(env, err, elen) != 0) {
+        free(st);
+        return -1;
+    }
+    int lock = ext_lock(env, err, elen);
+    if (lock < 0) {
+        free(st);
+        return -1;
+    }
     if (stage(env, file, st, res, staging, sizeof(staging), err, elen) != 0) {
+        ext_unlock(lock);
         free(st);
         return -1;
     }
@@ -392,6 +426,7 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
     rc = state_save(env->root, st, err, elen);
 out:
     pkg_rmtree(staging);
+    ext_unlock(lock);
     free(st);
     return rc;
 }
@@ -403,9 +438,12 @@ int ext_remove(const ext_env_t *env, const char *id, int keep_data, char *err, s
     if (!st)
         return fail(err, elen, "out of memory");
     int rc = -1;
-    if (!env->root || strlen(env->root) > EXT_ROOT_MAX) {
-        fail(err, elen, "the extension root is a path of at most %d bytes", EXT_ROOT_MAX);
-    } else if (!manifest_id_ok(id)) {
+    int lock = ext_lock(env, err, elen);
+    if (lock < 0) {
+        free(st);
+        return -1;
+    }
+    if (!manifest_id_ok(id)) {
         fail(err, elen, "that is not a package id");
     } else if (state_load(env->root, st, err, elen) == 0) {
         if (!state_find(st, id)) {
@@ -421,6 +459,45 @@ int ext_remove(const ext_env_t *env, const char *id, int keep_data, char *err, s
                 rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
         }
     }
+    ext_unlock(lock);
     free(st);
     return rc;
+}
+
+/* Load, change one package's entry, save: under the lock. */
+static int change(const ext_env_t *env, const char *id, int drop_previous, int quarantined, char *err, size_t elen)
+{
+    char pkgdir[340];
+    state_t *st = calloc(1, sizeof(*st));
+    if (!st)
+        return fail(err, elen, "out of memory");
+    int lock = ext_lock(env, err, elen), rc = -1;
+    if (lock >= 0 && state_load(env->root, st, err, elen) == 0) {
+        state_pkg_t *p = state_find(st, id);
+        if (!p) {
+            fail(err, elen, "%s is not installed", id);
+        } else {
+            if (drop_previous && p->previous[0]) {
+                snprintf(pkgdir, sizeof(pkgdir), "%.255s/pkg/%.63s", env->root, id);
+                drop_version(pkgdir, p->previous);
+                p->previous[0] = '\0';
+            }
+            if (quarantined >= 0)
+                p->quarantined = quarantined;
+            rc = state_save(env->root, st, err, elen);
+        }
+    }
+    ext_unlock(lock);
+    free(st);
+    return rc;
+}
+
+int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen)
+{
+    return change(env, id, 1, -1, err, elen);
+}
+
+int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen)
+{
+    return change(env, id, 0, on ? 1 : 0, err, elen);
 }

@@ -1,0 +1,189 @@
+/*
+ * machine.c - the machine's facts, as the supervisor needs them
+ * Copyright 2026 514 LLC d/b/a OpenGlow
+ * Written by Scott Wiederhold
+ * SPDX-License-Identifier: MIT
+ */
+#define _GNU_SOURCE
+#include "machine.h"
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <jansson.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#define HTTP_TIMEOUT_MS 2000
+#define HTTP_MAX        (64 * 1024)
+
+void machine_cfg_defaults(machine_cfg_t *cfg)
+{
+    cfg->conf = MACHINE_CONF_DEFAULT;
+    cfg->safe_file = MACHINE_SAFE_DEFAULT;
+    cfg->host = MACHINE_HOST_DEFAULT;
+    cfg->port = MACHINE_PORT_DEFAULT;
+}
+
+int machine_conf_value(const char *conf, const char *key, char *out, size_t olen)
+{
+    FILE *f = fopen(conf, "re");
+    char line[512];
+    int found = 0;
+    size_t klen = strlen(key);
+    out[0] = '\0';
+    while (f && fgets(line, sizeof(line), f)) {
+        char *s = line;
+        while (isspace((unsigned char)*s))
+            s++;
+        if (strncmp(s, key, klen) != 0)
+            continue;
+        char *eq = s + klen;
+        while (isspace((unsigned char)*eq))
+            eq++;
+        if (*eq != '=')
+            continue;
+        char *v = eq + 1;
+        while (isspace((unsigned char)*v))
+            v++;
+        size_t n = strlen(v);
+        while (n && isspace((unsigned char)v[n - 1]))
+            v[--n] = '\0';
+        snprintf(out, olen, "%s", v);
+        found = 1;                                      /* the last one wins, as a settings reader has it */
+    }
+    if (f)
+        fclose(f);
+    return found;
+}
+
+static int wait_fd(int fd, short events, long deadline_ms)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long left = deadline_ms - (ts.tv_sec * 1000L + ts.tv_nsec / 1000000L);
+    if (left <= 0)
+        return -1;
+    struct pollfd p = { .fd = fd, .events = events };
+    return poll(&p, 1, (int)left) == 1 ? 0 : -1;
+}
+
+int machine_get(const machine_cfg_t *cfg, const char *path, char *out, size_t olen)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)cfg->port) };
+    struct timespec ts;
+    out[0] = '\0';
+    if (inet_pton(AF_INET, cfg->host, &a.sin_addr) != 1)
+        return -1;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long deadline = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L + HTTP_TIMEOUT_MS;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char *buf = NULL;
+    int rc = -1;
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        int soerr = 0;
+        socklen_t sl = sizeof(soerr);
+        if (errno != EINPROGRESS || wait_fd(fd, POLLOUT, deadline) != 0
+            || getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0 || soerr != 0)
+            goto done;
+    }
+    char req[256];
+    int rlen = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, cfg->host);
+    if (rlen <= 0 || (size_t)rlen >= sizeof(req) || wait_fd(fd, POLLOUT, deadline) != 0
+        || send(fd, req, (size_t)rlen, MSG_NOSIGNAL) != rlen)
+        goto done;
+    buf = malloc(HTTP_MAX + 1);
+    if (!buf)
+        goto done;
+    size_t got = 0;
+    while (got < HTTP_MAX && wait_fd(fd, POLLIN, deadline) == 0) {
+        ssize_t k = recv(fd, buf + got, HTTP_MAX - got, 0);
+        if (k < 0 && (errno == EAGAIN || errno == EINTR))
+            continue;
+        if (k <= 0)
+            break;
+        got += (size_t)k;
+    }
+    buf[got] = '\0';
+    const char *body = strstr(buf, "\r\n\r\n");
+    if (strncmp(buf, "HTTP/1.", 7) != 0 || strncmp(buf + 8, " 200", 4) != 0 || !body)
+        goto done;
+    body += 4;
+    if (strlen(body) >= olen)
+        goto done;
+    memcpy(out, body, strlen(body) + 1);
+    rc = 0;
+done:
+    free(buf);
+    close(fd);
+    return rc;
+}
+
+static json_t *get_json(const machine_cfg_t *cfg, const char *path)
+{
+    static char body[HTTP_MAX];
+    json_error_t jerr;
+    if (machine_get(cfg, path, body, sizeof(body)) != 0)
+        return NULL;
+    json_t *j = json_loads(body, 0, &jerr);
+    if (j && !json_is_object(j)) {
+        json_decref(j);
+        return NULL;
+    }
+    return j;
+}
+
+void machine_read(const machine_cfg_t *cfg, machine_t *m, int with_start_facts)
+{
+    char v[32];
+    memset(m, 0, sizeof(*m));
+    m->armed = m->mode_cloud = -1;
+    if (access(cfg->safe_file, F_OK) == 0)
+        snprintf(m->off_reason, sizeof(m->off_reason), "safe mode (%s exists)", cfg->safe_file);
+    else if (!machine_conf_value(cfg->conf, "ext_enabled", v, sizeof(v)) || strcmp(v, "1") != 0)
+        snprintf(m->off_reason, sizeof(m->off_reason), "extensions are off (ext_enabled)");
+    else
+        m->enabled = 1;
+    if (!m->enabled)
+        return;                                         /* nothing runs: nothing to ask the machine */
+
+    json_t *cool = get_json(cfg, "/cool/status");
+    if (cool && json_is_boolean(json_object_get(cool, "armed")))
+        m->armed = json_is_true(json_object_get(cool, "armed"));
+    json_decref(cool);
+    json_t *mode = get_json(cfg, "/mode");
+    const char *mm = mode ? json_string_value(json_object_get(mode, "mode")) : NULL;
+    if (mm)
+        m->mode_cloud = strcmp(mm, "cloud") == 0;
+    const char *ctl = mode ? json_string_value(json_object_get(mode, "controller")) : NULL;
+    const char *motion = mode ? json_string_value(json_object_get(mode, "motion")) : NULL;
+    if (!mode)
+        snprintf(m->not_ready, sizeof(m->not_ready), "forgectrl does not answer");
+    else if (!ctl || strcmp(ctl, "running") != 0)
+        snprintf(m->not_ready, sizeof(m->not_ready), "the controller is %s", ctl ? ctl : "not reported");
+    else if (!motion || strcmp(motion, "verified") != 0)
+        snprintf(m->not_ready, sizeof(m->not_ready), "motion is %s", motion ? motion : "not reported");
+    json_decref(mode);
+    if (m->not_ready[0] || !with_start_facts)
+        return;
+    json_t *status = get_json(cfg, "/status"), *update = get_json(cfg, "/update/status");
+    if (!status || !update)
+        snprintf(m->not_ready, sizeof(m->not_ready), "forgectrl does not answer");
+    else if (json_is_true(json_object_get(status, "diag")))
+        snprintf(m->not_ready, sizeof(m->not_ready), "a diagnostic is running");
+    else if (json_is_true(json_object_get(update, "running")))
+        snprintf(m->not_ready, sizeof(m->not_ready), "a firmware job is running");
+    else
+        m->may_start = 1;
+    json_decref(status);
+    json_decref(update);
+}

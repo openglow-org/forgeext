@@ -18,10 +18,11 @@ space with the cooling engine and the supervisor.
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Werror
 cmake --build build
-./build/caps_test && ./build/manifest_test && ./build/state_test
+./build/caps_test && ./build/manifest_test && ./build/state_test && ./build/super_test
 FWUP=/path/to/fwup python3 -B tests/install_test.py
 sudo ./build/sandbox_test
 sudo FORGEEXT=build/forgeext python3 -B tests/netrules_test.py
+sudo FORGEEXT=build/forgeext FWUP=/path/to/fwup python3 -B tests/run_test.py
 ```
 
 A warning is a failure. `tests/install_test.py` drives the built binary
@@ -33,7 +34,9 @@ a kernel without landlock's TCP rules (ABI 4) it sees on the machine.
 `tests/netrules_test.py` loads the image's rule file (`ffx.nft`, from a
 sibling `forgefirm` checkout or `FFX_RULES`) into a network namespace with a
 peer on a veth pair and drives `net-check`, `net-allow`, and `net-revoke`;
-it needs root, nft, ip, and nsenter.
+it needs root, nft, ip, and nsenter. `tests/run_test.py` runs the daemon
+itself in the same kind of namespace, against a stand-in for forgectrl's
+read-only routes and four real packages.
 
 ### Rules specific to this repository
 
@@ -61,6 +64,16 @@ it needs root, nft, ip, and nsenter.
   a looser sandbox. The child reports the step by name and is killed.
 - **Nothing of a package runs before it is in its cgroup.** The child waits
   on a pipe until the parent has put it there.
+- **The supervisor's policy is a step function over injected operations**
+  (`super.c`, `super_test.c`): which services run, when, and frozen or not
+  is decided there and nowhere else, and `run.c` only carries it out. A new
+  rule gets a case over the fakes, and a negative control.
+- **What cannot be read is taken the careful way**: an armed window that
+  cannot be seen is open (freeze), a machine that does not answer is not
+  ready (no new process), and a controller mode that cannot be read stops
+  nobody.
+- **`state.json` has one writer at a time**: `ext_lock` around every
+  load, change, save, in the command line and in the daemon alike.
 - **A network rule names an address, never a name**: what was resolved and
   judged is what is allowed. `netrules.c` is the only writer of the image
   table's `allow` map, and no service starts unless `net_base_ok` finds the

@@ -78,4 +78,17 @@ int ext_manifest_of(const ext_env_t *env, const char *id, manifest_t *m, char *e
 /* Does an installed package's tree still match what was installed? */
 int ext_check(const ext_env_t *env, const state_pkg_t *p, char *err, size_t elen);
 
+/* One writer of the root at a time: the command line and the daemon both
+ * change state.json and what is under pkg/. The lock is a file of the
+ * root held with flock; ext_install and ext_remove take it themselves.
+ * The descriptor, or -1. */
+int ext_lock(const ext_env_t *env, char *err, size_t elen);
+void ext_unlock(int lock);
+
+/* The daemon's two writes, each under the lock. A package that has run
+ * healthy once gives up the version it replaced; a package the supervisor
+ * gave up on is remembered as quarantined (and let out by quarantined=0). */
+int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen);
+int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
+
 #endif

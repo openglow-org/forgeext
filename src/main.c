@@ -19,6 +19,7 @@
 #include "manifest.h"
 #include "netrules.h"
 #include "pkg.h"
+#include "run.h"
 #include "state.h"
 
 static int usage(void)
@@ -31,6 +32,9 @@ static int usage(void)
             "  check [<id>]                       do the installed files still match what was installed\n"
             "  remove <id> [--keep-data]\n"
             "  caps                               the capabilities a manifest may ask for\n"
+            "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
+            "      [--run-dir <dir>] [--landlock-fs-only] [--ticks <n>]\n"
+            "                                     the daemon: run what is installed and enabled, in the sandbox\n"
             "  net-check                          is the image's deny table loaded, and the image's\n"
             "  net-allow <uid> [--listen <port>] [--dns] [<host>:<port>]...\n"
             "                                     give a pool account its way through (what a service start does)\n"
@@ -229,6 +233,45 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "check") == 0)
         return cmd_list(&env, i < argc ? argv[i] : NULL, 1);
 
+    if (strcmp(cmd, "run") == 0) {
+        static run_cfg_t rc;
+        static char host[64];
+        run_cfg_defaults(&rc);
+        rc.ext = env;
+        rc.net = net;
+        for (; i < argc; i++) {
+            const char *opt = argv[i], *val = i + 1 < argc ? argv[i + 1] : NULL;
+            if (strcmp(opt, "--landlock-fs-only") == 0) {
+                rc.landlock_fs_only = 1;
+                continue;
+            }
+            if (!val)
+                return usage();
+            i++;
+            if (strcmp(opt, "--conf") == 0) {
+                rc.machine.conf = val;
+            } else if (strcmp(opt, "--safe-file") == 0) {
+                rc.machine.safe_file = val;
+            } else if (strcmp(opt, "--cg-parent") == 0) {
+                rc.cg_parent = val;
+            } else if (strcmp(opt, "--run-dir") == 0) {
+                rc.run_dir = val;
+            } else if (strcmp(opt, "--ticks") == 0) {
+                rc.ticks = atoi(val);
+            } else if (strcmp(opt, "--forgectrl") == 0) {
+                const char *colon = strrchr(val, ':');
+                if (!colon || (size_t)(colon - val) >= sizeof(host))
+                    return usage();
+                memcpy(host, val, (size_t)(colon - val));
+                host[colon - val] = '\0';
+                rc.machine.host = host;
+                rc.machine.port = atoi(colon + 1);
+            } else {
+                return usage();
+            }
+        }
+        return run_daemon(&rc);
+    }
     if (strcmp(cmd, "net-check") == 0) {
         if (net_base_ok(&net, err, sizeof(err)) != 0)
             return refuse(err);
