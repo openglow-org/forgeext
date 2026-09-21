@@ -571,6 +571,30 @@ int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err,
     return change(env, id, 0, on ? 1 : 0, err, elen);
 }
 
+int ext_set_enabled(const ext_env_t *env, const char *id, int on, char *err, size_t elen)
+{
+    state_t *st = calloc(1, sizeof(*st));
+    if (!st)
+        return fail(err, elen, "out of memory");
+    int lock = ext_lock(env, err, elen), rc = -1;
+    if (lock >= 0 && state_load(env->root, st, err, elen) == 0) {
+        state_pkg_t *p = state_find(st, id);
+        if (!p) {
+            fail(err, elen, "%s is not installed", id);
+        } else {
+            p->enabled = on ? 1 : 0;
+            if (on)
+                p->quarantined = 0;
+            rc = state_save(env->root, st, err, elen);
+            if (rc == 0 && ext_required_holds_sync(env, st) != 0)
+                rc = fail(err, elen, "the required holds under %s could not be made to match", env->root);
+        }
+    }
+    ext_unlock(lock);
+    free(st);
+    return rc;
+}
+
 int ext_set_hold_required(const ext_env_t *env, const char *id, int on, char *err, size_t elen)
 {
     state_t *st = calloc(1, sizeof(*st));

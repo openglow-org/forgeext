@@ -31,6 +31,7 @@ static int usage(void)
             "  list                               what is installed\n"
             "  check [<id>]                       do the installed files still match what was installed\n"
             "  remove <id> [--keep-data]\n"
+            "  enable <id> | disable <id>         the operator's switch for one package; enabling lets it out of quarantine\n"
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
             "  caps                               the capabilities a manifest may ask for\n"
             "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
@@ -350,6 +351,17 @@ int main(int argc, char **argv)
         return answer(obj, 1);
     }
 
+    if ((strcmp(cmd, "enable") == 0 || strcmp(cmd, "disable") == 0) && i < argc) {
+        const char *id = argv[i];
+        int on = strcmp(cmd, "enable") == 0;
+        if (ext_set_enabled(&env, id, on, err, sizeof(err)) != 0)
+            return refuse(err);
+        fflog(LOG_NOTICE, "%s: %s by the operator", id, on ? "enabled" : "disabled");
+        json_t *obj = json_object();
+        json_object_set_new(obj, "id", json_string(id));
+        json_object_set_new(obj, "enabled", json_boolean(on));
+        return answer(obj, 1);
+    }
     if (strcmp(cmd, "hold") == 0 && i + 1 < argc) {
         const char *id = argv[i], *kind = argv[i + 1];
         int required = strcmp(kind, "required") == 0;

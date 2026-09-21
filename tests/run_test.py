@@ -443,9 +443,27 @@ def main():
         check(logged("ext org.example.crash: about to end"), "its last words are in the log")
         check(not os.path.isdir(CG_PARENT + "/org.example.crash"), "and its group is gone")
 
+        print("the operator's switch for one package")
+        r = fx("disable", "org.example.crash")
+        check(r.get("ok") is True and wait_for(lambda: held("org.example.crash") is None, 5) and not os.listdir(marks),
+              "disabled: its hold file and its name among the required holds are gone: %s %s", r.get("error", ""), os.listdir(marks))
+        check(svc("org.example.crash").get("state") in ("quarantined", "stopped") and not running().count("org.example.crash"),
+              "and it does not run: %s", svc("org.example.crash").get("state"))
+        r = fx("enable", "org.example.crash")
+        st = json.load(open(os.path.join(root, "state.json")))["packages"]["org.example.crash"]
+        check(r.get("ok") is True and st["enabled"] is True and st["quarantined"] is False and os.listdir(marks) == ["org.example.crash"],
+              "enabled again: out of quarantine, and named among the required holds again: %s", st)
+        check(wait_for(lambda: logged("org.example.crash: started as") and
+                       open(log_path).read().count("org.example.crash: started as") >= 6, 20),
+              "and the host tries it again")
+        check(wait_for(lambda: (held("org.example.crash") or {}).get("raised"), 10), "with its required hold raised while it does")
+        check(fx("enable", "org.example.nothere").get("ok") is False, "a package that is not installed cannot be enabled")
+
         print("one daemon at a time; a killed daemon's services do not outlive the next one's start")
         check(wait_for(lambda: len(running()) >= 2, 30), "services are running before the daemon is killed: %s", running())
-        mine = {s_["id"]: s_["pid"] for s_ in status().get("services", []) if s_["state"] == "running"}
+        # not the one that ends at every start: it is out of quarantine again, and its pid is gone before it is looked at
+        mine = {s_["id"]: s_["pid"] for s_ in status().get("services", [])
+                if s_["state"] == "running" and s_["id"] != "org.example.crash"}
         second = start_daemon()
         rc2 = second.wait(timeout=20)
         check(rc2 == 1 and logged("another extension host holds"), "a second daemon is refused (exit %s)", rc2)

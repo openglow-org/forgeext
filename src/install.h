@@ -98,6 +98,13 @@ void ext_unlock(int lock);
 int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen);
 int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
 
+/* The operator's switch for one package. A package that is disabled keeps
+ * its files, its data, its grants, and its account; its service is
+ * stopped and its hold, of either kind, is gone: that is the operator's
+ * exit. Enabling it again also lets it out of quarantine, because the
+ * operator has looked at it. */
+int ext_set_enabled(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
+
 /* Mark a package's hold required or advisory. Only a package that has the
  * operator's hold grant has a hold to mark. */
 int ext_set_hold_required(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
