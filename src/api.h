@@ -21,6 +21,19 @@
  *   GET  /v0/machine/mode      forgectrl's /mode          (machine.read)
  *   GET  /v0/hold              the package's own hold      (hold, granted)
  *   POST /v0/hold              {"raised": bool, "reason": "..."}: raise it, or clear it
+ *   POST /v0/events            {"since": n, "wait": s}: the machine's events after n (events)
+ *
+ * The events call is a poll and not a stream: it says the sequence number
+ * it has and is answered with what came after it, waiting up to `wait`
+ * seconds for something to come. It is a POST because the reader above
+ * refuses a query string on purpose and a poll needs its two numbers; the
+ * body carries them instead. A body with no `since` at all asks where the
+ * present is: the answer is the head and no events, which is how a package
+ * that does not want the past starts. That is a different question from
+ * `since: 0`, which is the beginning of what the host still holds, and it
+ * has to be, or a package that started before the first event could never
+ * be told of it. A reader that falls a whole ring behind is told how many
+ * it lost, never handed a stale event as if it were new.
  *
  * The machine routes are forgectrl's read-only loopback routes, relayed:
  * the package itself can reach no listener of the machine. The broker runs
@@ -39,6 +52,7 @@
 #include <sys/types.h>
 
 #include "caps.h"
+#include "evfeed.h"
 #include "holdkeep.h"
 #include "httpreq.h"
 #include "machine.h"
@@ -52,6 +66,9 @@
 #define API_CONN_TIMEOUT_S  5.0
 #define API_RATE_PER_S      20
 #define API_BODY_MAX        32768           /* a reply's body: forgectrl's /status with room to spare */
+#define API_EVENTS_MAX      32              /* events in one answer: the rest waits for the next call */
+#define API_EVENTS_WAIT_MAX 30.0            /* seconds a poll may wait */
+#define API_PARK            (-1)            /* dispatch's word for "this one waits" */
 
 /* What the broker knows of a package: what it may use. */
 typedef struct {
@@ -70,11 +87,22 @@ typedef struct {
 /* One GET of the machine: the body into out, 0 on a 200. */
 typedef int (*api_upstream_fn)(void *ctx, const char *path, char *out, size_t olen);
 
+/* A request that is to wait: from which event, and until when. */
+typedef struct {
+    unsigned long since;
+    double seconds;
+} api_park_t;
+
 /* The broker's judgment of one request: the status, and the JSON body into
  * body. hold is the package's word, changed by a POST /v0/hold. No I/O but
  * through up. */
 int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, api_upstream_fn up, void *upctx,
-                 char *body, size_t blen);
+                 evfeed_t *feed, api_park_t *park, char *body, size_t blen);
+
+/* The answer to an events poll: what the feed holds after `since`. The
+ * broker builds it when the wait is over, or at once when it need not
+ * wait. Returns the status. */
+int api_events_answer(evfeed_t *feed, unsigned long since, char *body, size_t blen);
 
 int api_may(const api_who_t *who, const char *cap);
 
@@ -89,6 +117,9 @@ typedef struct {
 typedef struct {
     int fd, svc;
     int limited;                        /* over its rate: the request is read, and answered 429 */
+    int parked;                         /* an events poll, waiting for an event or its deadline */
+    unsigned long ev_since;
+    double ev_until;
     double since;
     size_t len;
     char buf[HTTPREQ_HEAD_MAX + HTTPREQ_BODY_MAX];
@@ -100,12 +131,13 @@ typedef struct {
     int started, stop;
     char dir[256];
     machine_cfg_t upstream;
+    evfeed_t *feed;                     /* the one subscription every package reads from */
     api_svc_t svc[API_MAX_SERVICES];
     api_conn_t conn[API_MAX_CONNS];
 } api_t;
 
 /* Make the directory, remove the sockets a previous host left, start the thread. */
-int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, char *err, size_t elen);
+int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed, char *err, size_t elen);
 void api_stop(api_t *a);
 
 /* A service is about to start: its socket exists before it does, and its
@@ -116,5 +148,10 @@ void api_close(api_t *a, const char *id);
 
 /* What the package last said of its hold. 0 when it has a socket. */
 int api_hold_said(api_t *a, const char *id, api_hold_t *out);
+
+/* Running services that hold the events capability. The subscription to
+ * the machine's stream follows this number: with none of them, forgectrl
+ * has nobody listening and its sampler goes back to sleep. */
+int api_events_wanted(api_t *a);
 
 #endif

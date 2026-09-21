@@ -8,7 +8,10 @@
  * what a package may use is what the operator granted, the machine is
  * never asked for a package that may not read it, what the machine says
  * goes on only as a JSON object, and a package's word on its hold is taken
- * in one closed form. The sockets and the thread are run_test.py's.
+ * in one closed form. The events poll is judged here too: the capability,
+ * the body's form, what comes back after a sequence number, and when the
+ * broker is told to make the request wait instead of answering it. The
+ * sockets and the thread are run_test.py's.
  */
 #include "../src/api.h"
 
@@ -35,16 +38,27 @@ static int fake_machine(void *ctx, const char *path, char *out, size_t olen)
 }
 
 static char body[API_BODY_MAX];
+static evfeed_t feed;
+static api_park_t park;
 
 static int call(const api_who_t *who, api_hold_t *hold, const char *text)
 {
     httpreq_t req;
     const char *why;
+    memset(&park, 0, sizeof(park));
     if (httpreq_parse(text, strlen(text), &req, &why) != 1) {
         CHECK(0, "the test's own request does not read: %.40s", text);
         return 0;
     }
-    return api_dispatch(who, hold, &req, fake_machine, NULL, body, sizeof(body));
+    return api_dispatch(who, hold, &req, fake_machine, NULL, &feed, &park, body, sizeof(body));
+}
+
+static int post_events(const api_who_t *who, api_hold_t *hold, const char *json, const char *type)
+{
+    char text[512];
+    snprintf(text, sizeof(text), "POST /v0/events HTTP/1.1\r\n%s%s%sContent-Length: %zu\r\n\r\n%s",
+             type ? "Content-Type: " : "", type ? type : "", type ? "\r\n" : "", strlen(json), json);
+    return call(who, hold, text);
 }
 
 static int post_hold(const api_who_t *who, api_hold_t *hold, const char *json, const char *type)
@@ -153,6 +167,88 @@ int main(void)
         strcat(longjson, "\"}");
         rc = post_hold(&holder, &hold, longjson, "application/json");
         CHECK(rc == 400 && !strcmp(hold.reason, "standing"), "a reason of 96 bytes: %d", rc);
+    }
+
+    /* The events poll. */
+    pthread_mutex_init(&feed.mu, NULL);
+    pthread_cond_init(&feed.news, NULL);
+    rc = post_events(&holder, &hold, "{}", "application/json");
+    CHECK(rc == 403 && strstr(error_words(), "events"), "the poll without the capability: %d", rc);
+    CHECK(call(&reader, &hold, "GET /v0/events HTTP/1.1\r\n\r\n") == 405, "the poll is a POST");
+    rc = post_events(&reader, &hold, "{}", NULL);
+    CHECK(rc == 415, "the poll takes JSON: %d", rc);
+
+    /* An empty feed: where the present is, and nothing replayed. */
+    rc = post_events(&reader, &hold, "{}", "application/json");
+    j = json_loads(body, 0, NULL);
+    CHECK(rc == 200 && j && json_integer_value(json_object_get(j, "next")) == 0 &&
+          json_array_size(json_object_get(j, "events")) == 0 &&
+          json_integer_value(json_object_get(j, "dropped")) == 0, "an empty feed: %d %s", rc, body);
+    json_decref(j);
+
+    evfeed_add(&feed, "lid", "{\"open\":true}");
+    evfeed_add(&feed, "cooling.verdict", "{\"verdict\":\"OK\"}");
+    /* No since at all asks where the present is; since 0 is the
+     * beginning of what is held, and the two are different questions. */
+    rc = post_events(&reader, &hold, "{}", "application/json");
+    j = json_loads(body, 0, NULL);
+    CHECK(rc == 200 && json_integer_value(json_object_get(j, "next")) == 2 &&
+          json_array_size(json_object_get(j, "events")) == 0,
+          "no since is the present, not the past: %s", body);
+    json_decref(j);
+    rc = post_events(&reader, &hold, "{\"since\": 0}", "application/json");
+    j = json_loads(body, 0, NULL);
+    CHECK(rc == 200 && json_array_size(json_object_get(j, "events")) == 2 &&
+          json_integer_value(json_object_get(j, "next")) == 2,
+          "since 0 is what a reader that was there from the start is owed: %s", body);
+    json_decref(j);
+    rc = post_events(&reader, &hold, "{\"since\": 1}", "application/json");
+    j = json_loads(body, 0, NULL);
+    json_t *list = json_object_get(j, "events"), *one = json_array_get(list, 0);
+    CHECK(rc == 200 && json_array_size(list) == 1 && json_integer_value(json_object_get(j, "next")) == 2 &&
+          !strcmp(json_string_value(json_object_get(one, "event")), "cooling.verdict") &&
+          json_integer_value(json_object_get(one, "seq")) == 2,
+          "what came after 1: %s", body);
+    CHECK(!strcmp(json_string_value(json_object_get(json_object_get(one, "data"), "verdict")), "OK"),
+          "the event's data is the machine's JSON, not a string: %s", body);
+    json_decref(j);
+
+    /* A reader a whole ring behind is told, and handed what is still there. */
+    for (int i = 0; i < EVFEED_RING + 10; i++)
+        evfeed_add(&feed, "telemetry.tick", "{}");
+    rc = post_events(&reader, &hold, "{\"since\": 1}", "application/json");
+    j = json_loads(body, 0, NULL);
+    CHECK(rc == 200 && json_integer_value(json_object_get(j, "dropped")) > 0 &&
+          json_array_size(json_object_get(j, "events")) == API_EVENTS_MAX,
+          "a slow reader is told what it lost: %s", body);
+    json_decref(j);
+
+    /* A poll with nothing to say waits; one with something does not. */
+    rc = post_events(&reader, &hold, "{\"since\": 76, \"wait\": 20}", "application/json");
+    CHECK(rc == API_PARK && park.since == 76 && park.seconds == 20, "the poll waits: %d, %lu for %.0fs",
+          rc, park.since, park.seconds);
+    rc = post_events(&reader, &hold, "{\"since\": 76, \"wait\": 9000}", "application/json");
+    CHECK(rc == API_PARK && park.seconds == API_EVENTS_WAIT_MAX, "a wait longer than the cap is capped: %.0f", park.seconds);
+    rc = post_events(&reader, &hold, "{\"since\": 10, \"wait\": 20}", "application/json");
+    CHECK(rc == 200, "a poll that has something to say does not wait: %d", rc);
+    rc = post_events(&reader, &hold, "{\"wait\": 20}", "application/json");
+    CHECK(rc == 200, "asking where the present is never waits: %d", rc);
+    rc = post_events(&reader, &hold, "{\"since\": 500, \"wait\": 20}", "application/json");
+    CHECK(rc == 200 && strstr(body, "\"events\":[]") && strstr(body, "\"next\":76"),
+          "a feed that started over says so at once, not after the wait: %d %s", rc, body);
+
+    static const struct { const char *json, *name; } badpoll[] = {
+        { "{\"since\": -1}", "a place before the first" },
+        { "{\"since\": \"2\"}", "a place that is a string" },
+        { "{\"wait\": -5}", "a wait that is negative" },
+        { "{\"since\": 1, \"limit\": 4}", "a key the form does not have" },
+        { "{\"since\": 1, \"since\": 2}", "a key twice" },
+        { "[1]", "an array" },
+        { "{\"since\": 1", "cut-off JSON" },
+    };
+    for (size_t i = 0; i < sizeof(badpoll) / sizeof(badpoll[0]); i++) {
+        rc = post_events(&reader, &hold, badpoll[i].json, "application/json");
+        CHECK(rc == 400 && error_words()[0], "%s: %d", badpoll[i].name, rc);
     }
 
     /* Everything else. */

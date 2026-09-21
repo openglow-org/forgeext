@@ -53,6 +53,7 @@ typedef struct {
     char last_status[8192];
     char unreachable[300];                      /* the last word on a root no account can walk to, said once */
     holdkeep_t holds;
+    evfeed_t feed;
     api_t api;
     char dropped[SUPER_MAX_SERVICES][64];       /* the advisory holds dropped at the last turn, each said once */
     int ndropped;
@@ -415,6 +416,8 @@ static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
     json_object_set_new(top, "off_reason", json_string(mc->off_reason));
     json_object_set_new(top, "armed", mc->armed < 0 ? json_null() : json_boolean(mc->armed));
     json_object_set_new(top, "not_ready", json_string(mc->not_ready));
+    json_object_set_new(top, "events", json_pack("{s:b, s:i}", "connected", evfeed_connected(&r->feed),
+                                                 "wanted", api_events_wanted(&r->api)));
     for (int i = 0; i < sv->n; i++) {
         const svc_t *s = &sv->svc[i];
         json_t *j = json_object();
@@ -513,8 +516,15 @@ int run_daemon(const run_cfg_t *cfg)
         close(lfd);
         return 1;
     }
-    if (api_start(&r.api, cfg->api_dir, &cfg->machine, err, sizeof(err)) != 0) {
+    if (evfeed_start(&r.feed, &cfg->machine, err, sizeof(err)) != 0) {
         fflog(LOG_ERR, "not starting: %s", err);
+        holdkeep_stop(&r.holds);
+        close(lfd);
+        return 1;
+    }
+    if (api_start(&r.api, cfg->api_dir, &cfg->machine, &r.feed, err, sizeof(err)) != 0) {
+        fflog(LOG_ERR, "not starting: %s", err);
+        evfeed_stop(&r.feed);
         holdkeep_stop(&r.holds);
         close(lfd);
         return 1;
@@ -578,6 +588,10 @@ int run_daemon(const run_cfg_t *cfg)
         if (!stopping)
             super_tick(&sv, &in, mono());
         holds_turn(&r, &sv, &in);
+        /* The machine's stream is held while somebody reads it and let go
+         * when nobody does: forgectrl samples its own state only while a
+         * stream is open. */
+        evfeed_want(&r.feed, mc.enabled ? api_events_wanted(&r.api) : 0);
         write_status(&r, &sv, &mc);
         if (cfg->ticks && ++turns >= cfg->ticks)
             stopping = 1;
@@ -585,6 +599,7 @@ int run_daemon(const run_cfg_t *cfg)
     super_stop_all(&sv, "the extension host is stopping");
     holdkeep_stop(&r.holds);
     api_stop(&r.api);
+    evfeed_stop(&r.feed);
     machine_t off;
     memset(&off, 0, sizeof(off));
     snprintf(off.off_reason, sizeof(off.off_reason), "the extension host is not running");

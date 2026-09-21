@@ -117,8 +117,67 @@ static int hold_from(const httpreq_t *req, api_hold_t *out, const char **why)
     return 0;
 }
 
+/* {"since": a number, "wait": seconds}: those two keys, both optional,
+ * and no other. */
+static int events_from(const httpreq_t *req, unsigned long *since, int *have_since, double *wait,
+                       const char **why)
+{
+    json_error_t je;
+    json_t *j = json_loadb(req->body, req->body_len, JSON_REJECT_DUPLICATES, &je);
+    const char *key;
+    json_t *v;
+    int bad = 0;
+
+    *since = 0;
+    *have_since = 0;
+    *wait = 0;
+    *why = "the body is a JSON object: {\"since\": 0, \"wait\": 20}";
+    if (!json_is_object(j)) {
+        json_decref(j);
+        return -1;
+    }
+    json_object_foreach(j, key, v) {
+        if (strcmp(key, "since") == 0 && json_is_integer(v) && json_integer_value(v) >= 0) {
+            *since = (unsigned long)json_integer_value(v);
+            *have_since = 1;
+        } else if (strcmp(key, "wait") == 0 && json_is_number(v) && json_number_value(v) >= 0) {
+            *wait = json_number_value(v);
+            if (*wait > API_EVENTS_WAIT_MAX)
+                *wait = API_EVENTS_WAIT_MAX;            /* asking for longer is not an error: it is capped */
+        } else {
+            *why = "the body holds since (a number, 0 or more) and wait (seconds), and nothing else";
+            bad = 1;
+            break;
+        }
+    }
+    json_decref(j);
+    return bad ? -1 : 0;
+}
+
+int api_events_answer(evfeed_t *feed, unsigned long since, char *body, size_t blen)
+{
+    evfeed_ev_t ev[API_EVENTS_MAX];
+    unsigned long next = 0, dropped = 0;
+    int n = feed ? evfeed_since(feed, since, ev, API_EVENTS_MAX, &next, &dropped) : 0;
+    json_t *list = json_array();
+
+    for (int i = 0; i < n; i++) {
+        /* The data is forgectrl's JSON, passed on as it was written. What
+         * cannot be read as JSON is passed on as a string, so one odd
+         * event never costs a package the rest of them. */
+        json_t *d = json_loads(ev[i].data, 0, NULL);
+        if (!d)
+            d = json_string(ev[i].data);
+        json_array_append_new(list, json_pack("{s:I, s:s, s:o}", "seq", (json_int_t)ev[i].seq,
+                                              "event", ev[i].name, "data", d));
+    }
+    return say(body, blen, 200, json_pack("{s:I, s:I, s:b, s:o}", "next", (json_int_t)next,
+                                          "dropped", (json_int_t)dropped,
+                                          "connected", feed ? evfeed_connected(feed) : 0, "events", list));
+}
+
 int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, api_upstream_fn up, void *upctx,
-                 char *body, size_t blen)
+                 evfeed_t *feed, api_park_t *park, char *body, size_t blen)
 {
     static const struct { const char *path, *upstream; } machine[] = {
         { "/v0/machine/status", "/status" }, { "/v0/machine/cool", "/cool/status" }, { "/v0/machine/mode", "/mode" },
@@ -151,6 +210,31 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, a
         }
         json_decref(j);
         return 200;
+    }
+    if (strcmp(p, "/v0/events") == 0) {
+        if (req->method != HTTPREQ_POST)
+            return refuse(body, blen, 405, "POST /v0/events with {\"since\": n, \"wait\": s}");
+        if (!api_may(who, "events"))
+            return refuse(body, blen, 403, "this package does not hold events");
+        if (!req->json_body)
+            return refuse(body, blen, 415, "POST /v0/events takes application/json");
+        unsigned long since = 0;
+        double wait = 0;
+        const char *why;
+        int have_since = 0;
+        if (events_from(req, &since, &have_since, &wait, &why) != 0)
+            return refuse(body, blen, 400, why);
+        if (!have_since)
+            return api_events_answer(feed, feed ? evfeed_head(feed) : 0, body, blen);
+        /* It waits only when it is level with the feed. Behind it, there
+         * is something to say now; past it, the feed started over and
+         * saying so at once is what lets the reader find its place. */
+        if (wait > 0 && park && feed && since == evfeed_head(feed)) {
+            park->since = since;
+            park->seconds = wait;
+            return API_PARK;
+        }
+        return api_events_answer(feed, since, body, blen);
     }
     if (strcmp(p, "/v0/hold") == 0) {
         if (!api_may(who, "hold"))
@@ -239,16 +323,19 @@ static int upstream_get(void *ctx, const char *path, char *out, size_t olen)
 
 /* One whole request is in the buffer: judge it and answer. Called with the
  * lock held; the lock is let go for the one call that can wait. */
-static void serve(api_t *a, api_conn_t *c, const httpreq_t *req)
+/* 0 when the connection was answered and is done with, 1 when it was
+ * parked and the loop is to keep it. */
+static int serve(api_t *a, api_conn_t *c, const httpreq_t *req)
 {
     static char body[API_BODY_MAX];
     api_svc_t *s = &a->svc[c->svc];
     api_who_t who = s->who;
     api_hold_t hold = s->hold;
+    api_park_t park = { 0, 0 };
     int fd = c->fd;
 
     pthread_mutex_unlock(&a->mu);
-    int status = api_dispatch(&who, &hold, req, upstream_get, &a->upstream, body, sizeof(body));
+    int status = api_dispatch(&who, &hold, req, upstream_get, &a->upstream, a->feed, &park, body, sizeof(body));
     pthread_mutex_lock(&a->mu);
     /* The service may have ended while forgectrl was being asked. */
     if (s->used && strcmp(s->who.id, who.id) == 0) {
@@ -260,8 +347,17 @@ static void serve(api_t *a, api_conn_t *c, const httpreq_t *req)
         }
         s->hold = hold;
     }
-    if (c->fd == fd)
-        answer(fd, status, body);
+    if (c->fd != fd)
+        return 0;                                       /* it went away while forgectrl was being asked */
+    if (status == API_PARK) {
+        c->parked = 1;
+        c->ev_since = park.since;
+        c->ev_until = mono() + park.seconds;
+        c->len = 0;
+        return 1;
+    }
+    answer(fd, status, body);
+    return 0;
 }
 
 static void *broker(void *arg)
@@ -339,6 +435,15 @@ static void *broker(void *arg)
             api_conn_t *c = &a->conn[-what[k] - 1];
             if (c->fd != fds[k].fd)
                 continue;
+            if (c->parked) {
+                /* It has said all it has to say. Anything readable now is
+                 * the peer hanging up, and then there is nobody to tell. */
+                char rest[256];
+                ssize_t k2 = read(c->fd, rest, sizeof(rest));
+                if (k2 <= 0 && !(k2 < 0 && (errno == EAGAIN || errno == EINTR)))
+                    conn_drop(c);
+                continue;
+            }
             ssize_t got = read(c->fd, c->buf + c->len, sizeof(c->buf) - c->len);
             if (got <= 0) {
                 if (got < 0 && (errno == EAGAIN || errno == EINTR))
@@ -358,15 +463,32 @@ static void *broker(void *arg)
                 answer_error(c->fd, -rc, why);
             else if (c->limited)
                 answer_error(c->fd, 429, "too many requests: slow down");
-            else
-                serve(a, c, &req);
+            else if (serve(a, c, &req))
+                continue;                               /* parked: answered when an event comes, or at its deadline */
             conn_drop(c);
         }
-        for (int i = 0; i < API_MAX_CONNS; i++)
-            if (a->conn[i].fd > 0 && now - a->conn[i].since > API_CONN_TIMEOUT_S) {
-                answer_error(a->conn[i].fd, 408, "the request did not arrive in time");
-                conn_drop(&a->conn[i]);
+        /* A parked poll is answered when the feed moves past it, or when
+         * its own wait runs out - with an empty list, which is how a
+         * reader learns that nothing happened. */
+        unsigned long head = a->feed ? evfeed_head(a->feed) : 0;
+        for (int i = 0; i < API_MAX_CONNS; i++) {
+            api_conn_t *c = &a->conn[i];
+            if (c->fd <= 0)
+                continue;
+            if (c->parked) {
+                if (head > c->ev_since || now >= c->ev_until) {
+                    static char body[API_BODY_MAX];
+                    int status = api_events_answer(a->feed, c->ev_since, body, sizeof(body));
+                    answer(c->fd, status, body);
+                    conn_drop(c);
+                }
+                continue;
             }
+            if (now - c->since > API_CONN_TIMEOUT_S) {
+                answer_error(c->fd, 408, "the request did not arrive in time");
+                conn_drop(c);
+            }
+        }
         pthread_mutex_unlock(&a->mu);
     }
 }
@@ -378,10 +500,11 @@ static void sock_path(const api_t *a, const char *id, char *p, size_t plen)
     snprintf(p, plen, "%.255s/%.63s.sock", a->dir, id);
 }
 
-int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, char *err, size_t elen)
+int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed, char *err, size_t elen)
 {
     memset(a, 0, sizeof(*a));
     pthread_mutex_init(&a->mu, NULL);
+    a->feed = feed;
     if (strlen(dir) >= sizeof(a->dir) - 72) {
         snprintf(err, elen, "the API directory's path is too long");
         return -1;
@@ -503,6 +626,19 @@ void api_close(api_t *a, const char *id)
         if (a->svc[i].used && strcmp(a->svc[i].who.id, id) == 0)
             svc_shut(a, i);
     pthread_mutex_unlock(&a->mu);
+}
+
+int api_events_wanted(api_t *a)
+{
+    int n = 0;
+    if (!a->started)
+        return 0;
+    pthread_mutex_lock(&a->mu);
+    for (int i = 0; i < API_MAX_SERVICES; i++)
+        if (a->svc[i].used && api_may(&a->svc[i].who, "events"))
+            n++;
+    pthread_mutex_unlock(&a->mu);
+    return n;
 }
 
 int api_hold_said(api_t *a, const char *id, api_hold_t *out)

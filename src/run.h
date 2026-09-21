@@ -8,6 +8,7 @@
 #define FORGEEXT_RUN_H
 
 #include "api.h"
+#include "evfeed.h"
 #include "holdkeep.h"
 #include "install.h"
 #include "machine.h"
