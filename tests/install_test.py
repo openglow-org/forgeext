@@ -412,6 +412,44 @@ def run_all(w, top):
           "a removed package installs again, into the freed account")
     check(not w.leftovers(), "the staging directory is empty at the end: %s" % w.leftovers())
 
+    print("the owner's keys, and what one makes of a package")
+    keydir = os.path.join(root, "keys")
+    for f in os.listdir(keydir):
+        os.remove(os.path.join(keydir, f))
+    check(w.run("keys").get("keys") == [], "a machine with no owner key lists one: %s" % w.run("keys"))
+    pub = w.pub("owner")
+    check(w.run("key-add", "a maker", pub).get("ok") is False, "a name with a space was taken")
+    check(w.run("key-add", "../../etc/passwd", pub).get("ok") is False, "a name that is a path was taken")
+    check(w.run("key-add", ".hidden", pub).get("ok") is False, "a name that starts with a dot was taken")
+    check(w.run("key-add", "x" * 49, pub).get("ok") is False, "a name of 49 bytes was taken")
+    check(os.listdir(keydir) == [], "a refused key left a file: %s" % os.listdir(keydir))
+    notakey = os.path.join(w.top, "notakey.pub")
+    with open(notakey, "w") as f:
+        f.write("this is not a key\n")
+    r = w.run("key-add", "maker", notakey)
+    check(r.get("ok") is False and "public key" in r.get("error", ""), "what is no key was taken: %s" % r.get("error"))
+    check(os.listdir(keydir) == [], "what is no key left a file: %s" % os.listdir(keydir))
+
+    with open(pub) as f:
+        keytext = f.read().strip()
+    r = w.run("key-add", "maker", pub)
+    keys = {k["name"]: k["key"] for k in r.get("keys", [])}
+    check(r.get("ok") is True and list(keys) == ["maker"] and len(keys["maker"]) == 64,
+          "the key is added and listed with its id: %s" % r)
+    check(os.listdir(keydir) == ["maker.pub"] and open(os.path.join(keydir, "maker.pub")).read().strip() == keytext,
+          "the key on disk is the key that was given: %s" % os.listdir(keydir))
+    check(w.run("key-add", "maker", pub).get("ok") is False, "a second key of the same name was taken")
+
+    # what the key makes of a package signed with its private half
+    community = w.pack(w.tree(manifest("org.example.byakey"), RUN), "owner")
+    r = w.run("inspect", community)
+    check(r.get("tier") == "community" and r.get("key") == keys["maker"],
+          "with the owner's key the package is community, by that key: %s" % {k: r.get(k) for k in ("tier", "key")})
+    check(w.run("key-remove", "maker").get("keys") == [], "the key is removed")
+    check(w.run("inspect", community).get("tier") == "unverified", "without it the same package is unverified")
+    check(w.run("key-remove", "maker").get("ok") is False, "removing a key that is not there")
+    check(w.run("key-remove", "../../etc/passwd").get("ok") is False, "removing a path")
+
 
 if __name__ == "__main__":
     sys.exit(main())

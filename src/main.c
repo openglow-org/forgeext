@@ -32,6 +32,8 @@ static int usage(void)
             "  check [<id>]                       do the installed files still match what was installed\n"
             "  remove <id> [--keep-data]\n"
             "  enable <id> | disable <id>         the operator's switch for one package; enabling lets it out of quarantine\n"
+            "  keys | key-add <name> <file.pub> | key-remove <name>\n"
+            "                                     the owner's keys: what makes a package community rather than unverified\n"
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
             "  caps                               the capabilities a manifest may ask for\n"
             "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
@@ -351,6 +353,35 @@ int main(int argc, char **argv)
         return answer(obj, 1);
     }
 
+    if (strcmp(cmd, "keys") == 0) {
+        json_t *obj = json_object();
+        json_object_set_new(obj, "keys", ext_keys_json(&env));
+        return answer(obj, 1);
+    }
+    if (strcmp(cmd, "key-add") == 0 && i + 1 < argc) {
+        const char *name = argv[i], *file = argv[i + 1];
+        static char text[4096];
+        FILE *f = strcmp(file, "-") == 0 ? stdin : fopen(file, "rb");
+        if (!f)
+            return refuse("cannot read the key file");
+        size_t n = fread(text, 1, sizeof(text), f);
+        if (f != stdin)
+            fclose(f);
+        if (ext_key_add(&env, name, text, n, err, sizeof(err)) != 0)
+            return refuse(err);
+        fflog(LOG_NOTICE, "the owner's key %s was added", name);
+        json_t *obj = json_object();
+        json_object_set_new(obj, "keys", ext_keys_json(&env));
+        return answer(obj, 1);
+    }
+    if (strcmp(cmd, "key-remove") == 0 && i < argc) {
+        if (ext_key_remove(&env, argv[i], err, sizeof(err)) != 0)
+            return refuse(err);
+        fflog(LOG_NOTICE, "the owner's key %s was removed", argv[i]);
+        json_t *obj = json_object();
+        json_object_set_new(obj, "keys", ext_keys_json(&env));
+        return answer(obj, 1);
+    }
     if ((strcmp(cmd, "enable") == 0 || strcmp(cmd, "disable") == 0) && i < argc) {
         const char *id = argv[i];
         int on = strcmp(cmd, "enable") == 0;

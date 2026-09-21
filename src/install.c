@@ -571,6 +571,78 @@ int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err,
     return change(env, id, 0, on ? 1 : 0, err, elen);
 }
 
+/* A key's name: what may be a file name under the keys directory, and
+ * nothing that is a path. */
+static int key_name_ok(const char *name)
+{
+    size_t n = name ? strlen(name) : 0;
+    if (n < 1 || n > 48 || name[0] == '.' || name[0] == '-')
+        return 0;
+    return strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") == n;
+}
+
+int ext_key_add(const ext_env_t *env, const char *name, const char *text, size_t tlen, char *err, size_t elen)
+{
+    char path[400], tmp[420], id[65];
+    if (!key_name_ok(name))
+        return fail(err, elen, "a key's name is letters, digits, dash, underscore, and dot, at most 48 bytes");
+    if (!text || tlen == 0 || tlen > 4096)
+        return fail(err, elen, "a key is the text fwup writes, or its 32 raw bytes");
+    snprintf(path, sizeof(path), "%.255s/keys/%.48s.pub", env->root, name);
+    snprintf(tmp, sizeof(tmp), "%.255s/keys/.%.48s.pub.new", env->root, name);
+    if (access(path, F_OK) == 0)
+        return fail(err, elen, "a key called %s is already here", name);
+    int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return fail(err, elen, "cannot write %s: %s", tmp, strerror(errno));
+    int ok = write(fd, text, tlen) == (ssize_t)tlen;
+    close(fd);
+    /* It is a key or it is not: what cannot be read as one never becomes a
+     * trust anchor. */
+    if (!ok || pkg_key_id(tmp, id) != 0) {
+        unlink(tmp);
+        return fail(err, elen, ok ? "that is no Ed25519 public key" : "cannot write the key");
+    }
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return fail(err, elen, "cannot put the key in place: %s", strerror(errno));
+    }
+    return 0;
+}
+
+int ext_key_remove(const ext_env_t *env, const char *name, char *err, size_t elen)
+{
+    char path[400];
+    if (!key_name_ok(name))
+        return fail(err, elen, "a key's name is letters, digits, dash, underscore, and dot, at most 48 bytes");
+    snprintf(path, sizeof(path), "%.255s/keys/%.48s.pub", env->root, name);
+    if (unlink(path) != 0)
+        return fail(err, elen, "no key called %s is here", name);
+    return 0;
+}
+
+json_t *ext_keys_json(const ext_env_t *env)
+{
+    char dir[340], path[400], id[65];
+    json_t *arr = json_array();
+    struct dirent **list = NULL;
+    snprintf(dir, sizeof(dir), "%.255s/keys", env->root);
+    int n = scandir(dir, &list, NULL, alphasort);
+    for (int i = 0; i < n; i++) {
+        size_t len = strlen(list[i]->d_name);
+        if (list[i]->d_name[0] != '.' && len > 4 && strcmp(list[i]->d_name + len - 4, ".pub") == 0) {
+            snprintf(path, sizeof(path), "%.339s/%.56s", dir, list[i]->d_name);
+            json_t *j = json_object();
+            json_object_set_new(j, "name", json_stringn(list[i]->d_name, len - 4));
+            json_object_set_new(j, "key", json_string(pkg_key_id(path, id) == 0 ? id : ""));
+            json_array_append_new(arr, j);
+        }
+        free(list[i]);
+    }
+    free(list);
+    return arr;
+}
+
 int ext_set_enabled(const ext_env_t *env, const char *id, int on, char *err, size_t elen)
 {
     state_t *st = calloc(1, sizeof(*st));

@@ -20,6 +20,8 @@
 #include <stddef.h>
 
 #include "manifest.h"
+#include <jansson.h>
+
 #include "pkg.h"
 #include "state.h"
 
@@ -97,6 +99,22 @@ void ext_unlock(int lock);
  * gave up on is remembered as quarantined (and let out by quarantined=0). */
 int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen);
 int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
+
+/* The owner's keys: the trust anchor the owner may replace. A key file
+ * under <root>/keys is what makes a package community rather than
+ * unverified, so adding one is the operator's own act (forgectrl asks for
+ * the machine's button to be held, as for unsigned firmware).
+ *
+ * name is what the key is called: letters, digits, dash, underscore, dot,
+ * at most 48 bytes, no path. text is the key as fwup writes it (base64) or
+ * 32 raw bytes; it is parsed before it is written, so a file that is no
+ * Ed25519 public key never lands. 0, or -1 with the words. */
+int ext_key_add(const ext_env_t *env, const char *name, const char *text, size_t tlen, char *err, size_t elen);
+int ext_key_remove(const ext_env_t *env, const char *name, char *err, size_t elen);
+
+/* The keys, as a JSON array of {"name", "key"} (the key's id, as a
+ * package's "key" names it). NULL on failure. */
+json_t *ext_keys_json(const ext_env_t *env);
 
 /* The operator's switch for one package. A package that is disabled keeps
  * its files, its data, its grants, and its account; its service is
