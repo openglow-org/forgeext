@@ -174,6 +174,28 @@ int net_base_ok(const net_env_t *env, char *err, size_t elen)
     return 0;
 }
 
+int net_sweep(const net_env_t *env, char *err, size_t elen)
+{
+    /* The chain names alone: the rules of 32 accounts would not fit a
+     * buffer worth having. */
+    static char text[16384];
+    const char *argv[] = { "", "list", "chains", "inet", NULL };
+    if (nft_run(env, argv, NULL, text, sizeof(text)) != 0)
+        return fail(err, elen, "the chains of table inet ffx cannot be listed");
+    int n = 0;
+    for (const char *p = text; (p = strstr(p, "chain u")) != NULL;) {
+        p += strlen("chain u");
+        char *end;
+        unsigned long uid = strtoul(p, &end, 10);
+        if (end == p || *end != ' ' || uid < NET_POOL_FIRST || uid > NET_POOL_LAST)
+            continue;
+        if (net_revoke(env, (uid_t)uid, err, elen) != 0)
+            return -1;
+        n++;
+    }
+    return n;
+}
+
 static int v4_is_self_shaped(const struct in_addr *a)
 {
     uint32_t h = ntohl(a->s_addr);

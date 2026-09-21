@@ -71,6 +71,32 @@ int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
     return 0;
 }
 
+int ext_root_reachable(const ext_env_t *env, char *err, size_t elen)
+{
+    char p[512];
+    struct stat st;
+    static const char *const below[] = { "/pkg", "/data" };
+    if (!env->root || env->root[0] != '/' || strlen(env->root) > EXT_ROOT_MAX)
+        return fail(err, elen, "the extension root is an absolute path of at most %d bytes", EXT_ROOT_MAX);
+    size_t n = strlen(env->root);
+    for (size_t i = 1; i <= n; i++) {
+        if (env->root[i] != '/' && env->root[i] != '\0')
+            continue;
+        snprintf(p, sizeof(p), "%.*s", (int)i, env->root);
+        if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode))
+            return fail(err, elen, "%s is not a directory", p);
+        if (!(st.st_mode & S_IXOTH))
+            return fail(err, elen, "%s (mode %04o) does not let a package's account through", p,
+                        (unsigned)(st.st_mode & 07777));
+    }
+    for (size_t i = 0; i < sizeof(below) / sizeof(below[0]); i++) {
+        snprintf(p, sizeof(p), "%.255s%.8s", env->root, below[i]);
+        if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode) || !(st.st_mode & S_IXOTH))
+            return fail(err, elen, "%s does not let a package's account through", p);
+    }
+    return 0;
+}
+
 int ext_lock(const ext_env_t *env, char *err, size_t elen)
 {
     char p[300];

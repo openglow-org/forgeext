@@ -1,0 +1,108 @@
+#!/bin/sh
+# Copyright 2026 514 LLC d/b/a OpenGlow
+# Written by Scott Wiederhold
+# https://community.openglow.org
+# SPDX-License-Identifier:    MIT
+### BEGIN INIT INFO
+# Provides:          forgeext
+# Required-Start:    $network $syslog forgectrl
+# Required-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: ForgeFIRM extension host
+### END INIT INFO
+
+DAEMON=/usr/bin/forgeext
+PIDFILE=/var/run/forgeext.pid
+FIFO=/var/run/forgeext.stderr
+POOL=/sys/fs/cgroup/ffx
+
+# The host runs whether extensions are on or off: it reads ext_enabled
+# from the settings file on every turn and starts nothing while it is 0,
+# so turning extensions on or off never starts or stops this service.
+#
+# It runs under a small respawn wrapper, because a package's service is
+# frozen for an armed window by the host and by nothing else. A host that
+# ended without stopping its services leaves them running with nobody to
+# freeze them, so the wrapper kills every group of the pool the moment
+# that happens, and the respawned host sweeps the pool again before it
+# starts anything. Stopping the service stops the wrapper and the host,
+# and the host stops its services on the way out.
+#
+# Logging: the host emits through syslog itself (rsyslog files it under
+# /data/log/forgefirm/forgeext), a service's output included. Anything
+# that still reaches its stdout/stderr flows through a fifo into a
+# `logger` relay under the same program name. The relay holds the fifo
+# open read-write so it never sees EOF and survives respawns.
+
+# The host, and not an install or a check that an operator has under way:
+# the same executable, told apart by its command line. Never the process
+# name (this script is named forgeext too).
+hosts() {
+    for p in $(pidof forgeext 2>/dev/null); do
+        [ "$(readlink -f /proc/$p/exe 2>/dev/null)" = "$DAEMON" ] || continue
+        [ "$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)" = "$DAEMON run " ] && echo $p
+    done
+}
+
+kill_pool() {
+    for k in $POOL/*/cgroup.kill; do
+        [ -e "$k" ] && echo 1 > "$k" 2>/dev/null
+    done
+}
+
+case "$1" in
+  start)
+    echo "Starting forgeext"
+    rm -f "$FIFO"
+    mkfifo -m 600 "$FIFO"
+    start-stop-daemon -S -q -p $PIDFILE -m -b -x /bin/sh -- -c "
+      trap 'kill \$CHILD \$RELAY 2>/dev/null; exit 0' TERM
+      # The wrapper must survive memory pressure to respawn the host; the
+      # host outranks every service it runs (they are at 900) and ranks
+      # below the machine's own daemons.
+      echo -1000 > /proc/self/oom_score_adj 2>/dev/null
+      logger -t forgeext -p daemon.warning <> $FIFO &
+      RELAY=\$!
+      while :; do
+        ( echo -400 > /proc/self/oom_score_adj 2>/dev/null; exec $DAEMON run ) > $FIFO 2>&1 &
+        CHILD=\$!
+        wait \$CHILD
+        RC=\$?
+        [ \$RC -eq 0 ] && { kill \$RELAY 2>/dev/null; exit 0; }
+        for k in $POOL/*/cgroup.kill; do
+          [ -e \"\$k\" ] && echo 1 > \"\$k\" 2>/dev/null
+        done
+        logger -t forgeext -p daemon.err \"exited (\$RC) - its services were killed - respawning in 5 s\"
+        sleep 5 &
+        CHILD=\$!
+        wait \$CHILD
+      done"
+    ;;
+  stop)
+    echo "Stopping forgeext"
+    start-stop-daemon -K -q -p $PIDFILE
+    # The wrapper passes the TERM on and the host stops its services
+    # before it ends: give it the time, then take what is left.
+    n=0
+    while [ -n "$(hosts)" ] && [ $n -lt 20 ]; do
+      sleep 1
+      n=$((n + 1))
+    done
+    for p in $(hosts); do
+      kill -9 $p 2>/dev/null
+    done
+    kill_pool
+    rm -f $PIDFILE
+    ;;
+  restart)
+    $0 stop
+    sleep 1
+    $0 start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+exit 0

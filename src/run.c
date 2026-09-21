@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -50,6 +51,7 @@ typedef struct {
     const run_cfg_t *cfg;
     logpipe_t logs[SUPER_MAX_SERVICES];
     char last_status[8192];
+    char unreachable[300];                      /* the last word on a root no account can walk to, said once */
 } run_t;
 
 void run_cfg_defaults(run_cfg_t *cfg)
@@ -339,6 +341,9 @@ static void sync_installed(run_t *r, super_t *sv)
 static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
 {
     json_t *top = json_object(), *list = json_array();
+    /* The file is written when it changes and outlives a host that was
+     * killed: the pid says whose word it is. */
+    json_object_set_new(top, "pid", json_integer(getpid()));
     json_object_set_new(top, "enabled", json_boolean(mc->enabled));
     json_object_set_new(top, "off_reason", json_string(mc->off_reason));
     json_object_set_new(top, "armed", mc->armed < 0 ? json_null() : json_boolean(mc->armed));
@@ -398,6 +403,33 @@ int run_daemon(const run_cfg_t *cfg)
         fflog(LOG_ERR, "not starting: cannot make %s: %s", cfg->run_dir, strerror(errno));
         return 1;
     }
+    /* One daemon: a second one would sweep the first one's services. The
+     * lock is held until the process ends, however it ends. */
+    char lockpath[PATH_MAX];
+    snprintf(lockpath, sizeof(lockpath), "%.4000s/daemon.lock", cfg->run_dir);
+    int lfd = open(lockpath, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lfd < 0 || flock(lfd, LOCK_EX | LOCK_NB) != 0) {
+        fflog(LOG_ERR, "not starting: another extension host holds %s", lockpath);
+        fprintf(stderr, "forgeext run: another extension host is running\n");
+        if (lfd >= 0)
+            close(lfd);
+        return 1;
+    }
+    /* A daemon that was killed left its services running, thawed, with
+     * their ways out open, and nobody to freeze them when a job arms.
+     * Nothing this one did not start runs under it. */
+    int groups = cg_sweep(cfg->cg_parent);
+    int chains = net_sweep(&cfg->net, err, sizeof(err));
+    if (groups < 0) {
+        fflog(LOG_ERR, "not starting: a group under %s could not be emptied and removed", cfg->cg_parent);
+        close(lfd);
+        return 1;
+    }
+    if (groups > 0 || chains > 0)
+        fflog(LOG_WARNING, "a previous extension host left %d group(s) and %d allowlist chain(s): removed", groups,
+              chains > 0 ? chains : 0);
+    if (chains < 0)
+        fflog(LOG_WARNING, "the allowlist could not be swept (%s): a start replaces its own account's chain", err);
     sigemptyset(&mask);
     sigaddset(&mask, SIGCHLD);
     sigaddset(&mask, SIGTERM);
@@ -448,6 +480,20 @@ int run_daemon(const run_cfg_t *cfg)
         for (int i = 0; i < sv.n; i++)
             waiting |= sv.svc[i].wanted && sv.svc[i].state != SVC_RUNNING;
         machine_read(&cfg->machine, &mc, waiting);
+        /* A service whose account cannot walk to its package would end at
+         * once, five times, and be quarantined for a fault that is the
+         * machine's: it is the machine that is not ready. */
+        if (mc.may_start) {
+            if (ext_root_reachable(&cfg->ext, err, sizeof(err)) != 0) {
+                mc.may_start = 0;
+                snprintf(mc.not_ready, sizeof(mc.not_ready), "%.95s", err);
+                if (strcmp(err, r.unreachable) != 0)
+                    fflog(LOG_ERR, "no service can start: %s", err);
+                snprintf(r.unreachable, sizeof(r.unreachable), "%s", err);
+            } else {
+                r.unreachable[0] = '\0';
+            }
+        }
         super_inputs_t in = { mc.enabled, mc.may_start, mc.armed, mc.mode_cloud, mc.off_reason };
         if (!stopping)
             super_tick(&sv, &in, mono());
@@ -463,5 +509,6 @@ int run_daemon(const run_cfg_t *cfg)
     write_status(&r, &sv, &off);
     fflog(LOG_NOTICE, "stopped");
     close(sfd);
+    close(lfd);
     return 0;
 }

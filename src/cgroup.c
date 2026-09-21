@@ -6,6 +6,7 @@
  */
 #include "cgroup.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -193,4 +194,27 @@ int cg_destroy(const char *parent, const char *id)
         nap_ms(20);
     }
     return -1;
+}
+
+int cg_sweep(const char *parent)
+{
+    DIR *d = opendir(parent);
+    if (!d)
+        return -1;
+    int n = 0, bad = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        char p[512];
+        struct stat st;
+        if (e->d_name[0] == '.' || snprintf(p, sizeof(p), "%s/%s", parent, e->d_name) >= (int)sizeof(p))
+            continue;
+        if (lstat(p, &st) != 0 || !S_ISDIR(st.st_mode))
+            continue;
+        if (cg_destroy(parent, e->d_name) == 0)
+            n++;
+        else
+            bad = 1;
+    }
+    closedir(d);
+    return bad ? -1 : n;
 }

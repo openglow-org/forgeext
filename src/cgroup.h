@@ -46,4 +46,9 @@ long long cg_event(const char *parent, const char *id, const char *file, const c
  * one too), wait until it is empty, and remove it. 0 when it is gone. */
 int cg_destroy(const char *parent, const char *id);
 
+/* Destroy every group under the parent: what a daemon that died without
+ * stopping its services left running, outside anybody's freeze. The
+ * number of groups removed, or -1 when one could not be. */
+int cg_sweep(const char *parent);
+
 #endif

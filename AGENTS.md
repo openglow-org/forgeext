@@ -36,7 +36,8 @@ sibling `forgefirm` checkout or `FFX_RULES`) into a network namespace with a
 peer on a veth pair and drives `net-check`, `net-allow`, and `net-revoke`;
 it needs root, nft, ip, and nsenter. `tests/run_test.py` runs the daemon
 itself in the same kind of namespace, against a stand-in for forgectrl's
-read-only routes and four real packages.
+read-only routes and four real packages, a second daemon and a killed one
+included.
 
 ### Rules specific to this repository
 
@@ -74,6 +75,11 @@ read-only routes and four real packages.
   nobody.
 - **`state.json` has one writer at a time**: `ext_lock` around every
   load, change, save, in the command line and in the daemon alike.
+- **Nothing the host did not start runs under it.** A service is frozen for
+  an armed window by the host and by nothing else, so a service outside a
+  host's reach is outside the freeze: a starting host sweeps the pool's
+  groups and chains, there is one host at a time (`daemon.lock`), and the
+  init wrapper kills the pool the moment the host ends abnormally.
 - **A network rule names an address, never a name**: what was resolved and
   judged is what is allowed. `netrules.c` is the only writer of the image
   table's `allow` map, and no service starts unless `net_base_ok` finds the

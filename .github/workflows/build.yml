@@ -49,7 +49,7 @@ jobs:
         run: |
           sudo FORGEEXT=build/forgeext FFX_RULES=forgefirm-rules/meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files/ffx.nft \
             python3 -B tests/netrules_test.py
-      - name: run_test (the daemon itself: a stand-in forgectrl, four real packages, the armed window, quarantine, safe mode)
+      - name: run_test (the daemon itself: a stand-in forgectrl, four real packages, the armed window, quarantine, one daemon at a time, the sweep after a killed one, safe mode)
         run: |
           sudo FORGEEXT=build/forgeext FWUP="$(command -v fwup)" \
             FFX_RULES=forgefirm-rules/meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files/ffx.nft \

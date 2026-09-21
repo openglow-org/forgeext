@@ -62,6 +62,13 @@ void ext_env_defaults(ext_env_t *env);
 /* Make the root's directories (0755; tmp 0700). */
 int ext_root_prepare(const ext_env_t *env, char *err, size_t elen);
 
+/* Can a package's account walk to its files? Every directory from / down
+ * to the root, and the root's pkg and data, must let others through (the
+ * search bit); landlock, not the mode of a parent, is what keeps a service
+ * out of everything that is not its own. -1 with the directory that does
+ * not. */
+int ext_root_reachable(const ext_env_t *env, char *err, size_t elen);
+
 /* Everything an install checks short of the operator's consent and
  * grants, with nothing left behind: what the panel shows before it asks. */
 int ext_inspect(const ext_env_t *env, const char *file, install_result_t *res, char *err, size_t elen);

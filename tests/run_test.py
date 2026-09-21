@@ -192,10 +192,14 @@ def main():
         f.write("ext_enabled=0\n")
     log_path = os.path.join(top, "daemon.log")
     log = open(log_path, "w")
-    daemon = subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "run", "--conf", conf, "--safe-file", safe,
-                               "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir]
-                              + (["--landlock-fs-only"] if abi < 4 else []),
-                              stderr=log, stdout=log, env=dict(os.environ, FFLOG_STDERR="1", FFLOG_SOCK="/nonexistent"))
+
+    def start_daemon():
+        return subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "run", "--conf", conf, "--safe-file", safe,
+                                 "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir]
+                                + (["--landlock-fs-only"] if abi < 4 else []),
+                                stderr=log, stdout=log, env=dict(os.environ, FFLOG_STDERR="1", FFLOG_SOCK="/nonexistent"))
+
+    daemon = start_daemon()
 
     def status():
         try:
@@ -222,11 +226,26 @@ def main():
 
     try:
         print("off, then not ready")
+        check(wait_for(lambda: status().get("pid") == daemon.pid, 10), "the status file names the host that wrote it")
         check(wait_for(lambda: status().get("off_reason"), 10) and not running(), "off: %s", status().get("off_reason"))
         with open(conf, "w") as f:
             f.write("log_forgeext_disk=info\next_enabled = 1\n")
         check(wait_for(lambda: "motion is unverified" in status().get("not_ready", ""), 10) and not running(),
               "enabled and not ready: %s", status().get("not_ready"))
+
+        print("a root no package account can walk to: the machine is not ready, and nobody is quarantined for it")
+        os.chmod(top, 0o700)                            # as an installer under a strict umask leaves a data directory
+        facts["motion"] = "verified"
+        check(wait_for(lambda: "does not let a package's account through" in status().get("not_ready", ""), 10),
+              "the host names the directory: %s", status().get("not_ready"))
+        time.sleep(8)
+        check(not running() and not any(s_["state"] == "quarantined" for s_ in status().get("services", []))
+              and logged("no service can start: " + top), "nothing started, nothing is quarantined, and the log says why once")
+        check(open(log_path).read().count("no service can start") == 1, "it is said once, not every second")
+        facts["motion"] = "unverified"
+        os.chmod(top, 0o755)
+        check(wait_for(lambda: "motion is unverified" in status().get("not_ready", ""), 10), "walkable again: %s",
+              status().get("not_ready"))
 
         print("ready: one at a time, each in its own account and group")
         t0 = time.time()
@@ -283,6 +302,34 @@ def main():
               "state.json remembers it")
         check(logged("ext org.example.crash: about to end"), "its last words are in the log")
         check(not os.path.isdir(CG_PARENT + "/org.example.crash"), "and its group is gone")
+
+        print("one daemon at a time; a killed daemon's services do not outlive the next one's start")
+        check(wait_for(lambda: len(running()) >= 2, 30), "services are running before the daemon is killed: %s", running())
+        mine = {s_["id"]: s_["pid"] for s_ in status().get("services", []) if s_["state"] == "running"}
+        second = start_daemon()
+        rc2 = second.wait(timeout=20)
+        check(rc2 == 1 and logged("another extension host holds"), "a second daemon is refused (exit %s)", rc2)
+        check(all(os.path.exists("/proc/%d" % pid) for pid in mine.values()) and running(),
+              "and the first one's services are untouched by it")
+        daemon.kill()
+        daemon.wait(timeout=10)
+        alive = [i for i, pid in mine.items() if os.path.exists("/proc/%d" % pid)]
+        chains = subprocess.run([NFT, "list", "chains", "inet"], capture_output=True, text=True).stdout
+        check(alive and "chain u8" in chains, "a killed daemon leaves its services running and their chains in place "
+              "(what the sweep is for): alive %s", alive)
+        with open(conf, "w") as f:
+            f.write("ext_enabled=0\n")                    # the next daemon starts nothing: what ends them is the sweep
+        daemon = start_daemon()
+        check(wait_for(lambda: logged("a previous extension host left"), 15), "the next daemon says what it found")
+        check(wait_for(lambda: status().get("pid") == daemon.pid, 10), "and the status file is the new host's word")
+        gone = wait_for(lambda: not any(os.path.exists("/proc/%d" % pid) for pid in mine.values()), 10)
+        left = [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))]
+        chains = subprocess.run([NFT, "list", "chains", "inet"], capture_output=True, text=True).stdout
+        check(gone and not left and "chain u8" not in chains, "and what it found is gone: processes %s, groups %s",
+              "gone" if gone else "alive", left)
+        with open(conf, "w") as f:
+            f.write("ext_enabled=1\n")
+        check(wait_for(lambda: len(running()) >= 1, 30), "turned on again, the services start under the new daemon")
 
         print("safe mode, and the end")
         open(safe, "w").close()

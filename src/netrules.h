@@ -55,6 +55,10 @@ int net_allow(const net_env_t *env, uid_t uid, const net_dest_t *dests, int ndes
  * error. */
 int net_revoke(const net_env_t *env, uid_t uid, char *err, size_t elen);
 
+/* Revoke every account that has a chain: the ways out that a daemon that
+ * died left open. The number revoked, or -1. */
+int net_sweep(const net_env_t *env, char *err, size_t elen);
+
 /* Is the address this machine's, loopback, unspecified, or multicast?
  * `addr` is numeric text. 1, 0, or -1 when it is not an address. */
 int net_addr_is_self(const char *addr);
