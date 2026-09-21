@@ -27,6 +27,8 @@ add_library(forgeext_core STATIC
   src/machine.c
   src/run.c
   src/holdkeep.c
+  src/httpreq.c
+  src/api.c
   src/fflog.c)
 target_include_directories(forgeext_core PUBLIC src
   ${JANSSON_INCLUDE_DIRS} ${LIBARCHIVE_INCLUDE_DIRS} ${SODIUM_INCLUDE_DIRS})
@@ -43,7 +45,7 @@ install(TARGETS forgeext RUNTIME DESTINATION bin)
 # Host tests: one binary each, exit 0 on a pass. tests/install_test.py
 # drives the built forgeext against real archives made with fwup.
 # sandbox_test needs root and cgroup v2 (it exits 77 without).
-foreach(t caps_test manifest_test state_test super_test holdkeep_test sandbox_test)
+foreach(t caps_test manifest_test state_test super_test holdkeep_test httpreq_test api_test sandbox_test)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} forgeext_core)
 endforeach()

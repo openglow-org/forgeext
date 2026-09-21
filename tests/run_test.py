@@ -29,6 +29,8 @@ import json
 import os
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -57,9 +59,61 @@ print(s.getsockname()[1], flush=True)
 sys.stdin.readline()
 ''' % PEER_ADDR
 
-DIAL = r'''
+# What a service needs to talk to the host: one request per connection to the socket named in FFX_API.
+API_CLIENT = r'''
+import json, os, socket
+def api(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else b""
+    head = "%s %s HTTP/1.1\r\nHost: forgeext\r\n" % (method, path)
+    if body is not None:
+        head += "Content-Type: application/json\r\nContent-Length: %d\r\n" % len(data)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect(os.environ["FFX_API"])
+        s.sendall(head.encode() + b"\r\n" + data)
+        buf = b""
+        while True:
+            c = s.recv(65536)
+            if not c:
+                break
+            buf += c
+        top, _, payload = buf.partition(b"\r\n\r\n")
+        return int(top.split()[1]), json.loads(payload or b"null")
+    except (OSError, ValueError, IndexError) as e:
+        return 599, {"error": str(e)}
+    finally:
+        s.close()
+'''
+
+# The one the operator lets run through a job: it may read the machine and has a hold.
+JOBTIME = API_CLIENT + r'''
+import sys, time
+code, me = api("GET", "/v0/self")
+print("api self %d %s %s %s" % (code, me.get("id"), me.get("api"), ",".join(sorted(me.get("capabilities", [])))), flush=True)
+code, mode = api("GET", "/v0/machine/mode")
+print("api mode %d %s %s" % (code, mode.get("mode"), mode.get("motion")), flush=True)
+print("api nowhere %d" % api("GET", "/v0/nowhere")[0], flush=True)
+print("api bad hold %d" % api("POST", "/v0/hold", {"raised": "yes"})[0], flush=True)
+code, h = api("POST", "/v0/hold", {"raised": True, "reason": "through the job"})
+print("api raise %d %s" % (code, h), flush=True)
+codes = [api("GET", "/v0/self")[0] for _ in range(60)]
+print("api burst %d ok %d limited" % (codes.count(200), codes.count(429)), flush=True)
+cleared = False
+while True:
+    if not cleared and os.path.exists(os.path.join(os.environ["FFX_DATA"], "clear")):
+        time.sleep(1.5)
+        print("api clear %d" % api("POST", "/v0/hold", {"raised": False})[0], flush=True)
+        cleared = True
+    print("through the job", flush=True)
+    time.sleep(1)
+'''
+
+DIAL = API_CLIENT + r'''
 import socket, sys, time
 name, port, local = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+print("api without the capabilities: mode %d hold %d raise %d" % (api("GET", "/v0/machine/mode")[0], api("GET", "/v0/hold")[0],
+      api("POST", "/v0/hold", {"raised": True})[0]), flush=True)
 def dial(host, p):
     s = socket.socket()
     s.settimeout(3)
@@ -182,19 +236,18 @@ def main():
     print("four packages")
     package("org.example.beat", "shell", "#!/bin/sh\nwhile true; do echo beat; sleep 1; done\n", caps=["hold"], grants=["hold"])
     package("org.example.dial", "python", DIAL, caps=["net.outbound:peer.test:%d" % pport], args=["peer.test", str(pport), str(fport)])
-    package("org.example.jobtime", "shell", "#!/bin/sh\nwhile true; do echo through the job; sleep 1; done\n",
-            caps=["job_time.run"], grants=["job_time.run"])
+    package("org.example.jobtime", "python", JOBTIME, caps=["job_time.run", "machine.read", "hold"], grants=["job_time.run", "hold"])
     package("org.example.crash", "shell", "#!/bin/sh\necho about to end\nexit 3\n", caps=["hold"], grants=["hold"])
 
     print("a hold is the operator's to mark, and only where there is one")
-    holds_dir, marks = os.path.join(top, "holds"), os.path.join(root, "required-holds")
+    holds_dir, marks, api_dir = os.path.join(top, "holds"), os.path.join(root, "required-holds"), os.path.join(top, "api")
     r = fx("hold", "org.example.dial", "required")
     check(r.get("ok") is False and "has no hold" in r.get("error", ""), "no grant, no hold to mark: %s", r.get("error"))
     r = fx("hold", "org.example.crash", "required")
     check(r.get("ok") is True and os.listdir(marks) == ["org.example.crash"], "marked required, and named for forgectrl: %s %s",
           r.get("error", ""), os.listdir(marks))
     listed = {x["id"]: x.get("hold") for x in fx("list").get("packages", [])}
-    check(listed == {"org.example.beat": "advisory", "org.example.dial": None, "org.example.jobtime": None,
+    check(listed == {"org.example.beat": "advisory", "org.example.dial": None, "org.example.jobtime": "advisory",
                      "org.example.crash": "required"}, "the list says which hold is which: %s", listed)
 
     def held(id_):
@@ -217,7 +270,7 @@ def main():
     def start_daemon():
         return subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "run", "--conf", conf, "--safe-file", safe,
                                  "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir,
-                                 "--holds-dir", holds_dir]
+                                 "--holds-dir", holds_dir, "--api-dir", api_dir]
                                 + (["--landlock-fs-only"] if abi < 4 else []),
                                 stderr=log, stdout=log, env=dict(os.environ, FFLOG_STDERR="1", FFLOG_SOCK="/nonexistent"))
 
@@ -296,6 +349,46 @@ def main():
         check(cg("org.example.beat", "cpu.max").split() == ["25000", "100000"] and cg("org.example.beat", "pids.max").strip() == "32",
               "its limits: cpu.max %s pids.max %s", cg("org.example.beat", "cpu.max").strip(), cg("org.example.beat", "pids.max").strip())
 
+        print("the API socket: a package's one way to the machine, and the broker behind it")
+        jid = "ext org.example.jobtime: "
+        check(wait_for(lambda: logged(jid + "api burst"), 40), "the service with the API's use has been through its calls")
+        check(logged(jid + "api self 200 org.example.jobtime 0.1 hold,job_time.run,machine.read"),
+              "GET /v0/self: who it is, the API's version, and what it may use (the grants it got, the capabilities that need none)")
+        check(logged(jid + "api mode 200 grbl verified"), "GET /v0/machine/mode: forgectrl's answer, relayed")
+        check(logged(jid + "api nowhere 404") and logged(jid + "api bad hold 400"), "a path the API does not have, and a hold in no form")
+        check(logged(jid + "api raise 200 {'raised': True, 'reason': 'through the job'}"), "POST /v0/hold: raised, in its words")
+        j = wait_for(lambda: (held("org.example.jobtime") or {}).get("raised") and held("org.example.jobtime"), 5)
+        check(j and j["required"] is False and j["reason"] == "through the job" and j["age"] < 1.5,
+              "and the host keeps it for forgectrl: %s", j)
+        check(logged("org.example.jobtime: it raised its hold: through the job"), "the host's log says who raised what")
+        burst = [l for l in open(log_path).read().splitlines() if jid + "api burst" in l]
+        ok, limited = (int(burst[0].split("api burst ")[1].split()[0]), int(burst[0].split(" ok ")[1].split()[0])) if burst else (0, 0)
+        check(ok + limited == 60 and 1 <= limited and ok <= 30, "sixty requests at once: %d answered, %d told to slow down", ok, limited)
+        check(logged("ext org.example.dial: api without the capabilities: mode 403 hold 403 raise 403"),
+              "a package that holds neither capability gets 403 three times")
+        sock = os.path.join(api_dir, "org.example.jobtime.sock")
+        st = os.stat(sock)
+        juid = 800 + int(svc("org.example.jobtime")["account"][3:])
+        check(stat.S_ISSOCK(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o660 and (st.st_uid, st.st_gid) == (0, juid),
+              "its socket is root's and its account's, 0660: %o %d:%d", stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+        check(sorted(os.listdir(api_dir)) == ["org.example.beat.sock", "org.example.dial.sock", "org.example.jobtime.sock"],
+              "one socket per running service: %s", sorted(os.listdir(api_dir)))
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(3)
+        c.connect(sock)
+        c.sendall(b"GET /v0/self HTTP/1.1\r\n\r\n")
+        try:
+            got = c.recv(4096)
+        except OSError:
+            got = b""
+        c.close()
+        check(got == b"" and wait_for(lambda: logged("a connection to its API socket that is not its account's"), 3),
+              "a caller that is not the package's account gets no answer (root here): %r", got[:60])
+        open(os.path.join(root, "data", "org.example.jobtime", "clear"), "w").close()
+        check(wait_for(lambda: logged(jid + "api clear 200"), 10) and
+              wait_for(lambda: (held("org.example.jobtime") or {"raised": True})["raised"] is False, 5),
+              "POST /v0/hold with raised false clears it: %s", held("org.example.jobtime"))
+
         print("the holds: kept by the host, fresh, and failing closed for the one marked required")
         b, c = held("org.example.beat"), None
         check(b and b["required"] is False and b["raised"] is False and b["age"] < 1.5,
@@ -305,7 +398,7 @@ def main():
         check(c and c["required"] is True and c["age"] < 1.5
               and c["reason"] in ("the extension is not running", "the extension has only just started"),
               "required and not running: raised by the host, in the host's words: %s", c)
-        check(sorted(os.listdir(holds_dir)) == ["org.example.beat.json", "org.example.crash.json"],
+        check(sorted(os.listdir(holds_dir)) == ["org.example.beat.json", "org.example.crash.json", "org.example.jobtime.json"],
               "a package without the grant has no file: %s", sorted(os.listdir(holds_dir)))
         ages, clear = [], 0
         for _ in range(8):
@@ -401,6 +494,7 @@ def main():
         chains = subprocess.run([NFT, "list", "table", "inet", "ffx"], capture_output=True, text=True).stdout
         check(rc == 0 and not left and "chain u8" not in chains and not running(),
               "SIGTERM: exit %s, groups left %s, the status says nothing runs", rc, left)
+        check(not os.listdir(api_dir), "and no API socket: %s", os.listdir(api_dir))
         check(os.listdir(holds_dir) == ["org.example.crash.json"], "a clean stop takes the advisory hold's file and leaves the "
               "required one to go stale: %s", os.listdir(holds_dir))
         r = fx("remove", "org.example.crash")

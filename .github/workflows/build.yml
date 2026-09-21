@@ -43,6 +43,10 @@ jobs:
         run: ./build/super_test
       - name: holdkeep_test (what the host says for a package's hold, and how it keeps the files fresh)
         run: ./build/holdkeep_test
+      - name: httpreq_test (the API socket's request reader: the closed form, and every refusal)
+        run: ./build/httpreq_test
+      - name: api_test (the capability broker's judgment over a fake machine)
+        run: ./build/api_test
       - name: sandbox_test (a real child under the launcher, seen from inside and from outside)
         run: |
           # 77 is the test's "could not run here": on this runner that is a failure.

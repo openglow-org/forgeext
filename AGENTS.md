@@ -19,6 +19,7 @@ space with the cooling engine and the supervisor.
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Werror
 cmake --build build
 ./build/caps_test && ./build/manifest_test && ./build/state_test && ./build/super_test && ./build/holdkeep_test
+./build/httpreq_test && ./build/api_test
 FWUP=/path/to/fwup python3 -B tests/install_test.py
 sudo ./build/sandbox_test
 sudo FORGEEXT=build/forgeext python3 -B tests/netrules_test.py
@@ -88,6 +89,13 @@ included.
   stale), and for a host that never came up (the names under
   `required-holds`). The operator's exits are extensions off, safe mode,
   and removal, never a quieter failure.
+- **The API socket takes a closed form, and the broker answers from the
+  grants.** `httpreq.c` reads one request in one form and refuses the rest
+  with a status; `api_dispatch()` is the broker's whole judgment, does no
+  I/O of its own, and is tested over a fake machine. The machine is never
+  asked on behalf of a package that may not read it, and only a JSON object
+  goes on to a package. The broker's thread may wait on forgectrl; the
+  supervisor's turn never waits on the broker.
 - **A network rule names an address, never a name**: what was resolved and
   judged is what is allowed. `netrules.c` is the only writer of the image
   table's `allow` map, and no service starts unless `net_base_ok` finds the

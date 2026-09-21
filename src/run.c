@@ -53,6 +53,7 @@ typedef struct {
     char last_status[8192];
     char unreachable[300];                      /* the last word on a root no account can walk to, said once */
     holdkeep_t holds;
+    api_t api;
     char dropped[SUPER_MAX_SERVICES][64];       /* the advisory holds dropped at the last turn, each said once */
     int ndropped;
 } run_t;
@@ -65,6 +66,7 @@ void run_cfg_defaults(run_cfg_t *cfg)
     cfg->cg_parent = CG_PARENT_DEFAULT;
     cfg->run_dir = RUN_DIR_DEFAULT;
     cfg->holds_dir = HOLDKEEP_DIR_DEFAULT;
+    cfg->api_dir = API_DIR_DEFAULT;
 }
 
 static double mono(void)
@@ -224,6 +226,27 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
     sb.argv[a++] = exec;
     for (int i = 0; i < m.nargs && a < SANDBOX_MAX_ARGV - 1; i++)
         sb.argv[a++] = m.args[i];
+    /* Its one way to the machine: the socket is there before the service
+     * is, and the broker answers from what the operator granted. */
+    static api_who_t who;
+    static char api_env[420];
+    char api_path[400];
+    memset(&who, 0, sizeof(who));
+    snprintf(who.id, sizeof(who.id), "%s", s->id);
+    snprintf(who.version, sizeof(who.version), "%s", p->version);
+    who.uid = uid;
+    for (int i = 0; i < m.ncaps && who.ncaps < MANIFEST_MAX_CAPS; i++)
+        if (!caps_needs_grant(m.caps[i]) || state_granted(p, m.caps[i]))
+            snprintf(who.caps[who.ncaps++], sizeof(who.caps[0]), "%s", m.caps[i]);
+    if (api_open(&r->api, &who, api_path, sizeof(api_path), err, elen) != 0) {
+        close(pfd[0]);
+        close(pfd[1]);
+        net_revoke(&cfg->net, uid, NULL, 0);
+        cg_destroy(cfg->cg_parent, s->id);
+        return -1;
+    }
+    snprintf(api_env, sizeof(api_env), "FFX_API=%s", api_path);
+    sb.env[0] = api_env;
     sb.id = s->id;
     sb.uid = uid;
     sb.gid = (gid_t)uid;
@@ -244,6 +267,7 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
         close(pfd[0]);
         if (pid > 0)
             snprintf(err, elen, "no room for its log");
+        api_close(&r->api, s->id);
         net_revoke(&cfg->net, uid, NULL, 0);
         cg_destroy(cfg->cg_parent, s->id);
         return -1;
@@ -263,6 +287,7 @@ static void op_stop(void *ctx, svc_t *s)
         fflog(LOG_ERR, "%s: its group could not be emptied and removed", s->id);
     if (s->slot >= 0 && net_revoke(&r->cfg->net, (uid_t)(STATE_POOL_UID + s->slot), err, sizeof(err)) != 0)
         fflog(LOG_ERR, "%s: %s", s->id, err);
+    api_close(&r->api, s->id);
     if (s->pid > 0)
         waitpid(s->pid, NULL, 0);                       /* killed with its group; an ended one is already reaped */
     log_close(r, s->id);
@@ -310,8 +335,8 @@ static const super_ops_t OPS = { op_start, op_stop, op_freeze, op_job_limits, op
 /* The holds, as they stand after this turn's policy. A package that is
  * enabled and runs in this controller mode has a file while extensions are
  * on; every other case has none, and that is the operator's exit. The
- * package's own word arrives over the API socket; until it has spoken, a
- * running package's hold is clear. */
+ * package's own word arrives over its API socket (POST /v0/hold) and
+ * starts clear with every start of its service. */
 static void holds_turn(run_t *r, const super_t *sv, const super_inputs_t *in)
 {
     static hold_entry_t e[HOLDKEEP_MAX];
@@ -322,7 +347,9 @@ static void holds_turn(run_t *r, const super_t *sv, const super_inputs_t *in)
         int mode_ok = in->mode_cloud < 0 ? 1 : in->mode_cloud ? s->mode_cloud : s->mode_grbl;
         if (!s->present || !s->hold || !s->pkg_enabled || !mode_ok)
             continue;
-        if (hold_decide(s->id, s->hold_required, s->state == SVC_RUNNING, s->healthy, 0, NULL, &e[n]))
+        api_hold_t said;
+        api_hold_said(&r->api, s->id, &said);
+        if (hold_decide(s->id, s->hold_required, s->state == SVC_RUNNING, s->healthy, said.raised, said.reason, &e[n]))
             snprintf(now_dropped[nd++], sizeof(now_dropped[0]), "%s", s->id);
         n++;
     }
@@ -486,6 +513,12 @@ int run_daemon(const run_cfg_t *cfg)
         close(lfd);
         return 1;
     }
+    if (api_start(&r.api, cfg->api_dir, &cfg->machine, err, sizeof(err)) != 0) {
+        fflog(LOG_ERR, "not starting: %s", err);
+        holdkeep_stop(&r.holds);
+        close(lfd);
+        return 1;
+    }
     super_init(&sv, &OPS, &r);
     fflog(LOG_NOTICE, "started: extension root %s, groups under %s", cfg->ext.root, cfg->cg_parent);
 
@@ -551,6 +584,7 @@ int run_daemon(const run_cfg_t *cfg)
     }
     super_stop_all(&sv, "the extension host is stopping");
     holdkeep_stop(&r.holds);
+    api_stop(&r.api);
     machine_t off;
     memset(&off, 0, sizeof(off));
     snprintf(off.off_reason, sizeof(off.off_reason), "the extension host is not running");

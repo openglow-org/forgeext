@@ -34,7 +34,7 @@ static int usage(void)
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
             "  caps                               the capabilities a manifest may ask for\n"
             "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
-            "      [--run-dir <dir>] [--holds-dir <dir>] [--landlock-fs-only] [--ticks <n>]\n"
+            "      [--run-dir <dir>] [--holds-dir <dir>] [--api-dir <dir>] [--landlock-fs-only] [--ticks <n>]\n"
             "                                     the daemon: run what is installed and enabled, in the sandbox\n"
             "  net-check                          is the image's deny table loaded, and the image's\n"
             "  net-allow <uid> [--listen <port>] [--dns] [<host>:<port>]...\n"
@@ -261,6 +261,8 @@ int main(int argc, char **argv)
                 rc.run_dir = val;
             } else if (strcmp(opt, "--holds-dir") == 0) {
                 rc.holds_dir = val;
+            } else if (strcmp(opt, "--api-dir") == 0) {
+                rc.api_dir = val;
             } else if (strcmp(opt, "--ticks") == 0) {
                 rc.ticks = atoi(val);
             } else if (strcmp(opt, "--forgectrl") == 0) {
