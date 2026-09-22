@@ -11,8 +11,10 @@ the three tiers and what each needs from the operator, the product gate
 in both of its directions, a firmware key on an extension, a payload that
 is not the one the signed metadata names, payloads that try to leave the
 package, the namespace, key pinning across an update, the capability diff,
-conflicts, the budget, the integrity check, and removal. After every
-refusal the root holds nothing the refused archive brought.
+conflicts, the budget, the integrity check, removal, and the wipe a change
+of owner takes (every package, everything under data/, every key the owner
+added). After every refusal the root holds nothing the refused archive
+brought.
 
     python3 tests/install_test.py [-v]
 
@@ -503,6 +505,53 @@ def run_all(w, top):
 
     print("the firmware range a package says it needs")
     core_range(w)
+
+    print("a change of owner takes everything the last one left")
+    wipe(w, root, keydir)
+
+
+def wipe(w, root, keydir):
+    """Every package, its data, and every key the owner added."""
+    check(w.run("key-add", "maker", w.pub("owner")).get("ok") is True, "the key could not be added back")
+    ids = []
+    for n in range(3):
+        id_ = "org.example.gone%d" % n
+        ids.append(id_)
+        arch = w.pack(w.tree(manifest(id_), RUN), "owner")
+        check(w.run("install", arch, "--consent-community").get("ok") is True, "%s could not be installed" % id_)
+        # Something of the owner's in each one's data, as a package's own
+        # would be: this is what the wipe is for.
+        d = os.path.join(root, "data", id_)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "token"), "w") as f:
+            print("the last owner's", file=f)
+    listed = sorted(x["id"] for x in w.run("list").get("packages", []))
+    check(set(ids) <= set(listed), "the three packages are not installed: %s" % listed)
+
+    r = w.run("wipe")
+    check(r.get("ok") is True and r.get("packages") == len(listed) and r.get("keys") == 1,
+          "the wipe reports what it took (%d were installed): %s" % (len(listed), r))
+    check(w.run("list").get("packages") == [], "a package is still listed: %s" % w.run("list"))
+    check(w.run("keys").get("keys") == [], "an owner key is still there: %s" % w.run("keys"))
+    for id_ in ids:
+        for sub in ("pkg", "data"):
+            left = os.path.join(root, sub, id_)
+            check(not os.path.exists(left), "%s stayed behind" % left)
+    # Everything under data/ goes, the leftovers of a package removed with
+    # its data kept included: they hold what the wipe is for.
+    for sub in ("pkg", "data", "keys"):
+        here = os.path.join(root, sub)
+        check(os.path.isdir(here) and os.listdir(here) == [], "%s is not an empty directory: %s"
+              % (here, os.listdir(here) if os.path.isdir(here) else "gone"))
+    marks = os.path.join(root, "required-holds")
+    check(not os.path.isdir(marks) or os.listdir(marks) == [], "a required-hold marker stayed: %s" % marks)
+    check(w.run("wipe").get("ok") is True, "a second wipe is not an error")
+    # And the machine is usable again: the same package installs, now as
+    # unverified, because the key that made it community went with the owner.
+    arch = w.pack(w.tree(manifest("org.example.after"), RUN), "owner")
+    check(w.run("inspect", arch).get("tier") == "unverified", "the owner's key outlived the wipe")
+    r = w.run("install", arch, "--consent-unverified")
+    check(r.get("ok") is True, "nothing installs after a wipe: %s" % r.get("error"))
 
 
 if __name__ == "__main__":

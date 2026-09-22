@@ -599,6 +599,92 @@ int ext_remove(const ext_env_t *env, const char *id, int keep_data, char *err, s
     return rc;
 }
 
+int ext_wipe(const ext_env_t *env, int *packages, int *keys, char *err, size_t elen)
+{
+    char p[400];
+    state_t *st = calloc(1, sizeof(*st));
+    int rc = -1, npkg = 0, nkey = 0;
+
+    if (packages)
+        *packages = 0;
+    if (keys)
+        *keys = 0;
+    if (!st)
+        return fail(err, elen, "out of memory");
+    int lock = ext_lock(env, err, elen);
+    if (lock < 0) {
+        free(st);
+        return -1;
+    }
+    if (state_load(env->root, st, err, elen) == 0) {
+        rc = 0;
+        /* The state is emptied and written first, so that nothing is ever
+         * started from a tree that is half gone: a host reading the state
+         * between the write and the last unlink finds no package at all. */
+        int n = st->n;
+        char ids[STATE_MAX_PKGS][64];
+        for (int i = 0; i < n; i++)
+            snprintf(ids[i], sizeof(ids[i]), "%s", st->pkgs[i].id);
+        st->n = 0;
+        rc = state_save(env->root, st, err, elen);
+        if (rc == 0 && ext_required_holds_sync(env, st) != 0)
+            rc = fail(err, elen, "the required holds under %s could not be emptied", env->root);
+        for (int i = 0; i < n && rc == 0; i++) {
+            settings_forget(env->root, ids[i]);
+            snprintf(p, sizeof(p), "%.255s/pkg/%.63s", env->root, ids[i]);
+            if (pkg_rmtree(p) != 0)
+                rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
+            snprintf(p, sizeof(p), "%.255s/data/%.63s", env->root, ids[i]);
+            if (rc == 0 && pkg_rmtree(p) != 0)
+                rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
+            if (rc == 0)
+                npkg++;
+        }
+        /* Whatever else is under data/. A package removed with its data
+         * kept leaves a directory the state no longer names, and it holds
+         * exactly what this is here to take. The directory holds nothing
+         * but per-package data, so everything in it goes. */
+        snprintf(p, sizeof(p), "%.255s/data", env->root);
+        DIR *dd = rc == 0 ? opendir(p) : NULL;
+        if (dd) {
+            struct dirent *e;
+            while ((e = readdir(dd)) != NULL) {
+                char left[400];
+                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+                    continue;
+                snprintf(left, sizeof(left), "%.255s/data/%.120s", env->root, e->d_name);
+                if (pkg_rmtree(left) != 0)
+                    rc = fail(err, elen, "cannot remove %s: %s", left, strerror(errno));
+            }
+            closedir(dd);
+        }
+        /* The owner's keys. A key the last owner added would go on making
+         * their packages read as community rather than as unverified. */
+        DIR *d = rc == 0 && env->trust.owner_keys_dir ? opendir(env->trust.owner_keys_dir) : NULL;
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != NULL) {
+                size_t len = strlen(e->d_name);
+                if (e->d_name[0] == '.' || len < 5 || strcmp(e->d_name + len - 4, ".pub") != 0)
+                    continue;
+                snprintf(p, sizeof(p), "%.255s/%.128s", env->trust.owner_keys_dir, e->d_name);
+                if (unlink(p) == 0)
+                    nkey++;
+                else if (errno != ENOENT)
+                    rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
+            }
+            closedir(d);
+        }
+    }
+    ext_unlock(lock);
+    free(st);
+    if (packages)
+        *packages = npkg;
+    if (keys)
+        *keys = nkey;
+    return rc;
+}
+
 /* Load, change one package's entry, save: under the lock. */
 int ext_required_holds_sync(const ext_env_t *env, const state_t *st)
 {

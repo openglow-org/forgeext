@@ -101,6 +101,20 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
 /* Remove a package and, unless keep_data, its data. */
 int ext_remove(const ext_env_t *env, const char *id, int keep_data, char *err, size_t elen);
 
+/* Everything an owner leaves behind: every package, everything under
+ * data/ (a package removed with its data kept leaves a directory the
+ * state no longer names, and it holds what this is here to take), every
+ * key the owner added, and the state that names them. This is the
+ * ownership reset's, not an operator's - a package can hold the previous
+ * owner's credentials, and a key they added would go on making their
+ * packages read as trusted. The root's own directories stay, and what is
+ * running is the supervisor's to stop when it next reads the state.
+ *
+ * The counts of what went into *packages and *keys. 0, or -1 with the
+ * reason; a failure part way through leaves the state naming only what is
+ * still there. */
+int ext_wipe(const ext_env_t *env, int *packages, int *keys, char *err, size_t elen);
+
 /* A package's interface: one self-contained HTML file at this path
  * inside the package, at most this large. It renders in a sandboxed
  * frame that can reach nothing of its own accord, so it is one file -

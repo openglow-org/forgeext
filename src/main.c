@@ -32,6 +32,7 @@ static int usage(void)
             "  list                               what is installed\n"
             "  check [<id>]                       do the installed files still match what was installed\n"
             "  remove <id> [--keep-data]\n"
+            "  wipe                               every package, its data, and the owner's keys: a change of owner\n"
             "  enable <id> | disable <id>         the operator's switch for one package; enabling lets it out of quarantine\n"
             "  keys | key-add <name> <file.pub> | key-remove <name>\n"
             "                                     the owner's keys: what makes a package community rather than unverified\n"
@@ -484,6 +485,20 @@ int main(int argc, char **argv)
         json_t *obj = json_object();
         json_object_set_new(obj, "id", json_string(id));
         json_object_set_new(obj, "hold", json_string(kind));
+        return answer(obj, 1);
+    }
+    if (strcmp(cmd, "wipe") == 0) {
+        /* The ownership reset's, and nobody else's: a package can hold
+         * the previous owner's credentials, and a key they added would go
+         * on making their packages read as trusted. */
+        int npkg = 0, nkey = 0;
+        if (ext_wipe(&env, &npkg, &nkey, err, sizeof(err)) != 0)
+            return refuse(err);
+        fflog(LOG_WARNING, "the extension tree was wiped for a change of owner: %d package%s and %d key%s",
+              npkg, npkg == 1 ? "" : "s", nkey, nkey == 1 ? "" : "s");
+        json_t *obj = json_object();
+        json_object_set_new(obj, "packages", json_integer(npkg));
+        json_object_set_new(obj, "keys", json_integer(nkey));
         return answer(obj, 1);
     }
     if (strcmp(cmd, "remove") == 0 && i < argc) {
