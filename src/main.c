@@ -20,6 +20,7 @@
 #include "netrules.h"
 #include "pkg.h"
 #include "run.h"
+#include "settings.h"
 #include "state.h"
 
 static int usage(void)
@@ -34,6 +35,7 @@ static int usage(void)
             "  enable <id> | disable <id>         the operator's switch for one package; enabling lets it out of quarantine\n"
             "  keys | key-add <name> <file.pub> | key-remove <name>\n"
             "  ui <id>             the package's interface, as JSON\n"
+            "  settings <id> [json] its settings, and the patch to apply\n"
             "                                     the owner's keys: what makes a package community rather than unverified\n"
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
             "  caps                               the capabilities a manifest may ask for\n"
@@ -361,6 +363,32 @@ int main(int argc, char **argv)
         return answer(obj, 1);
     }
 
+    if (strcmp(cmd, "settings") == 0 && i < argc) {
+        /* A package's settings as the operator sees them: the values and
+         * the schema. Reading needs no grant - they are shown in the
+         * panel - and writing is the operator's own act. */
+        manifest_t m;
+        char why[300];
+        const char *id = argv[i];
+        if (ext_manifest_of(&env, id, &m, why, sizeof(why)) != 0)
+            return answer(json_pack("{s:s}", "error", why), 0);
+        if (m.nsettings == 0)
+            return answer(json_pack("{s:s}", "error", "this package declares no settings"), 0);
+        if (i + 1 < argc) {
+            json_error_t je;
+            json_t *patch = json_loads(argv[i + 1], JSON_REJECT_DUPLICATES, &je);
+            int rc = patch ? settings_write(env.root, id, &m, patch, why, sizeof(why))
+                           : (snprintf(why, sizeof(why), "the patch is a JSON object of settings"), -1);
+            json_decref(patch);
+            if (rc != 0)
+                return answer(json_pack("{s:s}", "error", why), 0);
+        }
+        json_t *obj = json_object();
+        json_object_set_new(obj, "id", json_string(id));
+        json_object_set_new(obj, "settings", settings_read(env.root, id, &m));
+        json_object_set_new(obj, "schema", settings_schema_json(&m));
+        return answer(obj, 1);
+    }
     if (strcmp(cmd, "ui") == 0 && i < argc) {
         /* The page itself, as JSON, so that whatever is in it is a
          * string and never markup this program emitted. */
