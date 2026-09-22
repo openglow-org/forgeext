@@ -336,7 +336,7 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
                            : strcmp(key, "y") == 0 ? &axis[1]
                            : strcmp(key, "z") == 0 ? &axis[2]
                            : strcmp(key, "feed") == 0 ? &feed : NULL;
-                if (!at || !json_is_number(v) || json_is_boolean(v)) {
+                if (!at || !json_is_number(v)) {          /* a boolean is not a number to jansson */
                     why = "the body holds x, y, z, and feed, each a number, and nothing else";
                     bad = 1;
                     break;

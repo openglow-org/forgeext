@@ -288,14 +288,20 @@ static int filter_build(struct sock_filter *f, unsigned short *n)
 
 /* ---- the child ------------------------------------------------------------ */
 
-/* Tell the parent which step failed, and go. Async-signal-safe. */
+/* Tell the parent which step failed, and go.
+ *
+ * This runs in a child forked from a daemon that has threads, where only
+ * the async-signal-safe calls can be relied on: a lock another thread held
+ * at the fork is held forever here. strerror() is not one of them -
+ * glibc's may format into a buffer it allocates - so the reentrant form
+ * writes into one of ours. */
 static void die(int err_fd, const char *step, int saved)
 {
-    char msg[160];
+    char msg[160], buf[96];
     size_t n = 0;
     for (const char *p = step; *p && n < sizeof(msg) - 40; p++)
         msg[n++] = *p;
-    const char *why = saved ? strerror(saved) : "";
+    const char *why = saved ? strerror_r(saved, buf, sizeof(buf)) : "";
     if (*why) {
         msg[n++] = ':';
         msg[n++] = ' ';

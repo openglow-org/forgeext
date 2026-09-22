@@ -85,7 +85,10 @@ static int nft_run(const net_env_t *env, const char *const argv_in[], const char
     if (input) {
         close(in_pipe[0]);
         size_t len = strlen(input), off = 0;
-        signal(SIGPIPE, SIG_IGN);
+        /* nft may exit on the first rule it will not take, leaving the
+         * rest of the script with nowhere to go. The write's own result is
+         * what is checked; SIGPIPE is ignored for the whole program in
+         * main(). */
         while (off < len) {
             ssize_t k = write(in_pipe[1], input + off, len - off);
             if (k <= 0)

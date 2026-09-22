@@ -9,6 +9,7 @@
  * world the command works in; their defaults are the machine's.
  */
 #include <jansson.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -217,6 +218,12 @@ int main(int argc, char **argv)
     net_env_t net = { NULL };
     int i = 1, nfw = 0;
 
+    /* A peer that goes away mid-write, and nft's stdin when it exits on a
+     * rule it will not take, both raise SIGPIPE. Every write in this
+     * program checks its own result, so the signal is the one thing that
+     * must not happen: set once here, for the daemon and the command line
+     * alike, rather than by whichever function happened to think of it. */
+    signal(SIGPIPE, SIG_IGN);
     ext_env_defaults(&env);
     for (; i < argc && strncmp(argv[i], "--", 2) == 0; i++) {
         const char *opt = argv[i];
@@ -257,6 +264,15 @@ int main(int argc, char **argv)
         return usage();
     const char *cmd = argv[i++];
     fflog_init("forgeext");
+
+    /* A command whose argument names a package: the id is held to its form
+     * here, once, before anything builds a path out of it. forgectrl holds
+     * it to the same form before it ever runs this, and a command line is
+     * still a command line. */
+    static const char *const takes_id[] = { "ui", "settings", "hold", "enable", "disable", "remove", NULL };
+    for (int k = 0; takes_id[k]; k++)
+        if (strcmp(cmd, takes_id[k]) == 0 && i < argc && !manifest_id_ok(argv[i]))
+            return refuse("that is not a package id");
 
     if (strcmp(cmd, "caps") == 0)
         return cmd_caps();

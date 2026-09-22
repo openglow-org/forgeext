@@ -225,6 +225,10 @@ int caps_check(const char *cap, char *why, size_t wlen)
         }
         return 0;
     }
+    /* Reached by nothing today: every definition that takes an argument
+     * and is offered is handled above, and one that is not offered was
+     * refused before this. It is the default a new parameterized
+     * capability lands on until its own case is written. */
     snprintf(why, wlen, "%s is not offered by this extension API", d->name);
     return -1;
 }

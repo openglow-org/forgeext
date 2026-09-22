@@ -737,7 +737,6 @@ int run_daemon(const run_cfg_t *cfg)
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGINT);
     sigprocmask(SIG_BLOCK, &mask, NULL);
-    signal(SIGPIPE, SIG_IGN);
     int sfd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
     if (sfd < 0)
         return 1;
