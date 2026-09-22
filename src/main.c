@@ -172,10 +172,23 @@ static int cmd_list(const ext_env_t *env, const char *only, int check)
             json_object_set_new(j, "hold", json_string(p->hold_required ? "required" : "advisory"));
         if (p->slot >= 0)
             json_object_set_new(j, "account", json_sprintf("ffx%d", p->slot));
-        if (ext_manifest_of(env, p->id, &m, err, sizeof(err)) == 0)
+        if (ext_manifest_of(env, p->id, &m, err, sizeof(err)) == 0) {
             json_object_set_new(j, "package", manifest_json(&m));
-        else
+            /* What the broker would honor for this package: the
+             * capabilities that need no grant, and those the operator
+             * granted. The manifest's own list is what was *asked for*,
+             * which is a different question, and anything deciding what a
+             * package may do has to ask this one. It is how op_start()
+             * builds the identity behind the API socket, so the panel's
+             * bridge and the socket answer alike. */
+            json_t *eff = json_array();
+            for (int c = 0; c < m.ncaps; c++)
+                if (!caps_needs_grant(m.caps[c]) || state_granted(p, m.caps[c]))
+                    json_array_append_new(eff, json_string(m.caps[c]));
+            json_object_set_new(j, "effective", eff);
+        } else {
             json_object_set_new(j, "manifest_error", json_string(err));
+        }
         if (check) {
             int good = ext_check(env, p, err, sizeof(err)) == 0;
             json_object_set_new(j, "intact", json_boolean(good));
@@ -393,10 +406,24 @@ int main(int argc, char **argv)
     }
     if (strcmp(cmd, "ui") == 0 && i < argc) {
         /* The page itself, as JSON, so that whatever is in it is a
-         * string and never markup this program emitted. */
+         * string and never markup this program emitted.
+         *
+         * A disabled package has no page. Disabling one is the operator's
+         * way out of everything it does, and its page is part of that:
+         * the page holds no session and reaches the machine only through
+         * the panel's bridge, which asks what the package may do - but a
+         * door that is shut is shut. */
         char *html = NULL;
         size_t len = 0;
         char why[300];
+        static state_t ui_st;
+        if (state_load(env.root, &ui_st, err, sizeof(err)) != 0)
+            return refuse(err);
+        state_pkg_t *up = state_find(&ui_st, argv[i]);
+        if (!up)
+            return answer(json_pack("{s:s}", "error", "that package is not installed"), 0);
+        if (!up->enabled)
+            return answer(json_pack("{s:s}", "error", "this package is disabled: its interface is not served"), 0);
         if (ext_ui_html(&env, argv[i], &html, &len, why, sizeof(why)) != 0)
             return answer(json_pack("{s:s}", "error", why), 0);
         json_t *obj = json_object();

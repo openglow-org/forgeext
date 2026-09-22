@@ -264,6 +264,14 @@ def main():
     r = fx("hold", "org.example.crash", "required")
     check(r.get("ok") is True and os.listdir(marks) == ["org.example.crash"], "marked required, and named for forgectrl: %s %s",
           r.get("error", ""), os.listdir(marks))
+    # What each package may use, as the list reports it. The panel's bridge
+    # decides on this and the service sees the same answer at GET /v0/self,
+    # so the two are checked against each other below.
+    eff = {x["id"]: sorted(x.get("effective") or []) for x in fx("list").get("packages", [])}
+    check(eff.get("org.example.jobtime") == ["hold", "job_time.run", "machine.read", "motion.job"],
+          "what jobtime may use: %s", eff.get("org.example.jobtime"))
+    check(eff.get("org.example.dial") == ["net.outbound:peer.test:%d" % pport],
+          "what dial may use: %s", eff.get("org.example.dial"))
     listed = {x["id"]: x.get("hold") for x in fx("list").get("packages", [])}
     check(listed == {"org.example.beat": "advisory", "org.example.dial": None, "org.example.jobtime": "advisory",
                      "org.example.crash": "required"}, "the list says which hold is which: %s", listed)
@@ -371,6 +379,8 @@ def main():
         print("the API socket: a package's one way to the machine, and the broker behind it")
         jid = "ext org.example.jobtime: "
         check(wait_for(lambda: logged(jid + "api burst"), 40), "the service with the API's use has been through its calls")
+        check(",".join(eff["org.example.jobtime"]) == "hold,job_time.run,machine.read,motion.job",
+              "the list and the socket must answer alike, and the list says %s", eff["org.example.jobtime"])
         check(logged(jid + "api self 200 org.example.jobtime 0.1 hold,job_time.run,machine.read,motion.job"),
               "GET /v0/self: who it is, the API's version, and what it may use (the grants it got, the capabilities that need none)")
         check(logged(jid + "api mode 200 grbl verified"), "GET /v0/machine/mode: forgectrl's answer, relayed")
