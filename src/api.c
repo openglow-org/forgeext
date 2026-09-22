@@ -258,6 +258,58 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
         json_decref(j);
         return 200;
     }
+    if (strcmp(p, "/v0/motion/job") == 0 || strcmp(p, "/v0/motion/job/abort") == 0) {
+        int abort_ = strcmp(p, "/v0/motion/job/abort") == 0;
+        if (req->method != HTTPREQ_POST)
+            return refuse(body, blen, 405, "a job is a POST");
+        if (!api_may(who, "motion.job"))
+            return refuse(body, blen, 403, "this package does not hold motion.job");
+        if (!world || !world->job)
+            return refuse(body, blen, 502, "the host cannot reach the machine's job route");
+        if (abort_)
+            return world->job(world->job_ctx, who->id, NULL, NULL, body, blen);
+        if (!req->json_body)
+            return refuse(body, blen, 415, "POST /v0/motion/job takes application/json");
+
+        json_error_t je;
+        json_t *j = json_loadb(req->body, req->body_len, JSON_REJECT_DUPLICATES, &je);
+        const char *key, *program = NULL;
+        json_t *v;
+        double lit = 0, run = 0;
+        const char *why = "the body is a JSON object: {\"program\": \"job.gcode\"}";
+        int bad = !json_is_object(j);
+        if (!bad) {
+            json_object_foreach(j, key, v) {
+                if (strcmp(key, "program") == 0 && json_is_string(v)) {
+                    program = json_string_value(v);
+                } else if (strcmp(key, "lit_within_s") == 0 && json_is_number(v)
+                           && json_number_value(v) >= 0 && json_number_value(v) <= 3600) {
+                    lit = json_number_value(v);
+                } else if (strcmp(key, "timeout_s") == 0 && json_is_number(v)
+                           && json_number_value(v) >= 0 && json_number_value(v) <= 86400) {
+                    run = json_number_value(v);
+                } else {
+                    why = "the body holds program (a file of its own data), lit_within_s, and "
+                          "timeout_s, and nothing else";
+                    bad = 1;
+                    break;
+                }
+            }
+        }
+        char prog[200], fields[120];
+        if (!bad && program)
+            snprintf(prog, sizeof(prog), "%s", program);
+        json_decref(j);
+        if (bad)
+            return refuse(body, blen, 400, why);
+        if (!program)
+            return refuse(body, blen, 400, "program names a file of this package's own data");
+        /* The name that goes with the job is this host's word for who
+         * sent it. A package naming itself would be a package able to
+         * say a job came from somewhere else. */
+        snprintf(fields, sizeof(fields), "lit_within_s=%.0f&timeout_s=%.0f", lit, run);
+        return world->job(world->job_ctx, who->id, prog, fields, body, blen);
+    }
     if (strcmp(p, "/v0/motion/jog") == 0 || strcmp(p, "/v0/motion/cancel") == 0) {
         int cancel = strcmp(p, "/v0/motion/cancel") == 0;
         if (req->method != HTTPREQ_POST)
@@ -733,7 +785,8 @@ static void sock_path(const api_t *a, const char *id, char *p, size_t plen)
 int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed,
               api_settings_fn settings, void *settings_ctx,
               api_camera_fn camera, void *camera_ctx,
-              api_motion_fn motion, void *motion_ctx, char *err, size_t elen)
+              api_motion_fn motion, void *motion_ctx,
+              api_job_fn job, void *job_ctx, char *err, size_t elen)
 {
     memset(a, 0, sizeof(*a));
     pthread_mutex_init(&a->mu, NULL);
@@ -748,6 +801,8 @@ int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t
     a->world.camera_ctx = camera_ctx;
     a->world.motion = motion;
     a->world.motion_ctx = motion_ctx;
+    a->world.job = job;
+    a->world.job_ctx = job_ctx;
     if (strlen(dir) >= sizeof(a->dir) - 72) {
         snprintf(err, elen, "the API directory's path is too long");
         return -1;

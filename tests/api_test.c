@@ -72,6 +72,22 @@ static api_shot_t shot;
 static int motion_calls;
 static char motion_path[256];
 
+/* The job side, faked: what the broker would have handed the machine. */
+static int job_calls;
+static char job_id[64], job_program[200], job_fields[160];
+
+static int fake_job(void *ctx, const char *id, const char *program, const char *fields,
+                    char *out, size_t olen)
+{
+    (void)ctx;
+    job_calls++;
+    snprintf(job_id, sizeof(job_id), "%s", id);
+    snprintf(job_program, sizeof(job_program), "%s", program ? program : "(abort)");
+    snprintf(job_fields, sizeof(job_fields), "%s", fields ? fields : "");
+    snprintf(out, olen, "{\"ok\":true}");
+    return 200;
+}
+
 static int fake_motion(void *ctx, const char *path, char *out, size_t olen)
 {
     (void)ctx;
@@ -124,6 +140,7 @@ int main(void)
     world.settings = fake_settings;
     world.camera = fake_camera;
     world.motion = fake_motion;
+    world.job = fake_job;
     world.feed = &feed;
     api_who_t reader = { .id = "org.example.reader", .version = "1.2.0", .uid = 800, .caps = { "machine.read", "events" }, .ncaps = 2 };
     api_who_t holder = { .id = "org.example.badge", .version = "1.0.0", .uid = 801, .caps = { "hold" }, .ncaps = 1 };
@@ -449,6 +466,57 @@ int main(void)
         CHECK(rc == 502, "with no way to the machine's motion: %d", rc);
         world.motion = fake_motion;
         #undef JOG
+    }
+
+    /* A job: the one call that runs a program. */
+    api_who_t runner = { .id = "org.example.runner", .version = "1.0.0", .uid = 806,
+                         .caps = { "motion.job" }, .ncaps = 1 };
+    {
+        char text[400];
+        #define JOB(who_, json_) (snprintf(text, sizeof(text), \
+            "POST /v0/motion/job HTTP/1.1\r\nContent-Type: application/json\r\n" \
+            "Content-Length: %zu\r\n\r\n%s", strlen(json_), json_), call(who_, &hold, text))
+
+        job_calls = 0;
+        rc = JOB(&jogger, "{\"program\": \"j.gcode\"}");
+        CHECK(rc == 403 && job_calls == 0 && strstr(error_words(), "motion.job"),
+              "a job without the capability: %d, the machine asked %d times", rc, job_calls);
+
+        rc = JOB(&runner, "{\"program\": \"j.gcode\", \"lit_within_s\": 30, \"timeout_s\": 600}");
+        CHECK(rc == 200 && job_calls == 1 && !strcmp(job_program, "j.gcode")
+              && strstr(job_fields, "lit_within_s=30") && strstr(job_fields, "timeout_s=600"),
+              "a job with its bounds: %d %s %s", rc, job_program, job_fields);
+        /* Who the job is from is the host's word: the id, never a name
+         * the package chose. */
+        CHECK(!strcmp(job_id, "org.example.runner"), "the job was not named for the package: %s", job_id);
+
+        static const struct { const char *json, *name; } badjobs[] = {
+            { "{}", "a job that names no program" },
+            { "{\"program\": 7}", "a program that is not a string" },
+            { "{\"program\": \"j.gcode\", \"name\": \"someone-else\"}", "a package naming the sender itself" },
+            { "{\"program\": \"j.gcode\", \"unlock\": \"1\"}", "a key the form does not have" },
+            { "{\"program\": \"j.gcode\", \"lit_within_s\": 5000}", "a lit window past its bound" },
+            { "{\"program\": \"j.gcode\", \"timeout_s\": -1}", "a timeout below zero" },
+            { "{\"program\": \"j.gcode\", \"program\": \"k.gcode\"}", "a key twice" },
+            { "[\"j.gcode\"]", "an array" },
+        };
+        for (size_t i = 0; i < sizeof(badjobs) / sizeof(badjobs[0]); i++) {
+            int before = job_calls;
+            rc = JOB(&runner, badjobs[i].json);
+            CHECK(rc == 400 && job_calls == before && error_words()[0],
+                  "%s: %d, and the machine was asked %d times", badjobs[i].name, rc, job_calls - before);
+        }
+
+        CHECK(call(&runner, &hold, "GET /v0/motion/job HTTP/1.1\r\n\r\n") == 405, "a job is a POST");
+        rc = call(&runner, &hold, "POST /v0/motion/job/abort HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        CHECK(rc == 200 && !strcmp(job_program, "(abort)"), "an abort: %d %s", rc, job_program);
+        rc = call(&jogger, &hold, "POST /v0/motion/job/abort HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        CHECK(rc == 403, "an abort without the capability: %d", rc);
+        world.job = NULL;
+        rc = JOB(&runner, "{\"program\": \"j.gcode\"}");
+        CHECK(rc == 502, "with no way to the machine's job route: %d", rc);
+        world.job = fake_job;
+        #undef JOB
     }
 
     /* Everything else. */

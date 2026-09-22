@@ -27,6 +27,16 @@
  *   POST /v0/camera            {"camera": "lid"|"head", ...}: one frame (camera.lid, camera.head)
  *   POST /v0/motion/jog        {"x":, "y":, "z":, "feed":}: one bounded dark jog (motion.jog)
  *   POST /v0/motion/cancel     ends a jog this package started (motion.jog)
+ *   POST /v0/motion/job        {"program": "<a file of its own data>"}: run it (motion.job, granted)
+ *   POST /v0/motion/job/abort  end the running job (motion.job, granted)
+ *
+ * A program is named, not sent: the request reader takes 4 KiB of body
+ * and a program is not that, so a package writes it into its own data
+ * directory and names it here. The host reads it from there - inside that
+ * directory and nowhere else - and hands it to the machine, which runs it
+ * under the machine lease, refuses it while a sender is connected, and
+ * holds it to every arm gate and the button press like any other sender.
+ * Who the job is from is the host's word, not the package's.
  *
  * A jog moves the machine, so it is the one call here that does. It is
  * bounded twice - once by this host, and again by the machine, which
@@ -111,6 +121,11 @@ typedef int (*api_upstream_fn)(void *ctx, const char *path, char *out, size_t ol
  * JSON into out. Returns the status. */
 typedef int (*api_motion_fn)(void *ctx, const char *path, char *out, size_t olen);
 
+/* A package's program: the file it named, inside its own data directory,
+ * handed to the machine's job route. Returns the status. */
+typedef int (*api_job_fn)(void *ctx, const char *id, const char *program, const char *fields,
+                          char *out, size_t olen);
+
 /* A package's own settings (settings.h). patch is NULL to read them, or
  * the request's body to apply. The whole answer, JSON either way, into
  * out; the return is the status to send. */
@@ -137,6 +152,8 @@ typedef struct {
     void *camera_ctx;
     api_motion_fn motion;
     void *motion_ctx;
+    api_job_fn job;
+    void *job_ctx;
     evfeed_t *feed;
 } api_world_t;
 
@@ -230,7 +247,8 @@ typedef struct {
 int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t *feed,
               api_settings_fn settings, void *settings_ctx,
               api_camera_fn camera, void *camera_ctx,
-              api_motion_fn motion, void *motion_ctx, char *err, size_t elen);
+              api_motion_fn motion, void *motion_ctx,
+              api_job_fn job, void *job_ctx, char *err, size_t elen);
 void api_stop(api_t *a);
 
 /* A service is about to start: its socket exists before it does, and its

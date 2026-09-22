@@ -73,6 +73,15 @@ void machine_host_token(char *out, size_t olen);
  * when the machine could not be reached. */
 int machine_post(const machine_cfg_t *cfg, const char *path, char *out, size_t olen);
 
+/* A package's program, sent as the one file part the machine's job route
+ * takes, with the fields that go beside it. file is read whole and is
+ * refused above MACHINE_JOB_MAX. 0 on a 200, or minus the status, or -1
+ * when the machine could not be reached. */
+#define MACHINE_JOB_MAX (2 * 1024 * 1024)
+
+int machine_post_program(const machine_cfg_t *cfg, const char *path, const char *file,
+                         const char *fields, char *out, size_t olen);
+
 /* `key=value` out of a settings file: 1 when the key is there. */
 int machine_conf_value(const char *conf, const char *key, char *out, size_t olen);
 

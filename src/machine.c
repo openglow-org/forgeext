@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -296,6 +297,133 @@ int machine_post(const machine_cfg_t *cfg, const char *path, char *out, size_t o
 done:
     free(buf);
     close(fd);
+    return rc;
+}
+
+int machine_post_program(const machine_cfg_t *cfg, const char *path, const char *file,
+                         const char *fields, char *out, size_t olen)
+{
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)cfg->port) };
+    struct timespec ts;
+    struct stat st;
+    char token[64];
+    char *body = NULL, *reply = NULL;
+    int rc = -1, fd = -1;
+    FILE *f = NULL;
+
+    out[0] = '\0';
+    machine_host_token(token, sizeof(token));
+    if (!token[0])
+        return -1;
+    f = fopen(file, "re");
+    if (!f)
+        return -1;
+    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0
+        || st.st_size > MACHINE_JOB_MAX) {
+        fclose(f);
+        return -1;
+    }
+    /* The whole request is built before anything is sent: a program is
+     * bounded, and a length that is wrong would leave the machine
+     * waiting on bytes that never come. */
+    static const char *BOUND = "----forgefirm-ext-program";
+    size_t cap = (size_t)st.st_size + strlen(fields) + 4096;
+    body = malloc(cap);
+    if (!body) {
+        fclose(f);
+        return -1;
+    }
+    size_t n = 0;
+    /* the named fields, one part each: name=value, & separated */
+    const char *p = fields;
+    while (p && *p) {
+        const char *amp = strchr(p, '&'), *eq = strchr(p, '=');
+        size_t flen = amp ? (size_t)(amp - p) : strlen(p);
+        if (eq && (size_t)(eq - p) < flen) {
+            n += (size_t)snprintf(body + n, cap - n,
+                                  "--%s\r\nContent-Disposition: form-data; name=\"%.*s\"\r\n\r\n%.*s\r\n",
+                                  BOUND, (int)(eq - p), p, (int)(flen - (size_t)(eq - p) - 1), eq + 1);
+        }
+        p = amp ? amp + 1 : NULL;
+    }
+    n += (size_t)snprintf(body + n, cap - n,
+                          "--%s\r\nContent-Disposition: form-data; name=\"program\"; "
+                          "filename=\"program.gcode\"\r\nContent-Type: text/plain\r\n\r\n", BOUND);
+    size_t got = fread(body + n, 1, (size_t)st.st_size, f);
+    fclose(f);
+    f = NULL;
+    if (got != (size_t)st.st_size)
+        goto done;
+    n += got;
+    n += (size_t)snprintf(body + n, cap - n, "\r\n--%s--\r\n", BOUND);
+
+    if (inet_pton(AF_INET, cfg->host, &a.sin_addr) != 1)
+        goto done;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long deadline = ts.tv_sec * 1000L + ts.tv_nsec / 1000000L + MACHINE_BLOB_TIMEOUT_MS;
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        goto done;
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        int soerr = 0;
+        socklen_t sl = sizeof(soerr);
+        if (errno != EINPROGRESS || wait_fd(fd, POLLOUT, deadline) != 0
+            || getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0 || soerr != 0)
+            goto done;
+    }
+    char head[512];
+    int hlen = snprintf(head, sizeof(head),
+                        "POST %s HTTP/1.0\r\nHost: %s\r\nX-ForgeFIRM-Token: %s\r\n"
+                        "Content-Type: multipart/form-data; boundary=%s\r\nContent-Length: %zu\r\n"
+                        "Connection: close\r\n\r\n", path, cfg->host, token, BOUND, n);
+    if (hlen <= 0 || (size_t)hlen >= sizeof(head))
+        goto done;
+    size_t sent = 0;
+    while (sent < (size_t)hlen) {
+        if (wait_fd(fd, POLLOUT, deadline) != 0)
+            goto done;
+        ssize_t k = send(fd, head + sent, (size_t)hlen - sent, MSG_NOSIGNAL);
+        if (k <= 0)
+            goto done;
+        sent += (size_t)k;
+    }
+    sent = 0;
+    while (sent < n) {
+        if (wait_fd(fd, POLLOUT, deadline) != 0)
+            goto done;
+        ssize_t k = send(fd, body + sent, n - sent, MSG_NOSIGNAL);
+        if (k <= 0)
+            goto done;
+        sent += (size_t)k;
+    }
+    reply = malloc(HTTP_MAX + 1);
+    if (!reply)
+        goto done;
+    size_t rgot = 0;
+    while (rgot < HTTP_MAX && wait_fd(fd, POLLIN, deadline) == 0) {
+        ssize_t k = recv(fd, reply + rgot, HTTP_MAX - rgot, 0);
+        if (k < 0 && (errno == EAGAIN || errno == EINTR))
+            continue;
+        if (k <= 0)
+            break;
+        rgot += (size_t)k;
+    }
+    reply[rgot] = '\0';
+    const char *rbody = strstr(reply, "\r\n\r\n");
+    if (rgot < 12 || strncmp(reply, "HTTP/1.", 7) != 0 || !rbody)
+        goto done;
+    int status = atoi(reply + 9);
+    rbody += 4;
+    if (strlen(rbody) < olen)
+        memcpy(out, rbody, strlen(rbody) + 1);
+    rc = status == 200 ? 0 : -status;
+done:
+    if (f)
+        fclose(f);
+    if (fd >= 0)
+        close(fd);
+    free(body);
+    free(reply);
     return rc;
 }
 

@@ -415,6 +415,49 @@ static int motion_call(void *ctx, const char *path, char *out, size_t olen)
     return say_json(out, olen, status, json_pack("{s:s}", "error", words));
 }
 
+/* A package's program: the file it named, which must be a file of its
+ * own data directory and nothing else. The name is resolved and then
+ * checked against that directory's real path, so a link or a `..` out of
+ * it is not a program this host will read. */
+static int job_call(void *ctx, const char *id, const char *program, const char *fields,
+                    char *out, size_t olen)
+{
+    const run_cfg_t *cfg = ctx;
+    char data[420], want[700], real[PATH_MAX], base[PATH_MAX];
+    char answer[2048] = "";
+    int rc;
+
+    if (!program) {
+        rc = machine_post(&cfg->machine, "/job/abort", answer, sizeof(answer));
+    } else {
+        if (strchr(program, '/') || strstr(program, "..") || !program[0])
+            return say_json(out, olen, 400,
+                            json_pack("{s:s}", "error", "program is a file name in this package's data, "
+                                                        "with no directory in it"));
+        snprintf(data, sizeof(data), "%.255s/data/%.63s", cfg->ext.root, id);
+        snprintf(want, sizeof(want), "%.420s/%.200s", data, program);
+        if (!realpath(data, base) || !realpath(want, real)
+            || strncmp(real, base, strlen(base)) != 0 || real[strlen(base)] != '/')
+            return say_json(out, olen, 400,
+                            json_pack("{s:s}", "error", "that program is not a file of this package's data"));
+        fflog(LOG_NOTICE, "%s: it asked to run %s", id, program);
+        char with_name[240];
+        snprintf(with_name, sizeof(with_name), "%s&name=%.32s", fields ? fields : "", id);
+        rc = machine_post_program(&cfg->machine, "/job", real, with_name, answer, sizeof(answer));
+    }
+    if (rc == 0) {
+        snprintf(out, olen, "%s", answer[0] ? answer : "{\"ok\":true}");
+        return 200;
+    }
+    int status = rc < -1 ? -rc : 502;
+    char words[240];
+    snprintf(words, sizeof(words), "%s", answer[0] ? answer : "the machine did not answer");
+    for (char *q = words; *q; q++)
+        if ((unsigned char)*q < 0x20 || (unsigned char)*q == 0x7f)
+            *q = ' ';
+    return say_json(out, olen, status, json_pack("{s:s}", "error", words));
+}
+
 /* ---- the cameras --------------------------------------------------------------- */
 
 /* One frame for a package, from forgectrl's own camera route. It is
@@ -702,7 +745,8 @@ int run_daemon(const run_cfg_t *cfg)
         return 1;
     }
     if (api_start(&r.api, cfg->api_dir, &cfg->machine, &r.feed, settings_call, (void *)cfg,
-                  camera_call, (void *)cfg, motion_call, (void *)cfg, err, sizeof(err)) != 0) {
+                  camera_call, (void *)cfg, motion_call, (void *)cfg,
+                  job_call, (void *)cfg, err, sizeof(err)) != 0) {
         fflog(LOG_ERR, "not starting: %s", err);
         evfeed_stop(&r.feed);
         holdkeep_stop(&r.holds);
