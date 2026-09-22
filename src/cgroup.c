@@ -168,11 +168,17 @@ int cg_frozen(const char *parent, const char *id)
     return v < 0 ? -1 : v != 0;
 }
 
+/* The write, and then the flag. The kernel sets `frozen` within
+ * milliseconds of the tasks stopping, so the wait here is short on
+ * purpose: this runs on the supervisor's one thread, at its one-second
+ * turn, and a group that is slow to freeze must not take that turn away
+ * from every other package. A group that has not frozen inside the wait
+ * is reported as such and the caller asks again at its next turn. */
 int cg_freeze(const char *parent, const char *id, int on)
 {
     if (put(parent, id, "cgroup.freeze", on ? "1" : "0") != 0)
         return -1;
-    for (int i = 0; i < 100; i++) {                     /* the kernel reports it within milliseconds */
+    for (int i = 0; i < CG_FREEZE_WAIT_MS / 20; i++) {
         if (cg_frozen(parent, id) == (on ? 1 : 0))
             return 0;
         nap_ms(20);

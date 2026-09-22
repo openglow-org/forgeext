@@ -17,7 +17,12 @@
  *   While the armed window is open every service is frozen, and thawed
  *     when it closes. A window whose state cannot be read is an open one.
  *     The operator's job_time.run grant lifts the freeze and nothing else:
- *     such a service runs on under job-time limits instead.
+ *     such a service runs on under job-time limits instead, and falls back
+ *     to the freeze when those limits will not take.
+ *   A service that cannot be frozen for the window is quarantined, not
+ *     left running: the freeze is what keeps a package off the step
+ *     stream, and one that will not take is a defect and not a passing
+ *     condition. A thaw that fails is said and tried again.
  *   A service that ends is started again after a backoff that doubles from
  *     1 s to 30 s. One that ran SUPER_HEALTHY_S is healthy: its backoff
  *     starts over, and its predecessor version may go. One that ends
@@ -42,6 +47,10 @@
 #define SUPER_BACKOFF_MAX_S         30.0
 #define SUPER_QUARANTINE_CRASHES    5
 #define SUPER_QUARANTINE_WINDOW_S   600.0
+/* Turns a service gets to take the window's posture before it is set
+ * aside. A group is frozen in milliseconds; this is for the one that is
+ * slow, not for the one that cannot be. */
+#define SUPER_POSTURE_TRIES         3
 
 typedef enum { SVC_STOPPED = 0, SVC_RUNNING, SVC_BACKOFF, SVC_QUARANTINED } svc_state_t;
 
@@ -58,6 +67,7 @@ typedef struct {
     svc_state_t state;
     pid_t pid;
     int frozen, job_limited, healthy;
+    int posture_tries;                  /* turns spent trying to take the open window's posture */
     double started, next_start, backoff_s;
     double crashes[SUPER_QUARANTINE_CRASHES];
     int ncrashes;
@@ -104,12 +114,6 @@ void super_sync_end(super_t *sv);
 void super_tick(super_t *sv, const super_inputs_t *in, double now);
 void super_child_exited(super_t *sv, pid_t pid, int status, double now);
 void super_stop_all(super_t *sv, const char *why);
-
-/* Set one service aside for a reason of the caller's, as the supervisor
- * sets aside one that keeps ending: it is stopped, it is remembered as
- * quarantined across restarts, and the operator's enable is what lets it
- * out. 0 when there is no such running service. */
-int super_quarantine(super_t *sv, const char *id, const char *why);
 
 /* Set one service aside for a reason of the caller's, as the supervisor
  * sets aside one that keeps ending: it is stopped, it is remembered as

@@ -100,7 +100,7 @@ static void stop(super_t *sv, svc_t *s, const char *reason)
     if (s->state != SVC_QUARANTINED)
         s->state = SVC_STOPPED;
     s->pid = 0;
-    s->frozen = s->job_limited = 0;
+    s->frozen = s->job_limited = s->posture_tries = 0;
     s->next_start = 0;
     why(s, "%s", reason);
 }
@@ -140,7 +140,7 @@ static void crashed(super_t *sv, svc_t *s, double now, const char *how)
     if (s->ncrashes < SUPER_QUARANTINE_CRASHES)
         s->crashes[s->ncrashes++] = now;
     s->pid = 0;
-    s->frozen = s->job_limited = 0;
+    s->frozen = s->job_limited = s->posture_tries = 0;
     if (s->ncrashes >= SUPER_QUARANTINE_CRASHES) {
         s->state = SVC_QUARANTINED;
         s->wanted = 0;                                  /* until a sync finds the operator has let it out */
@@ -177,6 +177,79 @@ void super_child_exited(super_t *sv, pid_t pid, int status, double now)
         crashed(sv, s, now, how);
         s->healthy = 0;
         return;
+    }
+}
+
+/* The posture one running service takes for the window it is in.
+ *
+ * A freeze that will not take is not something to try again quietly: the
+ * package would be running beside the step stream, which is the one thing
+ * the freeze is there to stop, so it is set aside instead - loudly, and
+ * remembered, because a group that cannot be frozen is a defect and not a
+ * passing condition. Thawing is the other way round. A package left
+ * frozen costs nobody but itself, so a failure there is said and tried
+ * again at the next tick. */
+static void posture(super_t *sv, svc_t *s, int window)
+{
+    if (window && s->job_time) {
+        /* Its grant lifts the freeze and nothing else: it runs on under
+         * the job-time limits. If those will not take, the freeze the
+         * grant lifted is what is left, and if that will not take either
+         * there is nothing holding it off the step stream. */
+        if (s->job_limited || s->frozen)
+            return;                                     /* its posture stands, the fallback freeze included */
+        if (sv->ops->job_limits(sv->ctx, s, 1) == 0) {
+            s->job_limited = 1;
+            s->posture_tries = 0;
+            say(sv, LOG_INFO, "%s: the armed window is open: job-time limits", s->id);
+            return;
+        }
+        say(sv, LOG_ERR, "%s: its job-time limits could not be set: the freeze its grant lifted stands instead", s->id);
+        if (sv->ops->freeze(sv->ctx, s, 1) == 0) {
+            s->frozen = 1;
+            s->posture_tries = 0;
+        } else if (++s->posture_tries >= SUPER_POSTURE_TRIES) {
+            super_quarantine(sv, s->id, "it could not be limited or frozen for the armed window");
+        } else {
+            say(sv, LOG_WARNING, "%s: neither its limits nor the freeze have taken (turn %d of %d)", s->id,
+                s->posture_tries, SUPER_POSTURE_TRIES);
+        }
+        return;
+    }
+    if (window) {
+        if (s->frozen)
+            return;
+        if (sv->ops->freeze(sv->ctx, s, 1) == 0) {
+            s->frozen = 1;
+            s->posture_tries = 0;
+            say(sv, LOG_INFO, "%s: frozen for the armed window", s->id);
+        } else if (++s->posture_tries >= SUPER_POSTURE_TRIES) {
+            super_quarantine(sv, s->id, "it could not be frozen for the armed window");
+        } else {
+            say(sv, LOG_WARNING, "%s: it has not frozen for the armed window (turn %d of %d)", s->id, s->posture_tries,
+                SUPER_POSTURE_TRIES);
+        }
+        return;
+    }
+    /* The window is closed: its own limits back, and thawed. A service
+     * that took the fallback freeze is thawed here too, which is why the
+     * two are asked after separately and not as one posture. */
+    if (s->job_limited) {
+        if (sv->ops->job_limits(sv->ctx, s, 0) == 0) {
+            s->job_limited = 0;
+            say(sv, LOG_INFO, "%s: the armed window is closed: its own limits again", s->id);
+        } else {
+            say(sv, LOG_WARNING, "%s: its own limits could not be put back after the window", s->id);
+        }
+    }
+    if (s->frozen) {
+        if (sv->ops->freeze(sv->ctx, s, 0) == 0) {
+            s->frozen = 0;
+            s->posture_tries = 0;
+            say(sv, LOG_INFO, "%s: thawed", s->id);
+        } else {
+            say(sv, LOG_WARNING, "%s: it could not be thawed after the window", s->id);
+        }
     }
 }
 
@@ -222,16 +295,7 @@ void super_tick(super_t *sv, const super_inputs_t *in, double now)
             if (sv->ops->healthy)
                 sv->ops->healthy(sv->ctx, s);
         }
-        if (s->job_time) {
-            if (window != s->job_limited && sv->ops->job_limits(sv->ctx, s, window) == 0) {
-                s->job_limited = window;
-                say(sv, LOG_INFO, "%s: %s", s->id, window ? "the armed window is open: job-time limits"
-                                                           : "the armed window is closed: its own limits again");
-            }
-        } else if (window != s->frozen && sv->ops->freeze(sv->ctx, s, window) == 0) {
-            s->frozen = window;
-            say(sv, LOG_INFO, "%s: %s", s->id, window ? "frozen for the armed window" : "thawed");
-        }
+        posture(sv, s, window);
     }
     /* Starts: none inside a window, none the machine is not ready for, one
      * per tick, staggered, and under the cap. */
@@ -262,7 +326,7 @@ void super_tick(super_t *sv, const super_inputs_t *in, double now)
     pick->state = SVC_RUNNING;
     pick->pid = pid;
     pick->started = now;
-    pick->frozen = pick->job_limited = pick->healthy = 0;
+    pick->frozen = pick->job_limited = pick->healthy = pick->posture_tries = 0;
     pick->reason[0] = '\0';
     say(sv, LOG_NOTICE, "%s: started as ffx%d (pid %d)", pick->id, pick->slot, (int)pid);
 }

@@ -18,6 +18,11 @@
 
 #define CG_PARENT_DEFAULT "/sys/fs/cgroup/ffx"
 
+/* How long cg_freeze() waits for the kernel's `frozen` flag before it
+ * says the group has not frozen. It runs on the supervisor's one thread,
+ * so this is the most one package can take out of a turn. */
+#define CG_FREEZE_WAIT_MS 300
+
 typedef struct {
     int cpu_pct;                /* cpu.max as a percentage of the core; 0 = no limit */
     long long memory_bytes;     /* memory.max; 0 = no limit */

@@ -16,8 +16,13 @@
  * nothing; a failed start is a crash; a service that is disabled, gone, or
  * in the wrong controller mode is stopped without a crash, and a package
  * that is gone leaves the table; turning extensions off stops everything,
- * and the ends that follow are nobody's crash; and a package that keeps
- * ending does not take the start slots of the ones that would stay up.
+ * and the ends that follow are nobody's crash; a package that keeps
+ * ending does not take the start slots of the ones that would stay up;
+ * and, for the window's posture, a freeze that will not take sets the
+ * service aside instead of leaving it running, job-time limits that will
+ * not take fall back to the freeze the grant lifted (and it is thawed
+ * when the window closes), neither taking sets the service aside, and a
+ * thaw that fails is tried again.
  */
 #include "../src/super.h"
 
@@ -29,9 +34,9 @@ static int fails;
 
 static struct {
     int starts, stops, freezes, thaws, limits_on, limits_off, quarantines, healthies;
-    int fail_start;
+    int fail_start, fail_freeze, fail_limits;
     pid_t next_pid;
-    char last_started[64], last_quarantined[64];
+    char last_started[64], last_quarantined[64], last_why[160];
 } w;
 
 static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
@@ -46,14 +51,36 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
     return ++w.next_pid;
 }
 static void op_stop(void *ctx, svc_t *s) { (void)ctx; (void)s; w.stops++; }
-static int op_freeze(void *ctx, svc_t *s, int on) { (void)ctx; (void)s; if (on) w.freezes++; else w.thaws++; return 0; }
-static int op_limits(void *ctx, svc_t *s, int on) { (void)ctx; (void)s; if (on) w.limits_on++; else w.limits_off++; return 0; }
+static int op_freeze(void *ctx, svc_t *s, int on)
+{
+    (void)ctx;
+    (void)s;
+    if (w.fail_freeze)
+        return -1;
+    if (on)
+        w.freezes++;
+    else
+        w.thaws++;
+    return 0;
+}
+static int op_limits(void *ctx, svc_t *s, int on)
+{
+    (void)ctx;
+    (void)s;
+    if (w.fail_limits)
+        return -1;
+    if (on)
+        w.limits_on++;
+    else
+        w.limits_off++;
+    return 0;
+}
 static void op_quarantine(void *ctx, svc_t *s, const char *why)
 {
     (void)ctx;
-    (void)why;
     w.quarantines++;
     snprintf(w.last_quarantined, sizeof(w.last_quarantined), "%s", s->id);
+    snprintf(w.last_why, sizeof(w.last_why), "%s", why ? why : "");
 }
 static void op_healthy(void *ctx, svc_t *s) { (void)ctx; (void)s; w.healthies++; }
 static void op_log(void *ctx, int prio, const char *text) { (void)ctx; (void)prio; (void)text; }
@@ -242,6 +269,81 @@ int main(void)
     now += SUPER_STAGGER_S;
     super_tick(&sv, &READY, now);
     CHECK(crasher->state == SVC_RUNNING, "and then the crasher had its turn");
+
+    /* a freeze that will not take: the service is set aside, not left
+     * running beside the step stream */
+    fresh();
+    a = add("org.example.a", 0);
+    super_tick(&sv, &READY, 100);
+    CHECK(a->state == SVC_RUNNING, "not running before the window");
+    w.fail_freeze = 1;
+    for (int i = 1; i < SUPER_POSTURE_TRIES; i++) {
+        super_tick(&sv, &ARMED, 110 + i);
+        CHECK(a->state == SVC_RUNNING && a->posture_tries == i, "turn %d set it aside already: %s (%d)", i,
+              super_state_name(a->state), a->posture_tries);
+    }
+    super_tick(&sv, &ARMED, 110 + SUPER_POSTURE_TRIES);
+    CHECK(a->state == SVC_QUARANTINED && !a->frozen && w.quarantines == 1 && w.stops == 1,
+          "a freeze that never took: %s, %d quarantined, %d stopped", super_state_name(a->state), w.quarantines, w.stops);
+    CHECK(strstr(w.last_why, "could not be frozen") != NULL, "the reason it was set aside: %s", w.last_why);
+    w.fail_freeze = 0;
+    super_tick(&sv, &READY, 130);
+    CHECK(a->state == SVC_QUARANTINED && w.starts == 1, "it started again after the window with no operator");
+
+    /* a freeze that is only slow takes its turn and is not set aside */
+    fresh();
+    a = add("org.example.a", 0);
+    super_tick(&sv, &READY, 100);
+    w.fail_freeze = 1;
+    super_tick(&sv, &ARMED, 110);
+    w.fail_freeze = 0;
+    super_tick(&sv, &ARMED, 111);
+    CHECK(a->state == SVC_RUNNING && a->frozen && a->posture_tries == 0 && w.quarantines == 0,
+          "a slow freeze was set aside: %s, %d tries", super_state_name(a->state), a->posture_tries);
+
+    /* job-time limits that will not take: the freeze the grant lifted
+     * stands instead, and it is thawed when the window closes */
+    fresh();
+    a = add("org.example.a", 0);
+    a->job_time = 1;
+    super_tick(&sv, &READY, 100);
+    w.fail_limits = 1;
+    super_tick(&sv, &ARMED, 110);
+    CHECK(a->state == SVC_RUNNING && a->frozen && !a->job_limited && w.freezes == 1 && w.quarantines == 0,
+          "limits that failed did not fall back to the freeze: frozen %d, %d freezes, %d quarantined", a->frozen,
+          w.freezes, w.quarantines);
+    super_tick(&sv, &ARMED, 111);
+    CHECK(w.freezes == 1, "a second armed tick froze the fallback again");
+    super_tick(&sv, &READY, 120);
+    CHECK(!a->frozen && w.thaws == 1 && a->state == SVC_RUNNING, "the fallback freeze was not lifted: frozen %d, %d thaws",
+          a->frozen, w.thaws);
+
+    /* neither the limits nor the freeze take: nothing holds it off the
+     * step stream, so it is set aside */
+    fresh();
+    a = add("org.example.a", 0);
+    a->job_time = 1;
+    super_tick(&sv, &READY, 100);
+    w.fail_limits = w.fail_freeze = 1;
+    for (int i = 0; i < SUPER_POSTURE_TRIES; i++)
+        super_tick(&sv, &ARMED, 110 + i);
+    CHECK(a->state == SVC_QUARANTINED && w.quarantines == 1, "neither took, and it kept running: %s",
+          super_state_name(a->state));
+    CHECK(strstr(w.last_why, "limited or frozen") != NULL, "the reason it was set aside: %s", w.last_why);
+
+    /* a thaw that will not take is said, and tried again */
+    fresh();
+    a = add("org.example.a", 0);
+    super_tick(&sv, &READY, 100);
+    super_tick(&sv, &ARMED, 110);
+    CHECK(a->frozen, "not frozen for the window");
+    w.fail_freeze = 1;
+    super_tick(&sv, &READY, 120);
+    CHECK(a->state == SVC_RUNNING && a->frozen && w.quarantines == 0, "a thaw that failed set it aside: %s",
+          super_state_name(a->state));
+    w.fail_freeze = 0;
+    super_tick(&sv, &READY, 121);
+    CHECK(!a->frozen && w.thaws == 1, "the thaw was not tried again: frozen %d, %d thaws", a->frozen, w.thaws);
 
     printf("%s: super_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
