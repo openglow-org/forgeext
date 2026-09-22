@@ -13,7 +13,9 @@ destination, by name, and nothing else, and replaces what the account had; a
 destination that is this machine, by address or by name, is refused in
 words, and so are a name that does not resolve and an account outside the
 pool; --listen lets the account answer on its port; --dns opens the
-resolvers that are not this machine; `net-revoke` closes everything.
+resolvers that are not this machine; `net-revoke` closes everything. The listening port answers callers and is no
+way out: a connection the account opens from it reaches its declared
+destinations and nothing else.
 
 Needs root, nft, ip, nsenter, unshare, the built forgeext (FORGEEXT), and
 the rule file (FFX_RULES, default the sibling forgefirm checkout). Exits 77
@@ -64,7 +66,7 @@ def check(ok, what, *args):
         failures.append(text)
 
 
-def attempt(uid, addr, port, udp=False):
+def attempt(uid, addr, port, udp=False, sport=0):
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -77,6 +79,9 @@ def attempt(uid, addr, port, udp=False):
                 os.setuid(uid)
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM if udp else socket.SOCK_STREAM)
             s.settimeout(3.0)
+            if sport:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("", sport))
             if udp:
                 s.sendto(b"x", (addr, port))
             else:
@@ -219,6 +224,19 @@ def main():
     check(r.get("ok") is True and after == "ok", "with --listen %d it can -> %s", lport, after)
     os.close(hold_w)
     os.waitpid(child, 0)
+
+    print("and does not let it dial out of that port")
+    # The rule matches the source port. Bound to it, a connection out would
+    # reach anywhere at all if the rule did not tell a SYN from a reply, and
+    # the declared destinations would mean nothing.
+    out = attempt(UID, PEER_ADDR, p2, sport=lport)
+    check(out != "ok", "an undeclared destination from the listening port -> %s", out)
+    r = fx("net-allow", str(UID), "--listen", str(lport), "peer.test:%d" % p1)
+    check(r.get("ok") is True, "the destination beside the listening port -> %s", r.get("error"))
+    out = attempt(UID, PEER_ADDR, p1, sport=lport)
+    check(out == "ok", "and the declared one still opens from it -> %s", out)
+    out = attempt(UID, PEER_ADDR, p2, sport=lport)
+    check(out != "ok", "the undeclared one still does not -> %s", out)
 
     print("net-revoke closes everything")
     fx("net-allow", str(UID), "peer.test:%d" % p1)

@@ -350,8 +350,19 @@ int net_allow(const net_env_t *env, uid_t uid, const net_dest_t *dests, int ndes
                         (unsigned)uid, families[k] == AF_INET ? "ip" : "ip6", addrs[k],
                         (unsigned)uid, families[k] == AF_INET ? "ip" : "ip6", addrs[k]);
     }
+    /* A listening port is answered from, never dialed out of. The rule
+     * matches the source port, so on its own it would let the account
+     * reach any destination at all by binding a connection to that port -
+     * which is the declared-destination promise undone by a capability
+     * that has nothing to do with it. The flags tell the two apart with
+     * no connection tracking (the image's kernel builds none): a lone SYN
+     * is a connection this account is opening and is refused, and every
+     * other segment - the SYN-ACK that answers a caller, and the rest of
+     * that conversation - is its listener speaking and is let out. */
     if (rc == 0 && listen_port)
-        rc = append(script, &used, "add rule inet ffx u%u tcp sport %d accept\n", (unsigned)uid, listen_port);
+        rc = append(script, &used,
+                    "add rule inet ffx u%u tcp sport %d tcp flags & (fin|syn|rst|ack) != syn accept\n",
+                    (unsigned)uid, listen_port);
     if (rc == 0)
         rc = append(script, &used, "add element inet ffx allow { %u : jump u%u }\n", (unsigned)uid, (unsigned)uid);
     if (rc == 0) {
