@@ -14,6 +14,7 @@
 #include <jansson.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -300,7 +301,25 @@ done:
     return rc;
 }
 
-int machine_post_program(const machine_cfg_t *cfg, const char *path, const char *file,
+/* One part of the request, appended. -1 when it did not fit, which
+ * leaves *used where it was: every caller stops on that, so no later
+ * append can be handed a length that has run past the buffer. */
+static int part(char *body, size_t cap, size_t *used, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static int part(char *body, size_t cap, size_t *used, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(body + *used, cap - *used, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - *used)
+        return -1;
+    *used += (size_t)n;
+    return 0;
+}
+
+int machine_post_program(const machine_cfg_t *cfg, const char *path, int prog_fd,
                          const char *fields, char *out, size_t olen)
 {
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)cfg->port) };
@@ -309,53 +328,54 @@ int machine_post_program(const machine_cfg_t *cfg, const char *path, const char 
     char token[64];
     char *body = NULL, *reply = NULL;
     int rc = -1, fd = -1;
-    FILE *f = NULL;
 
     out[0] = '\0';
     machine_host_token(token, sizeof(token));
     if (!token[0])
         return -1;
-    f = fopen(file, "re");
-    if (!f)
+    if (prog_fd < 0 || fstat(prog_fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0
+        || st.st_size > MACHINE_JOB_MAX || lseek(prog_fd, 0, SEEK_SET) != 0)
         return -1;
-    if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0
-        || st.st_size > MACHINE_JOB_MAX) {
-        fclose(f);
-        return -1;
-    }
     /* The whole request is built before anything is sent: a program is
      * bounded, and a length that is wrong would leave the machine
      * waiting on bytes that never come. */
     static const char *BOUND = "----forgefirm-ext-program";
     size_t cap = (size_t)st.st_size + strlen(fields) + 4096;
     body = malloc(cap);
-    if (!body) {
-        fclose(f);
+    if (!body)
         return -1;
-    }
     size_t n = 0;
+    int over = 0;
     /* the named fields, one part each: name=value, & separated */
     const char *p = fields;
-    while (p && *p) {
+    while (p && *p && !over) {
         const char *amp = strchr(p, '&'), *eq = strchr(p, '=');
         size_t flen = amp ? (size_t)(amp - p) : strlen(p);
         if (eq && (size_t)(eq - p) < flen) {
-            n += (size_t)snprintf(body + n, cap - n,
-                                  "--%s\r\nContent-Disposition: form-data; name=\"%.*s\"\r\n\r\n%.*s\r\n",
-                                  BOUND, (int)(eq - p), p, (int)(flen - (size_t)(eq - p) - 1), eq + 1);
+            over = part(body, cap, &n,
+                        "--%s\r\nContent-Disposition: form-data; name=\"%.*s\"\r\n\r\n%.*s\r\n",
+                        BOUND, (int)(eq - p), p, (int)(flen - (size_t)(eq - p) - 1), eq + 1) != 0;
         }
         p = amp ? amp + 1 : NULL;
     }
-    n += (size_t)snprintf(body + n, cap - n,
-                          "--%s\r\nContent-Disposition: form-data; name=\"program\"; "
-                          "filename=\"program.gcode\"\r\nContent-Type: text/plain\r\n\r\n", BOUND);
-    size_t got = fread(body + n, 1, (size_t)st.st_size, f);
-    fclose(f);
-    f = NULL;
+    if (over || part(body, cap, &n,
+                     "--%s\r\nContent-Disposition: form-data; name=\"program\"; "
+                     "filename=\"program.gcode\"\r\nContent-Type: text/plain\r\n\r\n", BOUND) != 0)
+        goto done;
+    size_t got = 0;
+    while (got < (size_t)st.st_size) {
+        ssize_t k = read(prog_fd, body + n + got, (size_t)st.st_size - got);
+        if (k < 0 && (errno == EAGAIN || errno == EINTR))
+            continue;
+        if (k <= 0)
+            break;
+        got += (size_t)k;
+    }
     if (got != (size_t)st.st_size)
         goto done;
     n += got;
-    n += (size_t)snprintf(body + n, cap - n, "\r\n--%s--\r\n", BOUND);
+    if (part(body, cap, &n, "\r\n--%s--\r\n", BOUND) != 0)
+        goto done;
 
     if (inet_pton(AF_INET, cfg->host, &a.sin_addr) != 1)
         goto done;
@@ -418,8 +438,6 @@ int machine_post_program(const machine_cfg_t *cfg, const char *path, const char 
         memcpy(out, rbody, strlen(rbody) + 1);
     rc = status == 200 ? 0 : -status;
 done:
-    if (f)
-        fclose(f);
     if (fd >= 0)
         close(fd);
     free(body);

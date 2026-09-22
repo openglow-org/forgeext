@@ -416,14 +416,19 @@ static int motion_call(void *ctx, const char *path, char *out, size_t olen)
 }
 
 /* A package's program: the file it named, which must be a file of its
- * own data directory and nothing else. The name is resolved and then
- * checked against that directory's real path, so a link or a `..` out of
- * it is not a program this host will read. */
+ * own data directory and nothing else.
+ *
+ * The name carries no directory, so the file is opened through a
+ * descriptor for that directory and with O_NOFOLLOW, and that descriptor
+ * is what is read. Nothing here resolves a path and then opens it by
+ * name a moment later: the directory is the package's own to write, so
+ * between the two it could put something else where the checked name
+ * was, and what was read would not be what was checked. */
 static int job_call(void *ctx, const char *id, const char *program, const char *fields,
                     char *out, size_t olen)
 {
     const run_cfg_t *cfg = ctx;
-    char data[420], want[700], real[PATH_MAX], base[PATH_MAX];
+    char data[420];
     char answer[2048] = "";
     int rc;
 
@@ -435,15 +440,18 @@ static int job_call(void *ctx, const char *id, const char *program, const char *
                             json_pack("{s:s}", "error", "program is a file name in this package's data, "
                                                         "with no directory in it"));
         snprintf(data, sizeof(data), "%.255s/data/%.63s", cfg->ext.root, id);
-        snprintf(want, sizeof(want), "%.420s/%.200s", data, program);
-        if (!realpath(data, base) || !realpath(want, real)
-            || strncmp(real, base, strlen(base)) != 0 || real[strlen(base)] != '/')
+        int dirfd = open(data, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        int prog_fd = dirfd < 0 ? -1 : openat(dirfd, program, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (dirfd >= 0)
+            close(dirfd);
+        if (prog_fd < 0)
             return say_json(out, olen, 400,
                             json_pack("{s:s}", "error", "that program is not a file of this package's data"));
         fflog(LOG_NOTICE, "%s: it asked to run %s", id, program);
         char with_name[240];
         snprintf(with_name, sizeof(with_name), "%s&name=%.32s", fields ? fields : "", id);
-        rc = machine_post_program(&cfg->machine, "/job", real, with_name, answer, sizeof(answer));
+        rc = machine_post_program(&cfg->machine, "/job", prog_fd, with_name, answer, sizeof(answer));
+        close(prog_fd);
     }
     if (rc == 0) {
         snprintf(out, olen, "%s", answer[0] ? answer : "{\"ok\":true}");

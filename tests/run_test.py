@@ -16,8 +16,12 @@ services start one at a time, each as its pool account in its own cgroup, with
 its output in the log under its name. The dialer reaches its declared
 destination and not the machine. An armed window freezes every service but the
 one with the grant, which gets job-time limits; disarming thaws them; a
-forgectrl that stops answering freezes them again. A killed service comes
-back. The one that keeps ending is quarantined, and state.json remembers it.
+forgectrl that stops answering freezes them again. That same package names
+programs to run: the file that is really in its data directory gets as far as
+the machine, and a symbolic link out of the directory and a name with a
+directory in it are refused in words before anything does. A killed service
+comes back. The one that keeps ending is quarantined, and state.json
+remembers it.
 Safe mode stops everything and leaves no group and no chain. SIGTERM does the
 same and the daemon exits 0.
 
@@ -99,6 +103,19 @@ code, h = api("POST", "/v0/hold", {"raised": True, "reason": "through the job"})
 print("api raise %d %s" % (code, h), flush=True)
 codes = [api("GET", "/v0/self")[0] for _ in range(60)]
 print("api burst %d ok %d limited" % (codes.count(200), codes.count(429)), flush=True)
+# motion.job names a file of this package's own data. The host opens it
+# through a descriptor for that directory, so a name with a directory in
+# it and a symbolic link out of it are both refused before anything
+# reaches the machine; the file that is really there is not.
+time.sleep(1.5)                                 # the burst above spent this package's rate; let it refill
+d = os.environ["FFX_DATA"]
+with open(os.path.join(d, "job.gcode"), "w") as f:
+    for g in ("G21", "G90", "G0 X1"):
+        print(g, file=f)
+os.symlink("/etc/passwd", os.path.join(d, "elsewhere.gcode"))
+for what, name in (("real", "job.gcode"), ("link", "elsewhere.gcode"), ("dir", "../../state.json")):
+    code, ans = api("POST", "/v0/motion/job", {"program": name})
+    print("api job %s %d %s" % (what, code, (ans or {}).get("error", "")), flush=True)
 cleared = False
 while True:
     if not cleared and os.path.exists(os.path.join(os.environ["FFX_DATA"], "clear")):
@@ -236,7 +253,8 @@ def main():
     print("four packages")
     package("org.example.beat", "shell", "#!/bin/sh\nwhile true; do echo beat; sleep 1; done\n", caps=["hold"], grants=["hold"])
     package("org.example.dial", "python", DIAL, caps=["net.outbound:peer.test:%d" % pport], args=["peer.test", str(pport), str(fport)])
-    package("org.example.jobtime", "python", JOBTIME, caps=["job_time.run", "machine.read", "hold"], grants=["job_time.run", "hold"])
+    package("org.example.jobtime", "python", JOBTIME, caps=["job_time.run", "machine.read", "hold", "motion.job"],
+            grants=["job_time.run", "hold", "motion.job"])
     package("org.example.crash", "shell", "#!/bin/sh\necho about to end\nexit 3\n", caps=["hold"], grants=["hold"])
 
     print("a hold is the operator's to mark, and only where there is one")
@@ -353,7 +371,7 @@ def main():
         print("the API socket: a package's one way to the machine, and the broker behind it")
         jid = "ext org.example.jobtime: "
         check(wait_for(lambda: logged(jid + "api burst"), 40), "the service with the API's use has been through its calls")
-        check(logged(jid + "api self 200 org.example.jobtime 0.1 hold,job_time.run,machine.read"),
+        check(logged(jid + "api self 200 org.example.jobtime 0.1 hold,job_time.run,machine.read,motion.job"),
               "GET /v0/self: who it is, the API's version, and what it may use (the grants it got, the capabilities that need none)")
         check(logged(jid + "api mode 200 grbl verified"), "GET /v0/machine/mode: forgectrl's answer, relayed")
         check(logged(jid + "api nowhere 404") and logged(jid + "api bad hold 400"), "a path the API does not have, and a hold in no form")
@@ -367,6 +385,29 @@ def main():
         check(ok + limited == 60 and 1 <= limited and ok <= 30, "sixty requests at once: %d answered, %d told to slow down", ok, limited)
         check(logged("ext org.example.dial: api without the capabilities: mode 403 hold 403 raise 403"),
               "a package that holds neither capability gets 403 three times")
+
+        # motion.job: the program is a file of the package's own data, and
+        # the host opens it through a descriptor for that directory. The
+        # one that is really there gets as far as the machine (which this
+        # stand-in does not serve, so 502); a symbolic link out of the
+        # directory and a name with a directory in it never do.
+        def job_lines():
+            log.flush()
+            out = {}
+            for line in open(log_path).read().splitlines():
+                if jid + "api job " not in line:
+                    continue
+                rest = line.split("api job ", 1)[1].split(" ", 2)
+                out[rest[0]] = (int(rest[1]), rest[2] if len(rest) > 2 else "")
+            return out if len(out) == 3 else None
+
+        job = wait_for(job_lines, 15) or {}
+        check(set(job) == {"real", "link", "dir"}, "the package did not try all three programs: %s", job)
+        check(job.get("real", (0,))[0] != 400, "the file that is there was refused as a program: %s", job.get("real"))
+        for what in ("link", "dir"):
+            code, words = job.get(what, (0, ""))
+            check(code == 400 and "this package's data" in words, "the %s program was not refused in words: %s %s",
+                  what, code, words)
         sock = os.path.join(api_dir, "org.example.jobtime.sock")
         st = os.stat(sock)
         juid = 800 + int(svc("org.example.jobtime")["account"][3:])
