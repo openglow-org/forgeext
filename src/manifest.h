@@ -98,6 +98,13 @@ int manifest_load(const char *path, manifest_t *m, char *err, size_t elen);
 
 int manifest_id_ok(const char *id);
 int manifest_version_ok(const char *v);
+
+/* The firmware's own version as the image writes it, reduced to the
+ * version itself: a release image writes "v0.0.6", and the "v" is the
+ * file's form, not part of the version. A build stamp
+ * ("20260921190848") comes back as it was and is still no version at
+ * all. The result points into `v`. */
+const char *manifest_version_text(const char *v);
 const char *manifest_runtime_name(manifest_runtime_t r);
 int manifest_has_service(const manifest_t *m);
 int manifest_has_cap(const manifest_t *m, const char *cap);

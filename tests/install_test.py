@@ -159,10 +159,10 @@ def manifest_member(m):
 
 def core_range(t):
     """A package's "core" range against the firmware's own version. The
-    version comes from the command line here; on a machine it is read from
-    /etc/forgefirm-version, which on a dev image holds a build stamp and no
-    version at all, and then there is nothing to compare and nothing is
-    refused."""
+    version comes from the command line here, in the same form the machine
+    reads from /etc/forgefirm-version: "v0.0.6" on a release image, and on
+    a dev image a build stamp that is no version at all, and then there is
+    nothing to compare and nothing is refused."""
     a = t.pack(t.tree(manifest("org.example.core", core={"min": "0.0.7"}), RUN), "owner")
     r = t.run("inspect", a, core="0.0.9")
     check(r.get("ok") is True and r.get("core_checked") is True,
@@ -179,6 +179,16 @@ def core_range(t):
           "core.max 0.0.7 on firmware 0.0.9 is refused: %s" % r.get("error"))
     r = t.run("inspect", b, core="0.0.5")
     check(r.get("ok") is True, "core.max 0.0.7 on firmware 0.0.5 is taken: %s" % r.get("error"))
+
+    # The form a machine actually holds. /etc/forgefirm-version is written
+    # "v<version>" by the image build, and a range judged only against a
+    # bare version would be judged on no release image at all.
+    r = t.run("inspect", a, core="v0.0.9")
+    check(r.get("ok") is True and r.get("core_checked") is True,
+          "a release image's own \"v0.0.9\" is a version: %s" % r)
+    r = t.run("inspect", a, core="v0.0.5")
+    check(r.get("ok") is False and "0.0.7 or newer" in (r.get("error") or ""),
+          "and it is judged, not skipped: %s" % r.get("error"))
 
     # A build stamp is no version: nothing to compare against, and the
     # answer says so rather than leaving it to be guessed at.

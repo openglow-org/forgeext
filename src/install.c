@@ -53,20 +53,29 @@ void ext_env_defaults(ext_env_t *env)
     ext_read_core_version(env->core_version, sizeof(env->core_version));
 }
 
-void ext_read_core_version(char *out, size_t olen)
+void ext_read_core_version_from(const char *path, char *out, size_t olen)
 {
-    FILE *f = fopen(EXT_VERSION_FILE, "re");
+    FILE *f = fopen(path, "re");
     char line[128];
     out[0] = '\0';
     if (!f)
         return;
     if (fgets(line, sizeof(line), f)) {
-        /* "0.0.7", or "20260921190848 (dev)": the first word either way. */
+        /* "v0.0.6", or "20260921190848 (dev)": the first word either way,
+         * and the release form's leading "v" is the file's, not the
+         * version's. */
         size_t n = strcspn(line, " \t\r\n");
-        if (n < olen)
-            snprintf(out, olen, "%.*s", (int)n, line);
+        line[n] = '\0';
+        const char *v = manifest_version_text(line);
+        if (strlen(v) < olen)
+            snprintf(out, olen, "%s", v);
     }
     fclose(f);
+}
+
+void ext_read_core_version(char *out, size_t olen)
+{
+    ext_read_core_version_from(EXT_VERSION_FILE, out, olen);
 }
 
 int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
@@ -385,8 +394,8 @@ static int stage(const ext_env_t *env, const char *file, state_t *st, install_re
         rc = manifest_load(mf, &res->manifest, err, elen);
     if (rc == 0)
         rc = judge_exec(tree, &res->manifest, err, elen);
-        if (rc == 0)
-            rc = judge_ui(tree, &res->manifest, err, elen);
+    if (rc == 0)
+        rc = judge_ui(tree, &res->manifest, err, elen);
     if (rc == 0)
         rc = judge(env, st, res, err, elen);
     unlink(payload);

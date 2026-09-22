@@ -12,7 +12,9 @@
  * entry point that leaves the package, a capability that is unknown,
  * privileged, listed twice, or a service's on a package with none, a
  * data package that asks for anything, modes that are empty or doubled,
- * a conflict with itself. Versions order the way semantic versions do.
+ * a conflict with itself. Versions order the way semantic versions do,
+ * and the firmware's own version is read out of the form the image
+ * writes it in.
  */
 #include "../src/manifest.h"
 
@@ -142,6 +144,21 @@ int main(void)
           "version order");
     CHECK(manifest_id_reserved("org.openglow.align") && manifest_id_reserved("org.forgefirm.x")
           && !manifest_id_reserved("org.openglowfan.x") && !manifest_id_reserved("com.example.x"), "the reserved namespace");
+
+    /* /etc/forgefirm-version holds "v0.0.6" on a release image: the "v" is
+     * the file's form and the version has to be read out of it, or a
+     * release image judges no package's core range at all. A dev image's
+     * build stamp comes back untouched and is still no version. */
+    CHECK(strcmp(manifest_version_text("v0.0.6"), "0.0.6") == 0
+          && strcmp(manifest_version_text("0.0.6"), "0.0.6") == 0
+          && strcmp(manifest_version_text("v1.2.3-rc1"), "1.2.3-rc1") == 0
+          && strcmp(manifest_version_text("20260921190848"), "20260921190848") == 0
+          && strcmp(manifest_version_text("vendor"), "vendor") == 0
+          && strcmp(manifest_version_text(""), "") == 0, "the version out of the image's version file");
+    CHECK(manifest_version_ok(manifest_version_text("v0.0.6"))
+          && !manifest_version_ok(manifest_version_text("20260921190848"))
+          && manifest_version_cmp(manifest_version_text("v0.0.6"), "0.0.7") < 0,
+          "a release image's version is one a core range can be judged against");
 
     static char big[MANIFEST_MAX_BYTES + 64];
     memset(big, ' ', sizeof(big));

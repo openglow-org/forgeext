@@ -47,8 +47,15 @@ typedef struct {
 #define EXT_VERSION_FILE "/etc/forgefirm-version"
 
 /* The firmware's version as EXT_VERSION_FILE has it, or "" when the file
- * says nothing. What it holds may be a version or a build stamp; telling
- * them apart is manifest_version_ok()'s job. */
+ * says nothing: the first word, with the release form's leading "v"
+ * dropped (manifest_version_text()). What it holds may then be a version
+ * or a build stamp; telling them apart is manifest_version_ok()'s job.
+ *
+ * A campaign only ever runs on a dev image, whose stamp is no version, so
+ * no acceptance test can reach the judging path: the release form is
+ * proven here, by version_test, and nowhere else. Hence the _from()
+ * form, which is the same reader over a named file. */
+void ext_read_core_version_from(const char *path, char *out, size_t olen);
 void ext_read_core_version(char *out, size_t olen);
 
 typedef struct {

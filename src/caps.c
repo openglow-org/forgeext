@@ -16,7 +16,7 @@
 static const int firmware_ports[] = { 22, 23, 80, 443, 8090 };
 
 static const cap_def_t defs[] = {
-    { "machine.read",   0, 0, 1, "read the machine's status, cooling status, mode, and position" },
+    { "machine.read",   0, 0, 1, "read the machine's status, cooling status, and mode" },
     { "events",         0, 0, 1, "follow the machine's event stream" },
     { "settings.own",   0, 0, 1, "keep its own settings" },
     { "camera.lid",     0, 0, 1, "take pictures with the lid camera" },

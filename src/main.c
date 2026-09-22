@@ -34,9 +34,9 @@ static int usage(void)
             "  remove <id> [--keep-data]\n"
             "  enable <id> | disable <id>         the operator's switch for one package; enabling lets it out of quarantine\n"
             "  keys | key-add <name> <file.pub> | key-remove <name>\n"
-            "  ui <id>             the package's interface, as JSON\n"
-            "  settings <id> [json] its settings, and the patch to apply\n"
             "                                     the owner's keys: what makes a package community rather than unverified\n"
+            "  ui <id>                            the package's interface, as JSON\n"
+            "  settings <id> [json]               its settings, and the patch to apply\n"
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
             "  caps                               the capabilities a manifest may ask for\n"
             "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
@@ -53,7 +53,7 @@ static int usage(void)
             "  --firmware-key <path>   a key, or a directory of keys, that signs firmware (twice at most)\n"
             "  --nft <path>            the nft binary (default /usr/sbin/nft)\n"
             "  --budget-mib <n>        what every installed package may hold together (default %lld)\n"
-            "  --core-version <v>  this firmware's version, for a package's core range\n"
+            "  --core-version <v>      this firmware's version, for a package's core range\n"
             "  --no-reserve            do not keep free space back for a firmware update\n",
             EXT_BUDGET_DEFAULT >> 20);
     return 2;
@@ -226,7 +226,9 @@ int main(int argc, char **argv)
             if (env.budget_bytes <= 0)
                 return usage();
         } else if (strcmp(opt, "--core-version") == 0) {
-            snprintf(env.core_version, sizeof(env.core_version), "%s", val);
+            /* Taken in the form the image writes, "v0.0.6" included, so
+             * that what is passed here is what a machine reads. */
+            snprintf(env.core_version, sizeof(env.core_version), "%s", manifest_version_text(val));
         } else if (strcmp(opt, "--official-key") == 0) {
             env.trust.official_key = val;
         } else if (strcmp(opt, "--firmware-key") == 0 && nfw < 2) {

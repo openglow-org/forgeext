@@ -144,6 +144,13 @@ int manifest_version_ok(const char *v)
     return version_split(v, n, &pre) == 0;
 }
 
+const char *manifest_version_text(const char *v)
+{
+    if (v && v[0] == 'v' && isdigit((unsigned char)v[1]))
+        return v + 1;
+    return v;
+}
+
 int manifest_version_cmp(const char *a, const char *b)
 {
     long na[3] = { 0, 0, 0 }, nb[3] = { 0, 0, 0 };

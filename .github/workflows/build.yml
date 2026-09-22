@@ -37,6 +37,8 @@ jobs:
         run: ./build/caps_test
       - name: manifest_test (the manifest parser, and each way of being wrong)
         run: ./build/manifest_test
+      - name: version_test (the firmware's own version file; no acceptance test can reach the judging path)
+        run: ./build/version_test
       - name: state_test (state.json, the account pool, a file this daemon did not write)
         run: ./build/state_test
       - name: super_test (the supervisor's policy over fake operations)
