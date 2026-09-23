@@ -249,6 +249,28 @@ def operator_destinations(t):
     check(t.run("remove", D).get("ok") is True, "the package goes")
 
 
+def mcodes(t):
+    """An M-code is one package's, and it is answered during a job, which takes job_time.run."""
+    r = t.run("inspect", t.pack(t.tree(manifest("org.example.mc0", caps=["mcode:170"]), RUN), "owner"))
+    check(r.get("ok") is False and "which takes job_time.run" in (r.get("error") or ""),
+          "mcode with no job_time.run -> %s" % r.get("error"))
+    for cap in ("mcode:159", "mcode:180", "mcode:0170", "mcode", "mcode:17x"):
+        r = t.run("inspect", t.pack(t.tree(manifest("org.example.mc1", caps=[cap, "job_time.run"]), RUN), "owner"))
+        check(r.get("ok") is False and "mcode" in (r.get("error") or ""), "%s -> %s" % (cap, r.get("error")))
+    a = t.pack(t.tree(manifest("org.example.mca", caps=["mcode:170", "mcode:171", "job_time.run"]), RUN), "owner")
+    r = t.run("install", a, "--consent-unverified", "--grant", "job_time.run")
+    check(r.get("ok") is True, "a package answering M170 and M171 installs: %s" % r.get("error"))
+    b = t.pack(t.tree(manifest("org.example.mcb", caps=["mcode:171", "job_time.run"]), RUN), "owner")
+    r = t.run("install", b, "--consent-unverified", "--grant", "job_time.run")
+    check(r.get("ok") is False and "org.example.mca, which is installed, already answers M171" in (r.get("error") or ""),
+          "a second package answering M171 -> %s" % r.get("error"))
+    c = t.pack(t.tree(manifest("org.example.mcb", caps=["mcode:172", "job_time.run"]), RUN), "owner")
+    r = t.run("install", c, "--consent-unverified", "--grant", "job_time.run")
+    check(r.get("ok") is True, "another number is its own: %s" % r.get("error"))
+    for id_ in ("org.example.mca", "org.example.mcb"):
+        check(t.run("remove", id_).get("ok") is True, "%s goes" % id_)
+
+
 def the_index(t):
     """The signed index: verified only under the OpenGlow extension key, held to its form, and binding an id
     to an author key that the owner never added - for that id and no other."""
@@ -634,6 +656,9 @@ def run_all(w, top):
 
     print("destinations the operator names")
     operator_destinations(w)
+
+    print("the M-codes a package answers")
+    mcodes(w)
 
     print("the signed index")
     the_index(w)

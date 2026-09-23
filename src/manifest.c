@@ -25,7 +25,7 @@ static const char *const runtime_names[] = { "data", "ui", "shell", "native", "p
 /* Capabilities that are about a running process: a package with no
  * service has nothing that could use them. */
 static const char *const service_only[] = { "hold", "job_time.run", "net.outbound", "net.outbound.operator", "net.listen",
-                                             "storage" };
+                                             "storage", "mcode" };
 
 static int fail(char *err, size_t elen, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
@@ -370,6 +370,12 @@ static int take_caps(json_t *root, manifest_t *m, char *err, size_t elen)
     for (int i = 0; i < m->ncaps; i++)
         if (strncmp(m->caps[i], "storage:", 8) == 0 && storage++)
             return fail(err, elen, "\"storage\" is asked for twice");
+    /* An M-code is answered in the middle of a job, while the armed window
+     * freezes every service that may not run then. */
+    for (int i = 0; i < m->ncaps; i++)
+        if (strncmp(m->caps[i], "mcode:", 6) == 0 && !manifest_has_cap(m, "job_time.run"))
+            return fail(err, elen, "capability \"%s\" is answered while a job runs, which takes job_time.run: "
+                                   "ask for it too", m->caps[i]);
     return 0;
 }
 

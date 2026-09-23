@@ -32,7 +32,7 @@ static const cap_def_t defs[] = {
     { "net.outbound.operator", 0, 0, 1, "connect to the destinations the operator names for it" },
     { "net.listen",     1, 0, 1, "listen on port" },
     { "storage",        1, 0, 1, "keep data on the machine, in MiB up to" },
-    { "mcode",          1, 0, 0, "handle the M-code" },
+    { "mcode",          1, 0, 1, "answer the M-code, holding the job until it does" },
 };
 
 size_t caps_count(void)
@@ -217,6 +217,13 @@ int caps_check(const char *cap, char *why, size_t wlen)
                 snprintf(why, wlen, "port %ld is the firmware's own", v);
                 return -1;
             }
+        return 0;
+    }
+    if (strcmp(d->name, "mcode") == 0) {
+        if (number_in(arg, CAPS_MCODE_MIN, CAPS_MCODE_MAX, NULL) != 0) {
+            snprintf(why, wlen, "mcode names one M-code, %d to %d", CAPS_MCODE_MIN, CAPS_MCODE_MAX);
+            return -1;
+        }
         return 0;
     }
     if (strcmp(d->name, "storage") == 0) {

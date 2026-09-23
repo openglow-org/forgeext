@@ -22,6 +22,9 @@
 #define CALL_BODY_MAX     4096                  /* what a page may send its service */
 #define CALL_ANSWER_MAX   (64 * 1024)           /* what a service may answer */
 #define CALL_TIMEOUT_MS   10000
+/* An M-code's answer: under the GRBL controller's 30 s wait, with room for
+ * forgectrl to bring it back. */
+#define MCODE_TIMEOUT_MS  20000
 
 /* The listening socket for id's service under dir: bound, 0600, listening,
  * close-on-exec. 0 with *fd and the path, or -1 with the words. */

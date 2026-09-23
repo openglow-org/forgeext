@@ -317,6 +317,9 @@ static int judge(const ext_env_t *env, state_t *st, install_result_t *res, char 
             return fail(err, elen, "%s, which is installed, conflicts with %s", other.id, m->id);
         if (port && listen_port(&other) == port)
             return fail(err, elen, "%s, which is installed, already listens on port %d", other.id, port);
+        for (int k = 0; k < m->ncaps; k++)
+            if (strncmp(m->caps[k], "mcode:", 6) == 0 && manifest_has_cap(&other, m->caps[k]))
+                return fail(err, elen, "%s, which is installed, already answers M%s", other.id, m->caps[k] + 6);
     }
     if (have && manifest_has_cap(m, "net.outbound.operator") && have->ndests + outbound_count(m) > EXT_DESTS_MAX)
         return fail(err, elen, "the operator named %d destinations for %s and this version declares %d: a service has "

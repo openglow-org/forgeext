@@ -18,6 +18,11 @@
 
 #define CAP_MAX_LEN 96          /* a capability string, argument included */
 
+/* The M-codes a package may answer (mcode:<n>), each one package's: the
+ * GRBL controller's range for them. */
+#define CAPS_MCODE_MIN 160
+#define CAPS_MCODE_MAX 179
+
 typedef struct {
     const char *name;           /* without the argument */
     int takes_arg;              /* "name:<arg>" and never bare */

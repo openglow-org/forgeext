@@ -45,6 +45,8 @@ static int usage(void)
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
             "  dest <id> add|remove <host>:<port> a destination the operator names for a package that asks for them\n"
             "  call <id> GET|POST <path> [json] [--call-dir <dir>] [--cg-parent <dir>]\n"
+            "  mcode <n> [json] [--call-dir <dir>] [--cg-parent <dir>]\n"
+            "                                     M<n> of a job, to the service that answers it\n"
             "                                     one call from the package's page to its own service\n"
             "  caps                               the capabilities a manifest may ask for\n"
             "  index-verify <file.ffi>            verify the signed index and keep it: its listing and its endorsed keys\n"
@@ -543,6 +545,86 @@ int main(int argc, char **argv)
             return refuse("its service's answer is not JSON");
         json_t *obj = json_object();
         json_object_set_new(obj, "id", json_string(id));
+        json_object_set_new(obj, "status", json_integer(status));
+        json_object_set_new(obj, "body", ans);
+        return answer(obj, 1);
+    }
+    if (strcmp(cmd, "mcode") == 0 && i < argc) {
+        /* M<n> of a job, handed to the service that answers it, for the GRBL
+         * controller that waits at it (forgectrl relays the two). The words
+         * are P, Q, and R, each a number; the service is asked POST /mcode
+         * with {"code": n, "words": {...}} on its call socket, and its answer
+         * comes back as for a call. */
+        const char *num = argv[i++], *text = NULL;
+        const char *dir = CALL_DIR_DEFAULT, *cg = CG_PARENT_DEFAULT;
+        if (i < argc && strncmp(argv[i], "--", 2) != 0)
+            text = argv[i++];
+        for (; i < argc; i++) {
+            if (strcmp(argv[i], "--call-dir") == 0 && i + 1 < argc)
+                dir = argv[++i];
+            else if (strcmp(argv[i], "--cg-parent") == 0 && i + 1 < argc)
+                cg = argv[++i];
+            else
+                return usage();
+        }
+        char cap[24], why[200];
+        snprintf(cap, sizeof(cap), "mcode:%s", num);
+        if (strlen(num) > 3 || caps_check(cap, why, sizeof(why)) != 0)
+            return refuse("an M-code a package answers is one of M160 to M179");
+        json_error_t je;
+        json_t *words = json_loads(text ? text : "{}", JSON_REJECT_DUPLICATES, &je), *v;
+        const char *k;
+        int form = json_is_object(words) && json_object_size(words) <= 3;
+        json_object_foreach(words, k, v)
+            if (!(strcmp(k, "P") == 0 || strcmp(k, "Q") == 0 || strcmp(k, "R") == 0) || !json_is_number(v))
+                form = 0;
+        if (!form) {
+            json_decref(words);
+            return refuse("an M-code's words are P, Q, and R, each a number");
+        }
+
+        static state_t mc_st;
+        if (state_load(env.root, &mc_st, err, sizeof(err)) != 0) {
+            json_decref(words);
+            return refuse(err);
+        }
+        const state_pkg_t *who = NULL;
+        manifest_t m;
+        for (int k2 = 0; k2 < mc_st.n && !who; k2++)
+            if (ext_manifest_of(&env, mc_st.pkgs[k2].id, &m, why, sizeof(why)) == 0 && manifest_has_cap(&m, cap))
+                who = &mc_st.pkgs[k2];
+        const char *refusal = !who ? "no package answers this M-code"
+                              : !who->enabled || who->quarantined ? "the package that answers it is not running"
+                              : !state_granted(who, "job_time.run")
+                                  ? "the package that answers it may not run while a job is armed: the operator "
+                                    "did not grant it job_time.run"
+                              : cg_frozen(cg, who->id) == 1 ? "its service is frozen while a job is armed" : NULL;
+        if (refusal) {
+            json_decref(words);
+            return refuse(refusal);
+        }
+        json_t *req = json_pack("{s:i, s:o}", "code", atoi(num), "words", words);
+        char *out = req ? json_dumps(req, JSON_COMPACT) : NULL;
+        json_decref(req);
+        if (!out)
+            return refuse("out of memory");
+        int status = 0;
+        char *body = NULL;
+        size_t blen = 0;
+        int rc = call_service(dir, who->id, "POST", "/mcode", out, MCODE_TIMEOUT_MS, &status, &body, &blen, err,
+                              sizeof(err));
+        free(out);
+        if (rc != 0)
+            return refuse(err);
+        json_t *ans = json_null();
+        if (blen > 0)
+            ans = json_loadb(body, blen, JSON_DECODE_ANY | JSON_REJECT_DUPLICATES, &je);
+        free(body);
+        if (!ans)
+            return refuse("its service's answer is not JSON");
+        fflog(LOG_INFO, "M%s: %s answered %d", num, who->id, status);
+        json_t *obj = json_object();
+        json_object_set_new(obj, "id", json_string(who->id));
         json_object_set_new(obj, "status", json_integer(status));
         json_object_set_new(obj, "body", ans);
         return answer(obj, 1);

@@ -60,7 +60,7 @@ KNOWN_KEYS = ("manifest", "id", "name", "version", "description", "author", "lic
               "api", "core", "runtime", "service", "modes", "capabilities", "conflicts", "settings")
 RUNTIMES = ("data", "ui", "shell", "native", "python")
 SERVICE_RUNTIMES = ("shell", "native", "python")
-SERVICE_ONLY = ("hold", "job_time.run", "net.outbound", "net.outbound.operator", "net.listen", "storage")
+SERVICE_ONLY = ("hold", "job_time.run", "net.outbound", "net.outbound.operator", "net.listen", "storage", "mcode")
 # name: (takes an argument, needs the operator's grant, offered)
 CAPS = {
     "machine.read": (False, False, True), "events": (False, False, True), "settings.own": (False, False, True),
@@ -69,9 +69,10 @@ CAPS = {
     "job_time.run": (False, True, True), "ui": (False, False, True), "wizard": (False, False, False),
     "net.outbound": (True, False, True), "net.outbound.operator": (False, False, True), "net.listen": (True, False, True),
     "storage": (True, False, True),
-    "mcode": (True, False, False),
+    "mcode": (True, False, True),
 }
 FIRMWARE_PORTS = (22, 23, 80, 443, 8090)
+MCODE_MIN, MCODE_MAX = 160, 179
 CAP_MAX_LEN = 96
 TEXT = {"id": 64, "name": 65, "version": 33, "description": 257, "author": 129, "license": 65, "homepage": 257}
 MANIFEST_MAX_BYTES = 64 * 1024
@@ -261,6 +262,10 @@ def caps_check(cap):
             return "net.listen names one port, 1024 to 65535"
         if int(arg) in FIRMWARE_PORTS:
             return "port %d is the firmware's own" % int(arg)
+        return None
+    if name == "mcode":
+        if not re.fullmatch(r"[1-9][0-9]{0,8}", arg) or not MCODE_MIN <= int(arg) <= MCODE_MAX:
+            return "mcode names one M-code, %d to %d" % (MCODE_MIN, MCODE_MAX)
         return None
     if name == "storage":
         if not re.fullmatch(r"[1-9][0-9]{0,8}", arg) or not 1 <= int(arg) <= 256:
@@ -457,6 +462,9 @@ def judge_manifest(raw):
         have.append(c)
     if sum(1 for c in have if c.startswith("storage:")) > 1:
         raise Refused('"storage" is asked for twice')
+    for c in have:
+        if c.startswith("mcode:") and "job_time.run" not in have:
+            raise Refused('capability "%s" is answered while a job runs, which takes job_time.run: ask for it too' % c)
     if "conflicts" in root:
         lst = root["conflicts"]
         if not isinstance(lst, list) or len(lst) > MAX_LIST:

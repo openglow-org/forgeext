@@ -50,6 +50,22 @@ MKFFX = os.path.join(HERE, "..", "tools", "mkffx.sh")
 CG_PARENT = "/sys/fs/cgroup/forgeext-sdk-test"
 SKIP = 77
 
+# A package with no page that answers M161 in a job: its service is asked POST /mcode on the same socket a
+# page's calls use.
+MC_SERVICE = r'''
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["FFX_PKG"], "lib"))
+import ffx
+def handle(method, path, body):
+    if method == "POST" and path == "/mcode":
+        w = body.get("words", {})
+        if w.get("P") == 2:
+            raise ffx.CallError(409, "the exhaust did not start")
+        return {"message": "M%d done with %s" % (body.get("code"), ",".join("%s=%s" % kv for kv in sorted(w.items())))}
+    raise ffx.CallError(404, "no such call")
+ffx.serve(handle)
+'''
+
 PY_SERVICE = r'''
 import json, os, socket, stat, sys, time
 sys.path.insert(0, os.path.join(os.environ["FFX_PKG"], "lib"))
@@ -241,6 +257,8 @@ def main():
     package("org.example.sdksh", "shell", "bin/run.sh", {"bin/run.sh": SH_SERVICE, "lib/ffx.sh": os.path.join(SDK, "sh", "ffx.sh")},
             caps=["hold"], grants=["hold"])
     package("org.example.sdkc", "native", "bin/run", {"bin/run": native}, caps=["hold", "machine.read", "ui"], grants=["hold"])
+    mc_files = {"bin/run.py": MC_SERVICE, "lib/ffx.py": os.path.join(SDK, "python", "ffx.py")}
+    package("org.example.sdkmc", "python", "bin/run.py", mc_files, caps=["mcode:161", "job_time.run"], grants=["job_time.run"])
 
     abi = int(subprocess.run([sys.executable, "-c", "import ctypes;print(ctypes.CDLL(None).syscall(444,None,0,1))"],
                              capture_output=True, text=True).stdout.strip() or 0)
@@ -292,6 +310,37 @@ def main():
 
         def call(id_, method, path, *body):
             return fx("call", id_, method, path, *body, "--call-dir", call_dir, "--cg-parent", CG_PARENT)
+
+        print("an M-code a package answers (forgeext mcode, ffx.serve)")
+
+        def mcodes_listed():
+            try:
+                return json.load(open(os.path.join(run_dir, "status.json"))).get("mcodes")
+            except (OSError, ValueError):
+                return None
+        listed = wait_for(lambda: mcodes_listed() == [{"code": 161, "id": "org.example.sdkmc"}] and mcodes_listed(), 60)
+        check(listed == [{"code": 161, "id": "org.example.sdkmc"}], "the host's status names who answers what: %s",
+              mcodes_listed())
+        check(os.path.exists(os.path.join(call_dir, "org.example.sdkmc.sock")), "a package with no page that answers an "
+              "M-code has its call socket")
+
+        def mc(*args):
+            return fx("mcode", *args, "--call-dir", call_dir, "--cg-parent", CG_PARENT)
+        r = mc("161", '{"P": 1, "Q": 2.5}')
+        check(r.get("ok") is True and r.get("id") == "org.example.sdkmc" and r.get("status") == 200
+              and (r.get("body") or {}).get("message") == "M161 done with P=1,Q=2.5", "M161 P1 Q2.5: %s", r)
+        r = mc("161")
+        check(r.get("status") == 200 and (r.get("body") or {}).get("message") == "M161 done with ", "M161 with no words: %s", r)
+        r = mc("161", '{"P": 2}')
+        check(r.get("ok") is True and r.get("status") == 409 and (r.get("body") or {}).get("error") == "the exhaust did not start",
+              "the service's refusal is its status and words: %s", r)
+        for args, words in ((("163",), "no package answers this M-code"),
+                            (("159",), "one of M160 to M179"), (("180",), "one of M160 to M179"), (("16x",), "one of M160"),
+                            (("0161",), "one of M160"), (("161", '{"X": 1}'), "words are P, Q, and R"),
+                            (("161", '{"P": "a"}'), "words are P, Q, and R"), (("161", "[1]"), "words are P, Q, and R"),
+                            (("161", '{"P": 1, "P": 2}'), "words are P, Q, and R")):
+            r = mc(*args)
+            check(r.get("ok") is False and words in (r.get("error") or ""), "mcode %s -> %s", " ".join(args), r.get("error"))
 
         print("a page's calls to its own service (forgeext call, ffx.serve)")
         py = "org.example.sdkpy"

@@ -30,6 +30,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "caps.h"
 #include "cgroup.h"
 #include "fflog.h"
 #include "sandbox.h"
@@ -63,6 +64,19 @@ typedef struct {
 } run_t;
 
 #define SHUTDOWN_GRACE_S 1.0
+
+/* The M-codes a manifest answers, as the service record's bits. */
+static unsigned long mcodes_of(const manifest_t *m)
+{
+    unsigned long bits = 0;
+    for (int i = 0; i < m->ncaps; i++)
+        if (strncmp(m->caps[i], "mcode:", 6) == 0) {
+            int n = atoi(m->caps[i] + 6);
+            if (n >= CAPS_MCODE_MIN && n <= CAPS_MCODE_MAX)
+                bits |= 1UL << (n - CAPS_MCODE_MIN);
+        }
+    return bits;
+}
 
 /* The host's own events, into the ring every package reads beside the
  * machine's: ext.will_freeze as the armed window opens (a service with
@@ -279,13 +293,14 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
     }
     snprintf(api_env, sizeof(api_env), "FFX_API=%s", api_path);
     sb.env[0] = api_env;
-    /* A package with a page may have its page ask the service: the host
-     * binds that socket where only it can put a name, and the service gets
-     * the listening end alone. */
+    /* A package with a page may have its page ask the service, and one
+     * that answers an M-code is asked it the same way: the host binds that
+     * socket where only it can put a name, and the service gets the
+     * listening end alone. */
     static char call_env[32];
     char call_path[400];
     int call_fd = -1;
-    if (manifest_has_cap(&m, "ui")) {
+    if (manifest_has_cap(&m, "ui") || mcodes_of(&m)) {
         if (call_open(cfg->call_dir, s->id, call_path, sizeof(call_path), &call_fd, err, elen) != 0) {
             api_close(&r->api, s->id);
             close(pfd[0]);
@@ -701,6 +716,7 @@ static void sync_installed(run_t *r, super_t *sv)
         if (s->state != SVC_RUNNING && ext_manifest_of(&r->cfg->ext, p->id, &m, err, sizeof(err)) == 0) {
             s->mode_grbl = m.mode_grbl;
             s->mode_cloud = m.mode_cloud;
+            s->mcodes = mcodes_of(&m);
         }
         s->wanted = p->enabled && !p->quarantined;
         if (p->quarantined && s->state != SVC_RUNNING && s->state != SVC_QUARANTINED) {
@@ -726,6 +742,16 @@ static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
     json_object_set_new(top, "not_ready", json_string(mc->not_ready));
     json_object_set_new(top, "events", json_pack("{s:b, s:i}", "connected", evfeed_connected(&r->feed),
                                                  "wanted", api_events_wanted(&r->api)));
+    /* Who answers which M-code now: a running service that may run while
+     * a job is armed. forgectrl tells the GRBL controller these numbers. */
+    json_t *mcodes = json_array();
+    for (int i = 0; i < sv->n; i++) {
+        const svc_t *s = &sv->svc[i];
+        for (int k = 0; s->state == SVC_RUNNING && s->job_time && k <= CAPS_MCODE_MAX - CAPS_MCODE_MIN; k++)
+            if (s->mcodes & (1UL << k))
+                json_array_append_new(mcodes, json_pack("{s:i, s:s}", "code", CAPS_MCODE_MIN + k, "id", s->id));
+    }
+    json_object_set_new(top, "mcodes", mcodes);
     for (int i = 0; i < sv->n; i++) {
         const svc_t *s = &sv->svc[i];
         json_t *j = json_object();
