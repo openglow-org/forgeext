@@ -170,6 +170,144 @@ def build(top, name, manifest, extra):
     return d
 
 
+TOKEN = "0123456789abcdef0123456789abcdef"
+
+
+def machine_client(ffx, top, archive):
+    """ffx install and ffx logs against a stand-in for forgectrl's HTTPS routes, answered as the daemon answers
+    them (the login, the page that carries the token, the upload, the install, the log's tail), so what the tool
+    sends is held to the contract: the cookie and the token on every write, an address-literal Host, the archive
+    as the file part, the grants and the phrase."""
+    import builtins
+    import getpass
+    import http.server
+    import ssl
+    import threading
+    import urllib.parse
+    if not shutil.which("openssl"):
+        print("  (the machine client: skipped, no openssl to make the stand-in's certificate)")
+        return
+    cert, key = os.path.join(top, "cert.pem"), os.path.join(top, "key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                    "-subj", "/CN=forgefirm", "-days", "1"], check=True, capture_output=True)
+    seen = []
+
+    class Forgectrl(http.server.BaseHTTPRequestHandler):
+        def reply(self, code, body, headers=()):
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json" if not isinstance(body, bytes) else "text/html")
+            self.send_header("Content-Length", str(len(data)))
+            for k, v in headers:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def authed(self):
+            return self.headers.get("Cookie") == "session=s3" and self.headers.get("X-ForgeFIRM-Token") == TOKEN
+
+        def do_GET(self):
+            u = urllib.parse.urlsplit(self.path)
+            seen.append(("GET", u.path, self.headers.get("Host")))
+            if u.path == "/" and self.headers.get("Cookie") == "session=s3":
+                return self.reply(200, ("<script>var TOK = '%s';</script>" % TOKEN).encode())
+            if u.path == "/logs/tail" and self.authed():
+                q = dict(urllib.parse.parse_qsl(u.query))
+                return self.reply(200, {"name": q.get("name"), "exists": True, "offset": 99,
+                                        "text": "a line of org.example.fixture\nsomebody else's line\n"})
+            return self.reply(403, {"error": "authentication required"})
+
+        def do_POST(self):
+            u = urllib.parse.urlsplit(self.path)
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            seen.append(("POST", u.path, self.headers.get("Host"), self.headers.get("Content-Type"), body))
+            if u.path == "/login":
+                f = dict(urllib.parse.parse_qsl(body.decode()))
+                if f == {"name": "owner", "password": "pw"}:
+                    return self.reply(200, {"ok": True}, [("Set-Cookie", "session=s3; Path=/; HttpOnly; Secure")])
+                return self.reply(401, {"error": "wrong name or password"})
+            if not self.authed():
+                return self.reply(403, {"error": "authentication required"})
+            if u.path == "/ext/upload":
+                ok = b'name="file"' in body and open(archive, "rb").read() in body
+                return self.reply(200 if ok else 400, {"tier": "community", "consent": "typed", "update": False,
+                                                       "needs_grant": ["hold"], "new_capabilities": [],
+                                                       "package": {"id": "org.example.fixture", "version": "1.0.0",
+                                                                   "author": "Test", "capabilities": ["hold", "machine.read"]}})
+            if u.path == "/ext/install":
+                f = dict(urllib.parse.parse_qsl(body.decode()))
+                ok = f == {"grants": "hold", "phrase": "I UNDERSTAND"}
+                return self.reply(200 if ok else 400, {"enabled": True} if ok else {"error": "not the consent: %s" % f})
+            if u.path == "/ext/upload/discard":
+                return self.reply(200, {"discarded": True})
+            return self.reply(404, {"error": "not found"})
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Forgectrl)
+    cx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    cx.load_cert_chain(cert, key)
+    srv.socket = cx.wrap_socket(srv.socket, server_side=True)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    addr = "127.0.0.1:%d" % srv.server_address[1]
+    answers = iter(["y", "I UNDERSTAND"])
+    home = os.path.join(top, "home")
+    saved = (builtins.input, getpass.getpass, os.environ.get("HOME"), os.environ.get("USERPROFILE"))
+    builtins.input = lambda prompt="": next(answers)
+    getpass.getpass = lambda prompt="": "pw"
+    os.environ["HOME"] = os.environ["USERPROFILE"] = home
+    out = io_capture()
+    try:
+        print("ffx install and logs, against a stand-in for forgectrl's routes")
+        with out:
+            rc = ffx.main(["install", archive, "--machine", addr, "--user", "owner", "--grant", "hold"])
+        check(rc == 0 and "installed: org.example.fixture" in out.text, "installed: rc %s, %s", rc, out.text[-200:])
+        posts = [s for s in seen if s[0] == "POST"]
+        check([p[1] for p in posts] == ["/login", "/ext/upload", "/ext/install"], "login, upload, install: %s",
+              [p[1] for p in posts])
+        check(all(s[2] == addr for s in seen), "every request's Host is the address itself: %s", set(s[2] for s in seen))
+        check(posts[1][3].startswith("multipart/form-data; boundary="), "the archive goes as a file part")
+        known = json.load(open(os.path.join(home, ".ffx", "machines.json")))
+        check(list(known) == [addr], "the certificate is remembered after the owner said yes")
+        seen.clear()
+        answers = iter([])
+        with out:
+            rc = ffx.main(["logs", "--machine", addr, "--user", "owner", "--id", "org.example.fixture"])
+        check(rc == 0 and "a line of org.example.fixture" in out.text and "somebody else" not in out.text,
+              "logs: a package's lines alone: %s", out.text.strip()[-120:])
+        check(any(s[1] == "/logs/tail" for s in seen), "read through /logs/tail")
+        # a certificate that changed is refused, not trusted again
+        json.dump({addr: "00" * 32}, open(os.path.join(home, ".ffx", "machines.json"), "w"))
+        with out:
+            rc = ffx.main(["logs", "--machine", addr, "--user", "owner"])
+        check(rc == 1 and "not the one it presented before" in out.err, "a changed certificate is refused: %s",
+              out.err.strip()[-160:])
+    finally:
+        builtins.input, getpass.getpass = saved[0], saved[1]
+        for k, v in (("HOME", saved[2]), ("USERPROFILE", saved[3])):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        srv.shutdown()
+
+
+class io_capture:
+    """stdout and stderr of a block, kept."""
+
+    def __enter__(self):
+        import io
+        self._old = (sys.stdout, sys.stderr)
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+        return self
+
+    def __exit__(self, *exc):
+        self.text, self.err = sys.stdout.getvalue(), sys.stderr.getvalue()
+        sys.stdout, sys.stderr = self._old
+        return False
+
+
 def main():
     if not FWUP or not os.path.isfile(FORGEEXT):
         print("skipped: needs fwup and the built forgeext")
@@ -270,6 +408,8 @@ def main():
             if runtime == "native":
                 check("entry point, bin/run" in why and os.path.isfile(os.path.join(d, "src", "ffx.h")),
                       "and says so, with ffx.h beside its source: %s", why)
+
+        machine_client(ffx, top, a1)
     finally:
         shutil.rmtree(top, ignore_errors=True)
     print("%d failure(s)" % len(failures))
