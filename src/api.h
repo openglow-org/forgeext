@@ -136,7 +136,7 @@ typedef int (*api_settings_fn)(void *ctx, const char *id, const char *patch, siz
  * the frame (malloc'd, the caller frees) and ctype its type, otherwise
  * out holds the JSON error. Runs on the camera thread, never the
  * broker's. */
-typedef int (*api_camera_fn)(void *ctx, const char *cam, int full, int quality,
+typedef int (*api_camera_fn)(void *ctx, const char *cam, int full, int quality, int lamp,
                              unsigned char **jpeg, size_t *len, char *ctype, size_t clen,
                              char *out, size_t olen);
 
@@ -172,6 +172,7 @@ typedef struct {
     char cam[8];
     int full;
     int quality;
+    int lamp;                   /* the camera's lamp for this frame, 0 to 1023; -1 leaves the machine's own */
 } api_shot_t;
 
 /* A request that is to wait: from which event, and until when. */

@@ -46,10 +46,10 @@ static int set_calls;
 static char set_id[64], set_patch[256];
 static int set_status = 200;
 
-static int fake_camera(void *ctx, const char *cam, int full, int quality, unsigned char **jpeg,
+static int fake_camera(void *ctx, const char *cam, int full, int quality, int lamp, unsigned char **jpeg,
                        size_t *len, char *ctype, size_t clen, char *out, size_t olen)
 {
-    (void)ctx; (void)cam; (void)full; (void)quality; (void)jpeg; (void)len;
+    (void)ctx; (void)cam; (void)full; (void)quality; (void)lamp; (void)jpeg; (void)len;
     (void)ctype; (void)clen; (void)out; (void)olen;
     return 200;                                     /* the broker never calls it in this test */
 }
@@ -363,8 +363,22 @@ int main(void)
         snprintf(text, sizeof(text), "POST /v0/camera HTTP/1.1\r\nContent-Type: application/json\r\n"
                                      "Content-Length: %zu\r\n\r\n%s", strlen(want), want);
         rc = call(&looker, &hold, text);
-        CHECK(rc == API_SHOOT && shot.full == 1 && shot.quality == 80,
-              "the whole frame at a quality it named: %d full %d q %d", rc, shot.full, shot.quality);
+        CHECK(rc == API_SHOOT && shot.full == 1 && shot.quality == 80 && shot.lamp == -1,
+              "the whole frame at a quality it named, the lamp left alone: %d full %d q %d lamp %d", rc,
+              shot.full, shot.quality, shot.lamp);
+
+        /* The camera's lamp for this frame, at each end of its range. */
+        static const struct { const char *json; int lamp; } lamps[] = {
+            { "{\"camera\": \"lid\", \"lamp\": 0}", 0 },
+            { "{\"camera\": \"lid\", \"lamp\": 60}", 60 },
+            { "{\"camera\": \"lid\", \"resolution\": \"full\", \"lamp\": 1023}", 1023 },
+        };
+        for (size_t i = 0; i < sizeof(lamps) / sizeof(lamps[0]); i++) {
+            snprintf(text, sizeof(text), "POST /v0/camera HTTP/1.1\r\nContent-Type: application/json\r\n"
+                     "Content-Length: %zu\r\n\r\n%s", strlen(lamps[i].json), lamps[i].json);
+            rc = call(&looker, &hold, text);
+            CHECK(rc == API_SHOOT && shot.lamp == lamps[i].lamp, "%s: %d lamp %d", lamps[i].json, rc, shot.lamp);
+        }
 
         /* The head camera is a capability of its own. */
         want = "{\"camera\": \"head\"}";
@@ -384,7 +398,11 @@ int main(void)
             { "{\"camera\": \"lid\", \"resolution\": \"huge\"}", "a resolution there is none of" },
             { "{\"camera\": \"lid\", \"quality\": 0}", "a quality below the range" },
             { "{\"camera\": \"lid\", \"quality\": 101}", "a quality above the range" },
-            { "{\"camera\": \"lid\", \"lamp\": 500}", "a key the form does not have" },
+            { "{\"camera\": \"lid\", \"lamp\": 1024}", "a lamp above the range" },
+            { "{\"camera\": \"lid\", \"lamp\": -1}", "a lamp below the range" },
+            { "{\"camera\": \"lid\", \"lamp\": \"60\"}", "a lamp that is no number" },
+            { "{\"camera\": \"lid\", \"lamp\": 6.5}", "a lamp that is no whole number" },
+            { "{\"camera\": \"lid\", \"flash\": 1}", "a key the form does not have" },
             { "{\"camera\": \"lid\", \"camera\": \"head\"}", "a key twice" },
             { "[\"lid\"]", "an array" },
         };

@@ -177,8 +177,11 @@ int api_events_answer(evfeed_t *feed, unsigned long since, char *body, size_t bl
                                           "connected", feed ? evfeed_connected(feed) : 0, "events", list));
 }
 
-/* {"camera": "lid"|"head", "resolution": "full"|"half", "quality": n}:
- * those three keys, the camera required, and no other. */
+/* {"camera": "lid"|"head", "resolution": "full"|"half", "quality": n, "lamp": n}:
+ * those four keys, the camera required, and no other. The lamp is the
+ * camera's own light for this one frame (the machine puts its level back
+ * after it): a head-camera picture of light wood wants little of it and a
+ * dark material a lot. */
 static int shot_from(const httpreq_t *req, api_shot_t *out, const char **why)
 {
     json_error_t je;
@@ -190,6 +193,7 @@ static int shot_from(const httpreq_t *req, api_shot_t *out, const char **why)
     memset(out, 0, sizeof(*out));
     out->full = 0;                                  /* half a frame unless it asks for the whole */
     out->quality = 0;                               /* the machine's own default */
+    out->lamp = -1;                                 /* and its own lamp level */
     *why = "the body is a JSON object: {\"camera\": \"lid\", \"resolution\": \"half\"}";
     if (!json_is_object(j)) {
         json_decref(j);
@@ -205,9 +209,12 @@ static int shot_from(const httpreq_t *req, api_shot_t *out, const char **why)
         } else if (strcmp(key, "quality") == 0 && json_is_integer(v)
                    && json_integer_value(v) >= 1 && json_integer_value(v) <= 100) {
             out->quality = (int)json_integer_value(v);
+        } else if (strcmp(key, "lamp") == 0 && json_is_integer(v)
+                   && json_integer_value(v) >= 0 && json_integer_value(v) <= 1023) {
+            out->lamp = (int)json_integer_value(v);
         } else {
-            *why = "the body holds camera (lid or head), resolution (full or half), and quality "
-                   "(1 to 100), and nothing else";
+            *why = "the body holds camera (lid or head), resolution (full or half), quality "
+                   "(1 to 100), and lamp (0 to 1023), and nothing else";
             bad = 1;
             break;
         }
@@ -556,7 +563,7 @@ static void *camera_thread(void *arg)
         unsigned char *jpeg = NULL;
         size_t len = 0;
         char ctype[64] = "", body[1024];
-        int status = fn ? fn(ctx, shot.cam, shot.full, shot.quality, &jpeg, &len, ctype, sizeof(ctype),
+        int status = fn ? fn(ctx, shot.cam, shot.full, shot.quality, shot.lamp, &jpeg, &len, ctype, sizeof(ctype),
                              body, sizeof(body))
                         : 502;
         if (!fn)

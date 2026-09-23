@@ -473,7 +473,7 @@ static int job_call(void *ctx, const char *id, const char *program, const char *
  * person standing at the machine, so it yields to an operator who is
  * watching rather than stuttering their stream. Runs on the broker's
  * camera thread. */
-static int camera_call(void *ctx, const char *cam, int full, int quality,
+static int camera_call(void *ctx, const char *cam, int full, int quality, int lamp,
                        unsigned char **jpeg, size_t *len, char *ctype, size_t clen,
                        char *out, size_t olen)
 {
@@ -482,7 +482,9 @@ static int camera_call(void *ctx, const char *cam, int full, int quality,
     int n = snprintf(path, sizeof(path), "/cam/snapshot?cam=%.8s&res=%s&background=1",
                      cam, full ? "full" : "half");
     if (quality > 0 && n > 0 && (size_t)n < sizeof(path))
-        snprintf(path + n, sizeof(path) - (size_t)n, "&q=%d", quality);
+        n += snprintf(path + n, sizeof(path) - (size_t)n, "&q=%d", quality);
+    if (lamp >= 0 && n > 0 && (size_t)n < sizeof(path))
+        snprintf(path + n, sizeof(path) - (size_t)n, "&lamp=%d", lamp);
 
     int rc = machine_get_blob(&cfg->machine, path, jpeg, len, ctype, clen);
     if (rc == 0 && *len > 2 && (*jpeg)[0] == 0xff && (*jpeg)[1] == 0xd8)
