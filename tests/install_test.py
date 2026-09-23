@@ -11,10 +11,12 @@ the three tiers and what each needs from the operator, the product gate
 in both of its directions, a firmware key on an extension, a payload that
 is not the one the signed metadata names, payloads that try to leave the
 package, the namespace, key pinning across an update, the capability diff,
-conflicts, the budget, the integrity check, removal, and the wipe a change
-of owner takes (every package, everything under data/, every key the owner
-added). After every refusal the root holds nothing the refused archive
-brought.
+conflicts, the budget, the integrity check, removal, the wipe a change of
+owner takes (every package, everything under data/, every key the owner
+added), and the signed index (kept only under the OpenGlow extension key,
+held to its form, endorsing its author key for one id and no other, and a
+listing withdrawn). After every refusal the root holds nothing the refused
+archive brought.
 
     python3 tests/install_test.py [-v]
 
@@ -245,6 +247,92 @@ def operator_destinations(t):
     r = t.run("dest", D, "add", "plug.lan:80")
     check(r.get("ok") is False and "does not ask for destinations" in (r.get("error") or ""), "and takes none -> %s" % r.get("error"))
     check(t.run("remove", D).get("ok") is True, "the package goes")
+
+
+def the_index(t):
+    """The signed index: verified only under the OpenGlow extension key, held to its form, and binding an id
+    to an author key that the owner never added - for that id and no other."""
+    ffx = os.path.join(HERE, "..", "tools", "ffx")
+    adir = t.path("author")
+    os.mkdir(adir)
+    subprocess.run([FWUP, "-g"], cwd=adir, check=True, capture_output=True)
+    t.keys["author"] = os.path.join(adir, "fwup-key.priv")
+    listed = t.pack(t.tree(manifest("org.example.listed"), RUN), "author")
+    other = t.pack(t.tree(manifest("org.example.other"), RUN), "author")
+    r = t.run("inspect", listed)
+    check(r.get("tier") == "unverified", "an author's key the owner never added: unverified (%s)" % r.get("tier"))
+    check(t.run("index").get("index") is None, "no index is kept yet")
+
+    def build(entries, key="official", out_name="index.ffi"):
+        d = t.path("listing")
+        os.mkdir(d)
+        for e in entries:
+            shutil.copy(e["path"], os.path.join(d, os.path.basename(e["path"])))
+        shutil.copy(t.pub("author"), os.path.join(d, "author.pub"))
+        listing = os.path.join(d, "listing.json")
+        with open(listing, "w") as f:
+            json.dump({"packages": [{"file": os.path.basename(e["path"]), "url": "https://example.org/" + os.path.basename(e["path"]),
+                                     **({"key": "author.pub"} if e.get("key") else {})} for e in entries]}, f)
+        out = os.path.join(d, out_name)
+        p = subprocess.run([sys.executable, "-B", ffx, "index", "build", listing, "--version", "2026.9.1", "--out", out]
+                           + (["--key", t.keys[key]] if key else []), capture_output=True, text=True, env=dict(os.environ, FWUP=FWUP))
+        check(p.returncode == 0, "ffx index build: %s" % p.stderr.strip())
+        return out
+
+    idx = build([{"path": listed, "key": True}])
+    r = t.run("index-verify", idx)
+    check(r.get("ok") is True and r.get("packages") == 1 and r.get("version") == "2026.9.1", "the index is kept: %s" % r)
+    kept = (t.run("index").get("index") or {}).get("packages") or [{}]
+    check(kept[0].get("id") == "org.example.listed" and len(kept[0].get("key_id", "")) == 64 and kept[0].get("size", 0) > 0,
+          "and read back, with the endorsed key's id: %s" % kept[0])
+    r = t.run("inspect", listed)
+    check(r.get("tier") == "community" and r.get("endorsed") is True, "the listed package, signed by its endorsed key: "
+          "community, endorsed (%s %s)" % (r.get("tier"), r.get("endorsed")))
+    r = t.run("inspect", other)
+    check(r.get("tier") == "unverified" and r.get("endorsed") is False,
+          "the same key on another id counts for nothing: %s" % r.get("tier"))
+    r = t.run("install", listed, "--consent-community")
+    check(r.get("ok") is True and r.get("tier") == "community", "it installs as community: %s" % r.get("error", r.get("tier")))
+
+    # An index the host does not keep, each refused in its words, the kept one left as it was.
+    for key, words in (("owner", "not signed with the OpenGlow extension key"), (None, "not signed with the OpenGlow")):
+        r = t.run("index-verify", build([{"path": listed, "key": True}], key=key))
+        check(r.get("ok") is False and words in (r.get("error") or ""), "an index signed by %s -> %s" % (key or "nobody", r.get("error")))
+    r = t.run("index-verify", listed)
+    check(r.get("ok") is False and "product" in (r.get("error") or ""), "a package given as the index -> %s" % r.get("error"))
+
+    def raw_index(doc, extra=None):
+        members = [member("index.json", json.dumps(doc).encode())] + (extra or [])
+        return t.pack_raw(t.tar(members), "2026.9.2", "official", product="ForgeFIRM extension index")
+    good = dict(kept[0])
+    good.pop("key_id", None)
+    for doc, words in (({"index": 2, "packages": []}, "an index is"),
+                       ({"index": 1, "packages": [good, good]}, "lists org.example.listed twice"),
+                       ({"index": 1, "packages": [dict(good, url="http://example.org/x.ffx")]}, "https://"),
+                       ({"index": 1, "packages": [dict(good, url="https://user:pw@example.org/x.ffx")]}, "no user or password"),
+                       ({"index": 1, "packages": [dict(good, sha256="ABC")]}, "sha256"),
+                       ({"index": 1, "packages": [dict(good, id="org.openglow.fake")]}, "OpenGlow's namespace"),
+                       ({"index": 1, "packages": [{k: v for k, v in good.items() if k != "key"}]}, "author's public key"),
+                       ({"index": 1, "packages": [dict(good, key="bm90IGEga2V5IGF0IGFsbCwgbm90IGFueSBvZiBpdCEhIQ==")]},
+                        "no Ed25519 public key"),
+                       ({"index": 1, "packages": [dict(good, capabilities=["role:homing"])]}, "role")):
+        r = t.run("index-verify", raw_index(doc))
+        check(r.get("ok") is False and words in (r.get("error") or ""), "%s -> %s" % (words, r.get("error")))
+    r = t.run("index-verify", raw_index({"index": 1, "packages": []}, [member("extra.txt", b"x")]))
+    check(r.get("ok") is False and "nothing else" in (r.get("error") or ""), "an index with a second file -> %s" % r.get("error"))
+    check(((t.run("index").get("index") or {}).get("packages") or [{}])[0].get("id") == "org.example.listed",
+          "every refused index left the kept one as it was")
+
+    # Withdrawn: the installed version stays, and an update no longer reads as community.
+    idx = build([])
+    r = t.run("index-verify", idx)
+    check(r.get("ok") is True and r.get("packages") == 0, "an index that lists nothing: %s" % r)
+    update = t.pack(t.tree(manifest("org.example.listed", version="1.1.0"), RUN), "author")
+    r = t.run("inspect", update)
+    check(r.get("ok") is False and "signed by the key that signed the installed version" in (r.get("error") or ""),
+          "withdrawn: the update is unverified now, and the pinned key refuses it -> %s" % r.get("error"))
+    check("org.example.listed" in [p["id"] for p in t.run("list")["packages"]], "and the installed version stays")
+    check(t.run("remove", "org.example.listed").get("ok") is True, "the package goes")
 
 
 def main():
@@ -546,6 +634,9 @@ def run_all(w, top):
 
     print("destinations the operator names")
     operator_destinations(w)
+
+    print("the signed index")
+    the_index(w)
 
     print("a change of owner takes everything the last one left")
     wipe(w, root, keydir)

@@ -47,6 +47,7 @@ void ext_env_defaults(ext_env_t *env)
     env->trust.fwup = "fwup";
     env->trust.official_key = KEY_EXT_OFFICIAL;
     env->trust.owner_keys_dir = EXT_ROOT_DEFAULT "/keys";
+    env->trust.endorsed_dir = EXT_ROOT_DEFAULT "/index/keys";
     env->trust.firmware_keys[0] = KEY_FW_RELEASE;
     env->trust.firmware_keys[1] = KEY_FW_FACTORY;
     env->budget_bytes = EXT_BUDGET_DEFAULT;
@@ -405,6 +406,12 @@ static int stage(const ext_env_t *env, const char *file, state_t *st, install_re
         rc = pkg_unpack(payload, tree, list, &res->tree, err, elen);
     if (rc == 0)
         rc = manifest_load(mf, &res->manifest, err, elen);
+    if (rc == 0 && res->info.endorsed_id[0] && strcmp(res->info.endorsed_id, res->manifest.id) != 0) {
+        /* A key the index endorses for another id: for this one it is
+         * nobody's, and the archive is judged as signed by nobody. */
+        res->info.tier = TIER_UNVERIFIED;
+        res->info.key_id[0] = res->info.key_file[0] = res->info.endorsed_id[0] = '\0';
+    }
     if (rc == 0)
         rc = judge_exec(tree, &res->manifest, err, elen);
     if (rc == 0)

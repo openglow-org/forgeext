@@ -10,11 +10,13 @@ directory, packed unsigned by tools/mkffx.sh, is judged by the built
 `forgeext inspect`: the two must agree on every verdict, and where the host
 refuses a manifest the words must be the host's. Then `ffx pack` builds an
 archive the host takes, the same bytes twice over; `ffx new` makes a package
-for each runtime that lints as its template says; and `ffx keygen` refuses to
-overwrite a key.
+for each runtime that lints as its template says; `ffx keygen` refuses to
+overwrite a key; and `ffx index build` makes an index the host keeps, the
+same bytes twice over, and refuses a listing out of form.
 
 Needs fwup (FWUP) and the built forgeext (FORGEEXT). Exits 77 without them.
 """
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -468,6 +470,60 @@ def main():
             if runtime == "native":
                 check("entry point, bin/run" in why and os.path.isfile(os.path.join(d, "src", "ffx.h")),
                       "and says so, with ffx.h beside its source: %s", why)
+
+        print("ffx index build: the listing's archives, as the host keeps them")
+        idx = os.path.join(top, "idx")
+        os.mkdir(idx)
+        shutil.copyfile(signed, os.path.join(idx, "fixture.ffx"))
+        shutil.copyfile(key + ".pub", os.path.join(idx, "author.pub"))
+        off = build(top, "an official one", with_(id="org.openglow.fixture"), {})
+        subprocess.run(["sh", os.path.join(TOOLS, "mkffx.sh"), off, os.path.join(idx, "official.ffx")], check=True,
+                       capture_output=True, env=env)
+        ogkey = os.path.join(top, "openglow")
+        check(ffx.main(["keygen", ogkey]) == 0, "a stand-in for the OpenGlow extension key")
+
+        def index_build(entries, out, signer=None):
+            with open(os.path.join(idx, "listing.json"), "w") as f:
+                json.dump({"packages": entries}, f)
+            p = subprocess.run([sys.executable, "-B", os.path.join(TOOLS, "ffx"), "index", "build",
+                                os.path.join(idx, "listing.json"), "--version", "2026.9.23", "--out", out]
+                               + (["--key", signer + ".priv"] if signer else []), capture_output=True, text=True, env=env)
+            return p.returncode, (p.stdout + p.stderr).strip()
+
+        def host(*args):
+            p = subprocess.run([FORGEEXT, "--root", root, "--fwup", FWUP, "--no-reserve", "--official-key", ogkey + ".pub"]
+                               + list(args), capture_output=True, text=True)
+            try:
+                return json.loads(p.stdout)
+            except ValueError:
+                return {"ok": None, "error": p.stdout + p.stderr}
+        fx = {"file": "fixture.ffx", "url": "https://example.org/fixture.ffx"}
+        og = {"file": "official.ffx", "url": "https://example.org/official.ffx"}
+        out = os.path.join(top, "index.ffi")
+        for entries, words in (([fx], "names no author key"), ([dict(og, key="author.pub")], "endorses no key"),
+                               ([dict(fx, key="author.pub"), dict(fx, key="author.pub")], "twice")):
+            rc, said = index_build(entries, out)
+            check(rc == 1 and words in said and not os.path.exists(out), "refused, and nothing written: %s", said)
+        listing = [dict(fx, key="author.pub"), og]
+        i1, i2 = os.path.join(top, "i1.ffi"), os.path.join(top, "i2.ffi")
+        for o in (i1, i2):
+            rc, said = index_build(listing, o, ogkey)
+            check(rc == 0 and "2 packages" in said, "built and signed: %s", said)
+        check(open(i1, "rb").read() == open(i2, "rb").read(), "two builds of one listing are one index")
+        r = host("index-verify", i1)
+        check(r.get("ok") is True and r.get("packages") == 2 and r.get("version") == "2026.9.23", "the host keeps it: %s", r)
+        kept = {p["id"]: p for p in (host("index").get("index") or {}).get("packages", [])}
+        data = open(signed, "rb").read()
+        mine = kept.get("org.example.fixture", {})
+        check(mine.get("sha256") == hashlib.sha256(data).hexdigest() and mine.get("size") == len(data)
+              and mine.get("key") == open(key + ".pub").read().strip() and mine.get("name") == "Fixture"
+              and mine.get("capabilities") == ["machine.read"], "the entry is the archive's own: %s", mine)
+        check("key" not in kept.get("org.openglow.fixture", {"key": 1}), "the official entry names no key")
+        rc, said = index_build(listing, out)
+        check(rc == 0 and "UNSIGNED" in said, "unsigned, it says so: %s", said)
+        r = host("index-verify", out)
+        check(r.get("ok") is False and "not signed" in (r.get("error") or ""), "and the host keeps none of it: %s",
+              r.get("error"))
 
         machine_client(ffx, top, a1)
     finally:

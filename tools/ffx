@@ -10,6 +10,7 @@
     ffx keygen NAME
     ffx install FILE --machine ADDR [--user NAME] [--grant CAPABILITY]...
     ffx logs --machine ADDR [--user NAME] [--id ID] [--follow]
+    ffx index build LISTING --version V [--key KEY.priv] --out FILE
 
 `lint` judges a package the way the machine's extension host does, in its
 words, and stops where it would: the manifest, the capabilities, the page,
@@ -19,7 +20,8 @@ the archive with fwup (the same one a machine verifies with), signs it when
 given a key, and checks the signature before it says so. `install` logs in
 to a machine over HTTPS, uploads, shows what the machine says the package is
 and asks for, and installs with the consent its tier takes. `logs` reads the
-extension host's log, a package's lines alone with --id.
+extension host's log, a package's lines alone with --id. `index build` is
+OpenGlow's: the signed index of the catalog, from a listing of archives.
 
 Extension API 0.1. Python 3.8 or later and the standard library; fwup for
 pack and keygen (set FWUP to its path).
@@ -759,6 +761,92 @@ def cmd_pack(a):
     return 0
 
 
+# ---------------------------------------------------------------- the index
+
+INDEX_PRODUCT = "ForgeFIRM extension index"
+
+
+def archive_manifest(path):
+    """The manifest inside an .ffx: its payload's manifest.json, read out of the archive as it is."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            data = z.read("data/payload.tar.gz")
+    except (OSError, KeyError, zipfile.BadZipFile) as e:
+        raise Refused("%s is not an extension archive: %s" % (path, e))
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
+        # mkffx.sh writes the members as ./path, a packer by hand may not.
+        info = next((i for i in t.getmembers() if i.isfile() and i.name in ("manifest.json", "./manifest.json")), None)
+        f = t.extractfile(info) if info else None
+        if f is None:
+            raise Refused("%s holds no manifest.json" % path)
+        return judge_manifest(f.read())
+
+
+def cmd_index_build(a):
+    """The signed index from a listing: {"packages": [{"file": "x.ffx", "url": "https://...", "key": "author.pub"}]}.
+    Each entry's id, name, version, and the rest come from the archive's own manifest; its sha256 and size from its
+    bytes; the author's public key from the named file (none for an id in OpenGlow's namespace)."""
+    listing = json.load(open(a.listing, encoding="utf-8"))
+    base = os.path.dirname(os.path.abspath(a.listing))
+    out_pkgs, seen = [], set()
+    for e in listing.get("packages", []):
+        path = os.path.join(base, e["file"])
+        m = archive_manifest(path)
+        if m["id"] in seen:
+            raise Refused("the listing names %s twice" % m["id"])
+        seen.add(m["id"])
+        data = open(path, "rb").read()
+        entry = {"id": m["id"], "name": m["name"], "version": m["version"], "author": m["author"],
+                 "url": e["url"], "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+                 "capabilities": list(m.get("capabilities") or [])}
+        for k in ("description", "license", "homepage"):
+            if m.get(k):
+                entry[k] = m[k]
+        official = m["id"].startswith(("org.openglow.", "org.forgefirm."))
+        if e.get("key") and official:
+            raise Refused("%s is in OpenGlow's namespace: the index endorses no key for it" % m["id"])
+        if e.get("key"):
+            entry["key"] = open(os.path.join(base, e["key"]), encoding="ascii").read().strip()
+        elif not official:
+            raise Refused("%s: the listing names no author key for it" % m["id"])
+        out_pkgs.append(entry)
+    doc = {"index": 1, "packages": out_pkgs}
+    fwup = fwup_bin()
+    work = tempfile.mkdtemp(prefix="ffx-index-")
+    try:
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as t:
+            text = (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode()
+            info = tarfile.TarInfo("index.json")
+            info.size, info.mode, info.mtime, info.uname, info.gname = len(text), 0o644, 0, "root", "root"
+            t.addfile(info, io.BytesIO(text))
+        pl = os.path.join(work, "payload.tar.gz")
+        with open(pl, "wb") as f:
+            with gzip.GzipFile(fileobj=f, mode="wb", compresslevel=9, mtime=0, filename="") as gz:
+                gz.write(raw.getvalue())
+        conf = os.path.join(work, "fwup.conf")
+        with open(conf, "w") as f:
+            f.write('meta-product = "%s"\nmeta-description = "the listed packages"\nmeta-version = "%s"\n'
+                    'meta-platform = "forgefirm-ext"\nfile-resource payload.tar.gz {\n    host-path = "%s"\n}\n'
+                    % (INDEX_PRODUCT, a.version, pl.replace("\\", "/")))
+        unsigned = os.path.join(work, "index.ffi")
+        subprocess.run([fwup, "-c", "-f", conf, "-o", unsigned], check=True, capture_output=True)
+        if a.key:
+            signed = os.path.join(work, "signed.ffi")
+            subprocess.run([fwup, "-S", "-s", a.key, "-i", unsigned, "-o", signed], check=True, capture_output=True)
+            shutil.copyfile(signed, a.out)
+        else:
+            shutil.copyfile(unsigned, a.out)
+        print("%s: %d package%s, version %s%s" % (a.out, len(out_pkgs), "" if len(out_pkgs) == 1 else "s", a.version,
+                                                  "" if a.key else " (UNSIGNED: no machine keeps it)"))
+    except subprocess.CalledProcessError as e:
+        raise Refused("fwup failed: %s" % (e.stderr or b"").decode("utf-8", "replace").strip())
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return 0
+
+
 def cmd_keygen(a):
     fwup = fwup_bin()
     for ext in (".pub", ".priv"):
@@ -976,6 +1064,14 @@ def main(argv=None):
     p.add_argument("--key", help="the private key (NAME.priv from ffx keygen); its NAME.pub must be beside it")
     p.add_argument("--out")
     p.set_defaults(fn=cmd_pack)
+    p = sub.add_parser("index", help="the signed index: build one from a listing")
+    isub = p.add_subparsers(dest="icmd", required=True)
+    q = isub.add_parser("build")
+    q.add_argument("listing", help='{"packages": [{"file": "x.ffx", "url": "https://...", "key": "author.pub"}]}')
+    q.add_argument("--version", required=True, help="the index's own version")
+    q.add_argument("--key", help="the OpenGlow extension key's private half: no machine keeps an index signed otherwise")
+    q.add_argument("--out", required=True)
+    q.set_defaults(fn=cmd_index_build)
     p = sub.add_parser("keygen", help="an Ed25519 key pair for signing")
     p.add_argument("name")
     p.set_defaults(fn=cmd_keygen)

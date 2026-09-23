@@ -26,6 +26,7 @@
 #include <stddef.h>
 
 #define PKG_PRODUCT          "ForgeFIRM extension"
+#define PKG_INDEX_PRODUCT    "ForgeFIRM extension index"    /* the signed index (index.h) */
 #define PKG_MAX_ARCHIVE      (32LL * 1024 * 1024)   /* the .ffx itself */
 #define PKG_MAX_UNPACKED     (64LL * 1024 * 1024)   /* every file of the payload together */
 #define PKG_MAX_FILE         (32LL * 1024 * 1024)
@@ -45,6 +46,7 @@ typedef struct {
     const char *fwup;               /* the fwup binary; NULL is "fwup" on PATH */
     const char *official_key;       /* the image's extension public key; NULL or absent file: no official tier */
     const char *owner_keys_dir;     /* owner-added public keys (*.pub); may be NULL */
+    const char *endorsed_dir;       /* keys the verified index endorses, one per package id (<id>.pub); may be NULL */
     const char *firmware_keys[4];   /* files or directories of keys that sign firmware, NULL-ended */
 } pkg_trust_t;
 
@@ -55,6 +57,8 @@ typedef struct {
     char version[33];               /* meta-version */
     char payload_b2[65];            /* blake2b-256 of payload.tar.gz, from the verified meta.conf */
     long long payload_len;
+    char endorsed_id[64];           /* the id the signing key is endorsed for, when an endorsed key verified it;
+                                     * the install holds the manifest's id to it */
 } pkg_info_t;
 
 typedef struct {
@@ -70,6 +74,11 @@ const char *pkg_tier_name(pkg_tier_t t);
  * file is left behind. */
 int pkg_open(const pkg_trust_t *trust, const char *file, const char *out_payload,
              pkg_info_t *info, char *err, size_t elen);
+
+/* The same for an archive of another product: the index, which is the
+ * same container. */
+int pkg_open_product(const pkg_trust_t *trust, const char *file, const char *product, const char *out_payload,
+                     pkg_info_t *info, char *err, size_t elen);
 
 /* Unpack payload.tar.gz into dest, a directory that exists and is empty.
  * Regular files and directories only, every path inside dest, modes

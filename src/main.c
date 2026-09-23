@@ -18,6 +18,7 @@
 #include "caps.h"
 #include "cgroup.h"
 #include "fflog.h"
+#include "index.h"
 #include "install.h"
 #include "manifest.h"
 #include "netrules.h"
@@ -46,6 +47,8 @@ static int usage(void)
             "  call <id> GET|POST <path> [json] [--call-dir <dir>] [--cg-parent <dir>]\n"
             "                                     one call from the package's page to its own service\n"
             "  caps                               the capabilities a manifest may ask for\n"
+            "  index-verify <file.ffi>            verify the signed index and keep it: its listing and its endorsed keys\n"
+            "  index                              the index this host keeps\n"
             "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
             "      [--run-dir <dir>] [--holds-dir <dir>] [--api-dir <dir>] [--call-dir <dir>] [--landlock-fs-only]\n"
             "      [--ticks <n>]\n"
@@ -119,6 +122,9 @@ static json_t *result_json(install_result_t *r)
     json_object_set_new(j, "package", manifest_json(&r->manifest));
     json_object_set_new(j, "tier", json_string(pkg_tier_name(r->info.tier)));
     json_object_set_new(j, "key", json_string(r->info.key_id));
+    /* The key is the one the signed index endorses for this id, and no
+     * key of the owner's: what makes it community here. */
+    json_object_set_new(j, "endorsed", json_boolean(r->info.endorsed_id[0] != '\0'));
     json_object_set_new(j, "files", json_integer(r->tree.files));
     json_object_set_new(j, "bytes", json_integer(r->tree.bytes));
     json_object_set_new(j, "update", json_boolean(r->update));
@@ -220,7 +226,7 @@ static int cmd_list(const ext_env_t *env, const char *only, int check)
 
 int main(int argc, char **argv)
 {
-    char err[768] = "", keys_dir[512];
+    char err[768] = "", keys_dir[512], endorsed_dir[512];
     ext_env_t env;
     net_env_t net = { NULL };
     int i = 1, nfw = 0;
@@ -245,6 +251,8 @@ int main(int argc, char **argv)
             env.root = val;
             snprintf(keys_dir, sizeof(keys_dir), "%s/keys", val);
             env.trust.owner_keys_dir = keys_dir;
+            snprintf(endorsed_dir, sizeof(endorsed_dir), "%s/index/keys", val);
+            env.trust.endorsed_dir = endorsed_dir;
         } else if (strcmp(opt, "--fwup") == 0) {
             env.trust.fwup = val;
         } else if (strcmp(opt, "--nft") == 0) {
@@ -537,6 +545,24 @@ int main(int argc, char **argv)
         json_object_set_new(obj, "id", json_string(id));
         json_object_set_new(obj, "status", json_integer(status));
         json_object_set_new(obj, "body", ans);
+        return answer(obj, 1);
+    }
+    if (strcmp(cmd, "index-verify") == 0 && i < argc) {
+        int n = 0;
+        char version[40];
+        if (index_install(&env, argv[i], &n, version, sizeof(version), err, sizeof(err)) != 0) {
+            fflog(LOG_WARNING, "the index %s was refused: %s", argv[i], err);
+            return refuse(err);
+        }
+        fflog(LOG_NOTICE, "the index %s is kept: %d package%s", version, n, n == 1 ? "" : "s");
+        json_t *obj = json_object();
+        json_object_set_new(obj, "version", json_string(version));
+        json_object_set_new(obj, "packages", json_integer(n));
+        return answer(obj, 1);
+    }
+    if (strcmp(cmd, "index") == 0) {
+        json_t *obj = json_object(), *doc = index_read(&env);
+        json_object_set_new(obj, "index", doc ? doc : json_null());
         return answer(obj, 1);
     }
     if (strcmp(cmd, "keys") == 0) {

@@ -8,6 +8,8 @@
 #define _GNU_SOURCE
 #include "pkg.h"
 
+#define INDEX_KEYS_SCAN 256                             /* index.h's INDEX_MAX_PKGS: one endorsed key per id */
+
 #include <archive.h>
 #include <archive_entry.h>
 #include <ctype.h>
@@ -356,6 +358,12 @@ static long long entry_to_buf(struct archive *a, unsigned char *buf, size_t max)
 int pkg_open(const pkg_trust_t *trust, const char *file, const char *out_payload,
              pkg_info_t *info, char *err, size_t elen)
 {
+    return pkg_open_product(trust, file, PKG_PRODUCT, out_payload, info, err, elen);
+}
+
+int pkg_open_product(const pkg_trust_t *trust, const char *file, const char *product, const char *out_payload,
+                     pkg_info_t *info, char *err, size_t elen)
+{
     unsigned char sig[crypto_sign_BYTES + 1], *meta = NULL, h[32];
     char text[4096], value[128], owner[PKG_MAX_KEYS][256];
     int have_sig = 0, have_meta = 0, have_payload = 0, out_fd = -1, rc = -1;
@@ -460,8 +468,8 @@ int pkg_open(const pkg_trust_t *trust, const char *file, const char *out_payload
     }
 
     /* 2. The product gate. */
-    if (strcmp(m.product, PKG_PRODUCT) != 0) {
-        fail(err, elen, "the archive's product is \"%.40s\", not \"" PKG_PRODUCT "\"", m.product);
+    if (strcmp(m.product, product) != 0) {
+        fail(err, elen, "the archive's product is \"%.40s\", not \"%s\"", m.product, product);
         goto out;
     }
 
@@ -486,6 +494,18 @@ int pkg_open(const pkg_trust_t *trust, const char *file, const char *out_payload
                     info->tier = TIER_COMMUNITY;
                     by = owner[i];
                 }
+            /* A key the verified index endorses, for the one id its file is
+             * named after: community for that id, which the install holds
+             * the manifest to. */
+            static char endorsed[INDEX_KEYS_SCAN][256];
+            n = by ? 0 : keys_in(trust->endorsed_dir, endorsed, INDEX_KEYS_SCAN);
+            for (int i = 0; i < n && !by; i++)
+                if (signed_by(endorsed[i], sig, meta, (size_t)mlen)) {
+                    info->tier = TIER_COMMUNITY;
+                    by = endorsed[i];
+                    const char *base = strrchr(endorsed[i], '/') ? strrchr(endorsed[i], '/') + 1 : endorsed[i];
+                    snprintf(info->endorsed_id, sizeof(info->endorsed_id), "%.*s", (int)(strlen(base) - 4), base);
+                }
         }
         if (by) {
             snprintf(info->key_file, sizeof(info->key_file), "%.255s", by);
@@ -507,7 +527,7 @@ int pkg_open(const pkg_trust_t *trust, const char *file, const char *out_payload
         fail(err, elen, "fwup does not read the archive's metadata");
         goto out;
     }
-    if (conf_value(text, "meta-product", value, sizeof(value)) != 0 || strcmp(value, PKG_PRODUCT) != 0
+    if (conf_value(text, "meta-product", value, sizeof(value)) != 0 || strcmp(value, product) != 0
         || conf_value(text, "meta-version", value, sizeof(value)) != 0 || strcmp(value, m.version) != 0) {
         fail(err, elen, "fwup reads another product or version out of the archive than this verifier does");
         goto out;
