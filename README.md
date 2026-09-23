@@ -22,6 +22,7 @@ truth for this project. This README is an index card.
 | The extension sandbox the image holds ready: the account pool, the cgroup tree, the deny rules | [Image and BSP](https://docs.forgefirm.org/technical/forgefirm/image-and-bsp/#the-extension-sandbox) |
 | A package's own page and the panel's bridge; the bridge client every page pastes in is `sdk/js/ffx-bridge.js` | [A package's own page](https://docs.forgefirm.org/technical/forgefirm/extensions/#a-packages-own-page) |
 | The official packages, under `packages/`: visual alignment | [Visual alignment](https://docs.forgefirm.org/usage/alignment/) |
+| Notifications and automation, `packages/automation/` (a native service and its page) | [Notifications and automation](https://docs.forgefirm.org/technical/forgefirm/automation/) |
 | How to build and test | [`AGENTS.md`](AGENTS.md) |
 
 ## License

@@ -341,6 +341,50 @@ def main():
         except ffx.Refused as e:
             check("belongs to a service" in str(e), "a page asking for the operator's destinations: %s", e)
 
+        print("a native service: what the machine's loader can run")
+        nat = build(top, "a native service", with_(runtime="native", service={"exec": "bin/run"}, capabilities=[]), {})
+
+        def native_says(path):
+            shutil.copyfile(path, os.path.join(nat, "bin", "run"))
+            os.chmod(os.path.join(nat, "bin", "run"), 0o755)
+            try:
+                ffx.lint(nat)
+                return None
+            except ffx.Refused as e:
+                return str(e)
+        script = os.path.join(top, "run.sh")
+        open(script, "w").write("#!/bin/sh\n")
+        check("not an ELF binary" in (native_says(script) or ""), "a script is no native service: %s", native_says(script))
+        host_cc = shutil.which("cc")
+        if host_cc:
+            src = os.path.join(top, "hello.c")
+            open(src, "w").write("#include <stdio.h>\nint main(void) { puts(\"hello\"); return 0; }\n")
+            subprocess.run([host_cc, "-o", os.path.join(top, "hello-host"), src], check=True, capture_output=True)
+            check("not a 32-bit ARM binary" in (native_says(os.path.join(top, "hello-host")) or ""),
+                  "a binary for this computer is not the machine's: %s", native_says(os.path.join(top, "hello-host")))
+        arm = shutil.which("arm-linux-gnueabihf-gcc")
+        if arm:
+            dyn, stat_ = os.path.join(top, "hello-arm"), os.path.join(top, "hello-arm-static")
+            subprocess.run([arm, "-O2", "-o", dyn, src, "-lm"], check=True, capture_output=True)
+            subprocess.run([arm, "-O2", "-static", "-o", stat_, src], check=True, capture_output=True)
+            check(native_says(dyn) is None, "linked against the C library alone: taken (%s)", native_says(dyn))
+            check(native_says(stat_) is None, "static: taken (%s)", native_says(stat_))
+            b = bytearray(open(dyn, "rb").read())
+            i = b.find(b"libc.so.6\0")
+            b[i:i + 9] = b"libq.so.6"
+            open(dyn + ".other", "wb").write(b)
+            check("libq.so.6, which the machine does not promise" in (native_says(dyn + ".other") or ""),
+                  "a library the machine does not promise: %s", native_says(dyn + ".other"))
+            b = bytearray(open(dyn, "rb").read())
+            i = b.find(b"GLIBC_2.")
+            j = b.index(b"\0", i)
+            b[i:j] = (b"GLIBC_9.9" + b"9" * 64)[:j - i]
+            open(dyn + ".newer", "wb").write(b)
+            check("and the machine carries 2.39" in (native_says(dyn + ".newer") or ""),
+                  "a newer C library than the machine's: %s", native_says(dyn + ".newer"))
+        else:
+            print("  note: no arm-linux-gnueabihf-gcc here: the ARM binaries are not tried")
+
         print("ffx lint against forgeext inspect, fixture by fixture")
         for name, manifest, extra in FIXTURES:
             d = build(top, name, manifest, extra)

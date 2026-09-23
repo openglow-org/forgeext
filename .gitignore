@@ -2,3 +2,5 @@ build/
 build-arm/
 build-host/
 __pycache__/
+packages/automation/bin/
+packages/automation/build/
