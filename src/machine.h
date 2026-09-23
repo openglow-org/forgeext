@@ -39,6 +39,12 @@ typedef struct {
 
 void machine_cfg_defaults(machine_cfg_t *cfg);
 
+/* The armed window alone, as forgectrl's /cool/status says it: 1 open,
+ * 0 closed, -1 when it cannot be read (which the supervisor takes as
+ * open). For a turn on which machine_read() asked nothing because
+ * extensions are off. */
+int machine_armed(const machine_cfg_t *cfg);
+
 /* with_start_facts: also ask what a start needs to know (two more
  * requests); without it may_start is 0. */
 void machine_read(const machine_cfg_t *cfg, machine_t *m, int with_start_facts);

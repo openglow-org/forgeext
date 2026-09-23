@@ -459,6 +459,14 @@ static json_t *get_json(const machine_cfg_t *cfg, const char *path)
     return j;
 }
 
+int machine_armed(const machine_cfg_t *cfg)
+{
+    json_t *cool = get_json(cfg, "/cool/status");
+    int armed = cool && json_is_boolean(json_object_get(cool, "armed")) ? json_is_true(json_object_get(cool, "armed")) : -1;
+    json_decref(cool);
+    return armed;
+}
+
 void machine_read(const machine_cfg_t *cfg, machine_t *m, int with_start_facts)
 {
     char v[32];

@@ -58,7 +58,26 @@ typedef struct {
     api_t api;
     char dropped[SUPER_MAX_SERVICES][64];       /* the advisory holds dropped at the last turn, each said once */
     int ndropped;
+    int window, enabled;                        /* at the last turn: the armed window, and extensions on */
+    double grace_until;                         /* services stop after this: ext.shutdown's second to be read */
 } run_t;
+
+#define SHUTDOWN_GRACE_S 1.0
+
+/* The host's own events, into the ring every package reads beside the
+ * machine's: ext.will_freeze as the armed window opens (a service with
+ * job_time.run reads it at once; a frozen one when it thaws), ext.thawed
+ * as it closes, and ext.shutdown SHUTDOWN_GRACE_S before every service is
+ * stopped - extensions off, safe mode, or the host stopping. The grace is
+ * for the services alone: holds follow the machine's word at once. */
+static void host_event(run_t *r, const char *name, const char *reason)
+{
+    json_t *d = reason ? json_pack("{s:s}", "reason", reason) : json_object();
+    char *text = d ? json_dumps(d, JSON_COMPACT) : NULL;
+    evfeed_add(&r->feed, name, text ? text : "{}");
+    free(text);
+    json_decref(d);
+}
 
 void run_cfg_defaults(run_cfg_t *cfg)
 {
@@ -875,8 +894,32 @@ int run_daemon(const run_cfg_t *cfg)
             }
         }
         super_inputs_t in = { mc.enabled, mc.may_start, mc.armed, mc.mode_cloud, mc.off_reason };
+        int window = mc.enabled && mc.armed != 0;       /* one that cannot be read is open, as the supervisor has it */
+        if (r.enabled && !mc.enabled && !stopping) {
+            host_event(&r, "ext.shutdown", mc.off_reason[0] ? mc.off_reason : "extensions are off");
+            r.grace_until = mono() + SHUTDOWN_GRACE_S;
+        }
+        if (window && !r.window && !stopping)
+            host_event(&r, "ext.will_freeze", NULL);
+        /* Inside the grace the running services are left running - nothing
+         * starts and nothing is stopped yet; an armed window still freezes
+         * them, as it would any other turn. */
+        super_inputs_t tick = in;
+        if (!mc.enabled && mono() < r.grace_until) {
+            tick.enabled = 1;
+            tick.may_start = 0;
+            /* machine_read() asks nothing with extensions off, so the
+             * window is asked for here: a service is frozen inside the
+             * grace for a window that is open or cannot be read, and
+             * never for want of the question. */
+            tick.armed = machine_armed(&cfg->machine);
+        }
         if (!stopping)
-            super_tick(&sv, &in, mono());
+            super_tick(&sv, &tick, mono());
+        if (!window && r.window && mc.enabled && !stopping)
+            host_event(&r, "ext.thawed", NULL);
+        r.window = window;
+        r.enabled = mc.enabled;
         quota_turn(&r, &sv, mono());
         holds_turn(&r, &sv, &in);
         /* The machine's stream is held while somebody reads it and let go
@@ -886,6 +929,11 @@ int run_daemon(const run_cfg_t *cfg)
         write_status(&r, &sv, &mc);
         if (cfg->ticks && ++turns >= cfg->ticks)
             stopping = 1;
+    }
+    if (super_running(&sv)) {
+        host_event(&r, "ext.shutdown", "the extension host is stopping");
+        struct timespec grace = { 1, 0 };
+        nanosleep(&grace, NULL);                        /* the broker's thread answers the polls meanwhile */
     }
     super_stop_all(&sv, "the extension host is stopping");
     holdkeep_stop(&r.holds);

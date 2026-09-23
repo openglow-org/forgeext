@@ -23,7 +23,9 @@ directory in it are refused in words before anything does. A killed service
 comes back. The one that keeps ending is quarantined, and state.json
 remembers it. A fifth package asks for destinations of the operator's: it
 reaches nothing until the operator names the peer, is started again with
-it, reaches it, and loses it again when the operator takes it away.
+it, reaches it, and loses it again when the operator takes it away. A sixth,
+holding events and no grant, reads the host's ext.shutdown before safe mode
+stops it, unfrozen through that last second.
 Safe mode stops everything and leaves no group and no chain. SIGTERM does the
 same and the daemon exits 0.
 
@@ -167,6 +169,24 @@ def dial():
 while True:
     print("opdial dial %s" % dial(), flush=True)
     time.sleep(1)
+'''
+
+# One that follows the feed and keeps every host event it reads.
+LIFE = API_CLIENT + r'''
+import json, os, time
+code, ans = api("POST", "/v0/events", {})
+place = ans.get("next", 0)
+open(os.path.join(os.environ["FFX_DATA"], "ready"), "w").close()
+got = []
+while True:
+    code, ans = api("POST", "/v0/events", {"since": place, "wait": 20})
+    for e in (ans or {}).get("events") or []:
+        if e.get("event", "").startswith("ext."):
+            got.append(e)
+            with open(os.path.join(os.environ["FFX_DATA"], "host.json.new"), "w") as f:
+                json.dump(got, f)
+            os.rename(os.path.join(os.environ["FFX_DATA"], "host.json.new"), os.path.join(os.environ["FFX_DATA"], "host.json"))
+    place = (ans or {}).get("next", place)
 '''
 
 failures = []
@@ -565,6 +585,29 @@ def main():
         st = json.load(open(os.path.join(root, "state.json")))["packages"][oid]
         check(st.get("destinations") == [] and not st.get("quarantined"), "state.json: %s", st)
         check(fx("remove", oid).get("ok") is True and wait_for(lambda: oid not in running(), 10), "and it goes")
+
+        print("the host's own word before it stops a service")
+        lid_ = "org.example.life"
+        package(lid_, "python", LIFE, caps=["events"])
+        check(wait_for(lambda: svc(lid_).get("state") == "running" and os.path.exists(os.path.join(root, "data", lid_, "ready")),
+                       40), "it runs and follows its feed: %s", svc(lid_))
+        time.sleep(1.0)
+        at = mark()
+        open(safe, "w").close()
+        check(wait_for(lambda: svc(lid_).get("state") != "running", 15), "safe mode stops it: %s", svc(lid_))
+        try:
+            host = json.load(open(os.path.join(root, "data", lid_, "host.json")))
+        except (OSError, ValueError):
+            host = []
+        check(host and host[0].get("event") == "ext.shutdown"
+              and str((host[0].get("data") or {}).get("reason", "")).startswith("safe mode"),
+              "it read ext.shutdown, with the reason, before it was stopped: %s", host)
+        check(not since(at, "%s: frozen for the armed window" % lid_),
+              "nobody is frozen in that last second for a window that is not open")
+        os.unlink(safe)
+        check(fx("remove", lid_).get("ok") is True, "and it goes")
+        check(wait_for(lambda: all(s_ in running() for s_ in ("org.example.beat", "org.example.dial", "org.example.jobtime")),
+                       40), "out of safe mode the others run again: %s", running())
 
         print("the operator's switch for one package")
         r = fx("disable", "org.example.crash")
