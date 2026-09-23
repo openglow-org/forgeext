@@ -56,12 +56,23 @@ MC_SERVICE = r'''
 import os, sys
 sys.path.insert(0, os.path.join(os.environ["FFX_PKG"], "lib"))
 import ffx
+check = {"done": False}
 def handle(method, path, body):
     if method == "POST" and path == "/mcode":
         w = body.get("words", {})
         if w.get("P") == 2:
             raise ffx.CallError(409, "the exhaust did not start")
         return {"message": "M%d done with %s" % (body.get("code"), ",".join("%s=%s" % kv for kv in sorted(w.items())))}
+    if method == "GET" and path == "/wizard":
+        return dict(check, title="The exhaust check")
+    if method == "POST" and path == "/wizard/start":
+        return {"log": ["looking for the exhaust"], "phase": "asking", "progress": 50,
+                "prompt": {"kind": "confirm", "id": "fan", "text": "Is the exhaust fan running?"}}
+    if method == "POST" and path == "/wizard/answer":
+        check["done"] = body.get("id") == "fan" and body.get("answer") == "yes"
+        return {"result": {"ok": check["done"], "summary": "the exhaust runs" if check["done"] else "no exhaust"}}
+    if method == "POST" and path == "/wizard/abort":
+        return {}
     raise ffx.CallError(404, "no such call")
 ffx.serve(handle)
 '''
@@ -258,7 +269,8 @@ def main():
             caps=["hold"], grants=["hold"])
     package("org.example.sdkc", "native", "bin/run", {"bin/run": native}, caps=["hold", "machine.read", "ui"], grants=["hold"])
     mc_files = {"bin/run.py": MC_SERVICE, "lib/ffx.py": os.path.join(SDK, "python", "ffx.py")}
-    package("org.example.sdkmc", "python", "bin/run.py", mc_files, caps=["mcode:161", "job_time.run"], grants=["job_time.run"])
+    package("org.example.sdkmc", "python", "bin/run.py", mc_files, caps=["mcode:161", "job_time.run", "wizard"],
+            grants=["job_time.run"])
 
     abi = int(subprocess.run([sys.executable, "-c", "import ctypes;print(ctypes.CDLL(None).syscall(444,None,0,1))"],
                              capture_output=True, text=True).stdout.strip() or 0)
@@ -341,6 +353,34 @@ def main():
                             (("161", '{"P": 1, "P": 2}'), "words are P, Q, and R")):
             r = mc(*args)
             check(r.get("ok") is False and words in (r.get("error") or ""), "mcode %s -> %s", " ".join(args), r.get("error"))
+
+        print("a package's own check on the Setup page (forgeext wizard, ffx.serve)")
+
+        def wz(*args):
+            return fx("wizard", *args, "--call-dir", call_dir, "--cg-parent", CG_PARENT)
+        mc_id = "org.example.sdkmc"
+        r = wz(mc_id, "state")
+        check(r.get("ok") is True and r.get("status") == 200 and r.get("body") == {"done": False, "title": "The exhaust check"},
+              "state: %s", r)
+        r = wz(mc_id, "start")
+        check(r.get("status") == 200 and (r.get("body") or {}).get("prompt", {}).get("id") == "fan", "start: %s", r)
+        r = wz(mc_id, "answer", '{"id": "fan", "answer": "yes"}')
+        check(r.get("status") == 200 and (r.get("body") or {}).get("result") == {"ok": True, "summary": "the exhaust runs"},
+              "answer: %s", r)
+        r = wz(mc_id, "state")
+        check((r.get("body") or {}).get("done") is True, "the package keeps its own result: %s", r)
+        r = wz(mc_id, "abort")
+        check(r.get("status") == 200, "abort: %s", r)
+        for args, words in (((mc_id, "run"), "state, start, answer, or abort"),
+                            ((mc_id, "answer"), "carries the operator's answer"),
+                            ((mc_id, "start", "{}"), "only an answer carries a body"),
+                            ((mc_id, "answer", "[1]"), "carries the operator's answer"),
+                            ((mc_id, "answer", '{"a": 1, "a": 2}'), "carries the operator's answer"),
+                            (("org.example.sdkpy", "state"), "adds no check to the Setup page"),
+                            (("org.example.nothere", "state"), "not installed"),
+                            (("../etc", "state"), "not a package id")):
+            r = wz(*args)
+            check(r.get("ok") is False and words in (r.get("error") or ""), "wizard %s -> %s", " ".join(args), r.get("error"))
 
         print("a page's calls to its own service (forgeext call, ffx.serve)")
         py = "org.example.sdkpy"

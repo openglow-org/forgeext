@@ -294,13 +294,13 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
     snprintf(api_env, sizeof(api_env), "FFX_API=%s", api_path);
     sb.env[0] = api_env;
     /* A package with a page may have its page ask the service, and one
-     * that answers an M-code is asked it the same way: the host binds that
-     * socket where only it can put a name, and the service gets the
-     * listening end alone. */
+     * that answers an M-code or adds a check to the Setup page is asked
+     * the same way: the host binds that socket where only it can put a
+     * name, and the service gets the listening end alone. */
     static char call_env[32];
     char call_path[400];
     int call_fd = -1;
-    if (manifest_has_cap(&m, "ui") || mcodes_of(&m)) {
+    if (manifest_has_cap(&m, "ui") || mcodes_of(&m) || manifest_has_cap(&m, "wizard")) {
         if (call_open(cfg->call_dir, s->id, call_path, sizeof(call_path), &call_fd, err, elen) != 0) {
             api_close(&r->api, s->id);
             close(pfd[0]);

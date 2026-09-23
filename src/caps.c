@@ -27,7 +27,7 @@ static const cap_def_t defs[] = {
     { "hold",           0, 1, 1, "hold a job until it clears the hold" },
     { "job_time.run",   0, 1, 1, "keep running while a job is armed" },
     { "ui",             0, 0, 1, "show its own tab or cards in the control panel" },
-    { "wizard",         0, 0, 0, "add a check to the Setup tab" },
+    { "wizard",         0, 0, 1, "add a check of its own to the Setup page" },
     { "net.outbound",   1, 0, 1, "connect to" },
     { "net.outbound.operator", 0, 0, 1, "connect to the destinations the operator names for it" },
     { "net.listen",     1, 0, 1, "listen on port" },

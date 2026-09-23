@@ -45,6 +45,8 @@ static int usage(void)
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
             "  dest <id> add|remove <host>:<port> a destination the operator names for a package that asks for them\n"
             "  call <id> GET|POST <path> [json] [--call-dir <dir>] [--cg-parent <dir>]\n"
+            "  wizard <id> state|start|answer|abort [json] [--call-dir <dir>] [--cg-parent <dir>]\n"
+            "                                     the package's own check on the Setup page\n"
             "  mcode <n> [json] [--call-dir <dir>] [--cg-parent <dir>]\n"
             "                                     M<n> of a job, to the service that answers it\n"
             "                                     one call from the package's page to its own service\n"
@@ -87,6 +89,35 @@ static int refuse(const char *why)
     json_t *obj = json_object();
     json_object_set_new(obj, "error", json_string(why));
     return answer(obj, 0);
+}
+
+/* One request to id's service on its call socket, answered as the
+ * command's own: the service's status and the JSON it answered. what, when
+ * it is not NULL, names the request in the host's log. */
+static int service_answer(const char *dir, const char *id, const char *method, const char *path, const char *json,
+                          int timeout_ms, const char *what)
+{
+    char err[300];
+    int status = 0;
+    char *body = NULL;
+    size_t blen = 0;
+    if (call_service(dir, id, method, path, json, timeout_ms, &status, &body, &blen, err, sizeof(err)) != 0)
+        return refuse(err);
+    json_t *ans = json_null();
+    if (blen > 0) {
+        json_error_t je;
+        ans = json_loadb(body, blen, JSON_DECODE_ANY | JSON_REJECT_DUPLICATES, &je);
+    }
+    free(body);
+    if (!ans)
+        return refuse("its service's answer is not JSON");
+    if (what)
+        fflog(LOG_INFO, "%s: %s answered %d", what, id, status);
+    json_t *obj = json_object();
+    json_object_set_new(obj, "id", json_string(id));
+    json_object_set_new(obj, "status", json_integer(status));
+    json_object_set_new(obj, "body", ans);
+    return answer(obj, 1);
 }
 
 static json_t *strings(char list[][CAP_MAX_LEN], int n)
@@ -286,7 +317,8 @@ int main(int argc, char **argv)
      * here, once, before anything builds a path out of it. forgectrl holds
      * it to the same form before it ever runs this, and a command line is
      * still a command line. */
-    static const char *const takes_id[] = { "ui", "settings", "hold", "enable", "disable", "remove", "call", "dest", NULL };
+    static const char *const takes_id[] = { "ui", "settings", "hold", "enable", "disable", "remove", "call", "dest",
+                                            "wizard", NULL };
     for (int k = 0; takes_id[k]; k++)
         if (strcmp(cmd, takes_id[k]) == 0 && i < argc && !manifest_id_ok(argv[i]))
             return refuse("that is not a package id");
@@ -528,26 +560,9 @@ int main(int argc, char **argv)
             if (!out)
                 return refuse("out of memory");
         }
-        int status = 0;
-        char *body = NULL;
-        size_t blen = 0;
-        int rc = call_service(dir, id, method, path, out, CALL_TIMEOUT_MS, &status, &body, &blen, err, sizeof(err));
+        int rc = service_answer(dir, id, method, path, out, CALL_TIMEOUT_MS, NULL);
         free(out);
-        if (rc != 0)
-            return refuse(err);
-        json_t *ans = json_null();
-        if (blen > 0) {
-            json_error_t je;
-            ans = json_loadb(body, blen, JSON_DECODE_ANY | JSON_REJECT_DUPLICATES, &je);
-        }
-        free(body);
-        if (!ans)
-            return refuse("its service's answer is not JSON");
-        json_t *obj = json_object();
-        json_object_set_new(obj, "id", json_string(id));
-        json_object_set_new(obj, "status", json_integer(status));
-        json_object_set_new(obj, "body", ans);
-        return answer(obj, 1);
+        return rc;
     }
     if (strcmp(cmd, "mcode") == 0 && i < argc) {
         /* M<n> of a job, handed to the service that answers it, for the GRBL
@@ -608,26 +623,74 @@ int main(int argc, char **argv)
         json_decref(req);
         if (!out)
             return refuse("out of memory");
-        int status = 0;
-        char *body = NULL;
-        size_t blen = 0;
-        int rc = call_service(dir, who->id, "POST", "/mcode", out, MCODE_TIMEOUT_MS, &status, &body, &blen, err,
-                              sizeof(err));
+        char what[16];
+        snprintf(what, sizeof(what), "M%s", num);
+        int rc = service_answer(dir, who->id, "POST", "/mcode", out, MCODE_TIMEOUT_MS, what);
         free(out);
-        if (rc != 0)
+        return rc;
+    }
+    if (strcmp(cmd, "wizard") == 0 && i + 1 < argc) {
+        /* The Setup page's run of a package's own check, which forgectrl's
+         * wizard runner drives. The check's state and its result are the
+         * package's: its service keeps them, and the machine's own setup
+         * record never holds them. state asks GET /wizard; start, answer,
+         * and abort are POST /wizard/<verb>, answer with the operator's
+         * answer as a JSON object. */
+        const char *id = argv[i++], *verb = argv[i++], *text = NULL;
+        const char *dir = CALL_DIR_DEFAULT, *cg = CG_PARENT_DEFAULT;
+        if (i < argc && strncmp(argv[i], "--", 2) != 0)
+            text = argv[i++];
+        for (; i < argc; i++) {
+            if (strcmp(argv[i], "--call-dir") == 0 && i + 1 < argc)
+                dir = argv[++i];
+            else if (strcmp(argv[i], "--cg-parent") == 0 && i + 1 < argc)
+                cg = argv[++i];
+            else
+                return usage();
+        }
+        int state = strcmp(verb, "state") == 0, answering = strcmp(verb, "answer") == 0;
+        if (!state && !answering && strcmp(verb, "start") != 0 && strcmp(verb, "abort") != 0)
+            return refuse("a wizard is asked state, start, answer, or abort");
+        if (answering != (text != NULL))
+            return refuse(answering ? "an answer carries the operator's answer as a JSON object"
+                                    : "only an answer carries a body");
+        if (text && strlen(text) > CALL_BODY_MAX)
+            return refuse("an answer is at most 4096 bytes");
+        static state_t wz_st;
+        manifest_t m;
+        if (state_load(env.root, &wz_st, err, sizeof(err)) != 0)
             return refuse(err);
-        json_t *ans = json_null();
-        if (blen > 0)
-            ans = json_loadb(body, blen, JSON_DECODE_ANY | JSON_REJECT_DUPLICATES, &je);
-        free(body);
-        if (!ans)
-            return refuse("its service's answer is not JSON");
-        fflog(LOG_INFO, "M%s: %s answered %d", num, who->id, status);
-        json_t *obj = json_object();
-        json_object_set_new(obj, "id", json_string(who->id));
-        json_object_set_new(obj, "status", json_integer(status));
-        json_object_set_new(obj, "body", ans);
-        return answer(obj, 1);
+        state_pkg_t *p = state_find(&wz_st, id);
+        if (!p)
+            return refuse("that package is not installed");
+        if (!p->enabled || p->quarantined)
+            return refuse("this package is not running");
+        if (ext_manifest_of(&env, id, &m, err, sizeof(err)) != 0)
+            return refuse(err);
+        if (!manifest_has_cap(&m, "wizard"))
+            return refuse("this package adds no check to the Setup page");
+        if (cg_frozen(cg, id) == 1)
+            return refuse("its service is frozen while a job is armed");
+        char *out = NULL;
+        if (text) {
+            json_error_t je;
+            json_t *req = json_loads(text, JSON_REJECT_DUPLICATES, &je);
+            if (!json_is_object(req)) {
+                json_decref(req);
+                return refuse("an answer carries the operator's answer as a JSON object");
+            }
+            out = json_dumps(req, JSON_COMPACT);
+            json_decref(req);
+        } else if (!state) {
+            out = strdup("{}");
+        }
+        if (!state && !out)
+            return refuse("out of memory");
+        char path[32];
+        snprintf(path, sizeof(path), state ? "/wizard" : "/wizard/%s", verb);
+        int rc = service_answer(dir, id, state ? "GET" : "POST", path, out, CALL_TIMEOUT_MS, NULL);
+        free(out);
+        return rc;
     }
     if (strcmp(cmd, "index-verify") == 0 && i < argc) {
         int n = 0;

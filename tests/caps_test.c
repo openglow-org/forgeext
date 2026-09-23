@@ -39,6 +39,7 @@ int main(void)
         "machine.read", "events", "settings.own", "camera.lid", "camera.head", "motion.jog", "motion.job",
         "hold", "job_time.run", "ui", "net.outbound:mqtt.example.org:8883", "net.outbound:192.168.1.20:1883",
         "net.outbound:[2001:db8::1]:443", "net.listen:8123", "storage:16", "storage:256", "mcode:160", "mcode:179",
+        "wizard",
     };
     for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++)
         CHECK(ok(good[i]), "%s refused: %s", good[i], why);
@@ -50,7 +51,7 @@ int main(void)
     CHECK(refused_with("runner-fd", "is not a capability"), "runner-fd -> %s", why);
     CHECK(refused_with("pulse.fd", "is not a capability"), "pulse.fd -> %s", why);
     CHECK(refused_with("motion.offsets", "not offered"), "motion.offsets -> %s", why);
-    CHECK(refused_with("wizard", "not offered"), "wizard -> %s", why);
+    CHECK(refused_with("wizard:1", "takes no argument"), "wizard:1 -> %s", why);
     /* The M-codes a package answers are the controller's range for them, and M102 is the laser's. */
     static const char *const mcodes[] = { "mcode:101", "mcode:102", "mcode:159", "mcode:180", "mcode:0160", "mcode:16x",
                                           "mcode:-160", "mcode:1600" };

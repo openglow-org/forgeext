@@ -116,6 +116,8 @@ FIXTURES = [
     ("an M-code out of range", with_(capabilities=["mcode:180", "job_time.run"]), {}),
     ("an M-code below the range", with_(capabilities=["mcode:102", "job_time.run"]), {}),
     ("an M-code on a page", with_(runtime="ui", service=None, capabilities=["ui", "mcode:160"]), {}),
+    ("a check of its own on the Setup page", with_(capabilities=["wizard"]), {}),
+    ("a Setup check with no service", with_(runtime="ui", service=None, capabilities=["ui", "wizard"]), {}),
     ("a capability not offered", with_(capabilities=["motion.offsets"]), {}),
     ("an argument where none is taken", with_(capabilities=["hold:1"]), {}),
     ("an outbound to the machine", with_(capabilities=["net.outbound:127.0.0.1:80"]), {}),
