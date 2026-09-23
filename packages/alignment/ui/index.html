@@ -92,6 +92,7 @@ input[type=number] { width: 80px; font: inherit; }
  *   ffx.motion.job({program, lit_within_s, timeout_s})    (motion.job)
  *   ffx.motion.jobState() / .jobAbort()                   (motion.job)
  *   ffx.frame.height(px)                                  -> {px}, inside the panel's bounds
+ *   ffx.service.call(method, path, body)                  -> {status, body}, from the package's own service
  *
  * Extension API 0.1. The panel answers only its own frame's parent window,
  * and this script listens to nothing else.
@@ -154,6 +155,12 @@ var ffx = (function () {
     },
     frame: {
       height: function (px) { return call('frame.height', { px: px }); }
+    },
+    /* The package's own service answers; the host waits ten seconds for it. */
+    service: {
+      call: function (method, path, body) {
+        return call('service.call', { method: method, path: path, body: body }, 20000);
+      }
     }
   };
 })();

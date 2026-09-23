@@ -8,6 +8,7 @@
 #define FORGEEXT_RUN_H
 
 #include "api.h"
+#include "call.h"
 #include "evfeed.h"
 #include "holdkeep.h"
 #include "install.h"
@@ -33,6 +34,7 @@ typedef struct {
     const char *run_dir;                        /* status.json */
     const char *holds_dir;                      /* the hold files forgectrl's cooling engine reads */
     const char *api_dir;                        /* one API socket per running service */
+    const char *call_dir;                       /* one call socket per running service that has a page */
     int landlock_fs_only;                       /* a kernel older than landlock's TCP rules (tests on a host) */
     int ticks;                                  /* stop after this many seconds; 0 runs until a signal */
 } run_cfg_t;

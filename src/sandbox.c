@@ -447,13 +447,20 @@ static void child(const prepared_t *p)
             die(err_fd, limits[i].name, errno);
     }
 
-    /* Every descriptor but stdio and the word back to the parent. */
+    /* Every descriptor but stdio, the word back to the parent, and the
+     * listening end of its page's calls at 4. The call socket is moved out
+     * of the way first, so that neither move lands on the other. */
+    int call = -1;
+    if (c->call_fd > 0 && (call = fcntl(c->call_fd, F_DUPFD_CLOEXEC, 10)) < 0)
+        die(err_fd, "descriptors", errno);
     if (err_fd != 3) {
         if (dup2(err_fd, 3) < 0)
             die(err_fd, "descriptors", errno);
         err_fd = 3;
     }
-    if (fcntl(err_fd, F_SETFD, FD_CLOEXEC) != 0 || syscall(SYS_close_range, 4U, ~0U, 0U) != 0)
+    if (call >= 0 && dup2(call, 4) < 0)             /* dup2 leaves 4 open across the exec */
+        die(err_fd, "descriptors", errno);
+    if (fcntl(err_fd, F_SETFD, FD_CLOEXEC) != 0 || syscall(SYS_close_range, call >= 0 ? 5U : 4U, ~0U, 0U) != 0)
         die(err_fd, "descriptors", errno);
 
     int ruleset = ll_build(p);

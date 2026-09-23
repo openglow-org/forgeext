@@ -16,15 +16,22 @@ package copies this file next to its own code (it is not on the image).
     for ev in ffx.follow():                    # events
         ...
 
+A service whose package has a page also answers that page (serve()): the
+host hands it the listening end of a socket, and each call the page makes
+arrives there, relayed by the panel.
+
 The machine has no clock that keeps the date: time every wait and every
 schedule with time.monotonic(), never with the wall clock.
 """
 import json
 import os
 import socket
+import threading
 import time
 
 API_VERSION = "0.1"
+CALL_ANSWER_MAX = 64 * 1024                    # what the host takes back from a service
+_CALL_TIMEOUT = 10.0                           # what the host waits for the whole answer
 
 
 class ApiError(Exception):
@@ -209,3 +216,81 @@ def follow(since=None, wait=25):
         for ev in doc.get("events", []):
             yield ev
         since = doc.get("next", since)
+
+
+class CallError(Exception):
+    """Raised by a serve() handler to answer the page with `status` and {"error": words}."""
+
+    def __init__(self, status, words):
+        super().__init__("%d %s" % (status, words))
+        self.status = status
+        self.words = words
+
+
+def _answer(conn, status, doc):
+    data = json.dumps(doc, separators=(",", ":")).encode()
+    if len(data) > CALL_ANSWER_MAX - 256:
+        status, data = 500, json.dumps({"error": "the answer is more than the host takes"}).encode()
+    head = "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % (
+        status, "OK" if status == 200 else "Refused", len(data))
+    conn.sendall(head.encode() + data)
+
+
+def _one(conn, handler):
+    conn.settimeout(_CALL_TIMEOUT)
+    buf = b""
+    while b"\r\n\r\n" not in buf and len(buf) < 16384:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return
+        buf += chunk
+    top, _, body = buf.partition(b"\r\n\r\n")
+    lines = top.decode("latin-1").split("\r\n")
+    parts = lines[0].split()
+    if len(parts) != 3:
+        return
+    want = 0
+    for line in lines[1:]:
+        k, _, v = line.partition(":")
+        if k.strip().lower() == "content-length":
+            want = int(v.strip() or 0)
+    while len(body) < want:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return
+        body += chunk
+    try:
+        doc = json.loads(body[:want] or b"{}")
+        _answer(conn, 200, handler(parts[0], parts[1], doc))
+    except CallError as e:
+        _answer(conn, e.status, {"error": e.words})
+    except Exception as e:
+        _answer(conn, 500, {"error": "%s: %s" % (type(e).__name__, e)})
+
+
+def serve(handler, background=False):
+    """ui: answer this package's page. handler(method, path, body) gets "GET" or "POST", the path the
+    page named, and the JSON object it sent ({} for a GET), and returns a JSON value, answered as 200;
+    raising CallError answers that status and words, and any other exception answers 500. Calls come
+    one at a time, each on a connection of its own. background=True answers on a thread of its own and
+    returns the thread; otherwise this never returns."""
+    fd = os.environ.get("FFX_CALL_FD")
+    if not fd:
+        raise ApiError(0, "FFX_CALL_FD is not set: this package has no page, or this is not its service")
+    listener = socket.socket(fileno=int(fd))
+
+    def loop():
+        while True:
+            conn, _ = listener.accept()
+            try:
+                _one(conn, handler)
+            except (OSError, ValueError):
+                pass                                   # a call cut short, or not the host's form
+            finally:
+                conn.close()
+
+    if background:
+        t = threading.Thread(target=loop, name="ffx.serve", daemon=True)
+        t.start()
+        return t
+    loop()

@@ -69,6 +69,7 @@ void run_cfg_defaults(run_cfg_t *cfg)
     cfg->run_dir = RUN_DIR_DEFAULT;
     cfg->holds_dir = HOLDKEEP_DIR_DEFAULT;
     cfg->api_dir = API_DIR_DEFAULT;
+    cfg->call_dir = CALL_DIR_DEFAULT;
 }
 
 static double mono(void)
@@ -249,6 +250,25 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
     }
     snprintf(api_env, sizeof(api_env), "FFX_API=%s", api_path);
     sb.env[0] = api_env;
+    /* A package with a page may have its page ask the service: the host
+     * binds that socket where only it can put a name, and the service gets
+     * the listening end alone. */
+    static char call_env[32];
+    char call_path[400];
+    int call_fd = -1;
+    if (manifest_has_cap(&m, "ui")) {
+        if (call_open(cfg->call_dir, s->id, call_path, sizeof(call_path), &call_fd, err, elen) != 0) {
+            api_close(&r->api, s->id);
+            close(pfd[0]);
+            close(pfd[1]);
+            net_revoke(&cfg->net, uid, NULL, 0);
+            cg_destroy(cfg->cg_parent, s->id);
+            return -1;
+        }
+        snprintf(call_env, sizeof(call_env), "FFX_CALL_FD=%d", CALL_FD);
+        sb.env[1] = call_env;
+        sb.call_fd = call_fd;
+    }
     sb.id = s->id;
     sb.uid = uid;
     sb.gid = (gid_t)uid;
@@ -264,11 +284,14 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
 
     pid_t pid = sandbox_spawn(&sb, err, elen);
     close(pfd[1]);
+    if (call_fd >= 0)
+        close(call_fd);                                 /* the service holds its end; the host connects by name */
     logpipe_t *l = pid > 0 ? log_slot(r, s->id) : NULL;
     if (pid <= 0 || !l) {
         close(pfd[0]);
         if (pid > 0)
             snprintf(err, elen, "no room for its log");
+        call_close(cfg->call_dir, s->id);
         api_close(&r->api, s->id);
         net_revoke(&cfg->net, uid, NULL, 0);
         cg_destroy(cfg->cg_parent, s->id);
@@ -290,6 +313,7 @@ static void op_stop(void *ctx, svc_t *s)
     if (s->slot >= 0 && net_revoke(&r->cfg->net, (uid_t)(STATE_POOL_UID + s->slot), err, sizeof(err)) != 0)
         fflog(LOG_ERR, "%s: %s", s->id, err);
     api_close(&r->api, s->id);
+    call_close(r->cfg->call_dir, s->id);
     if (s->pid > 0)
         waitpid(s->pid, NULL, 0);                       /* killed with its group; an ended one is already reaped */
     log_close(r, s->id);

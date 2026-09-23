@@ -14,6 +14,12 @@ machine route it holds and one it does not, a path there is none of, and (in
 Python) its settings and the events poll - and writes what it was told into
 its data directory, where the test reads it.
 
+The Python and the C package also have a page, so their services answer the
+page's calls (ffx.serve(), ffx_serve_one()): the test makes those calls the
+way the panel relays them, with `forgeext call`, and holds the command to
+its closed form, the refusals to their words, a frozen service to its own
+answer, and the socket to being the host's and gone with the service.
+
 In network and mount namespaces of its own, with the image's deny rules
 loaded and a stand-in for forgectrl's read-only routes on loopback.
 
@@ -45,10 +51,36 @@ CG_PARENT = "/sys/fs/cgroup/forgeext-sdk-test"
 SKIP = 77
 
 PY_SERVICE = r'''
-import json, os, sys, time
+import json, os, socket, stat, sys, time
 sys.path.insert(0, os.path.join(os.environ["FFX_PKG"], "lib"))
 import ffx
 out = {}
+def handle(method, path, body):
+    if path == "/echo":
+        return {"method": method, "path": path, "body": body}
+    if path == "/refuse":
+        raise ffx.CallError(409, "not now")
+    if path == "/big":
+        return "x" * 70000
+    if path == "/me":
+        return ffx.me()["id"]
+    raise ValueError("there is no " + path)
+ffx.serve(handle, background=True)
+def fds():
+    r = {}
+    for n in (3, 4, 5):
+        try:
+            r[str(n)] = "socket" if stat.S_ISSOCK(os.fstat(n).st_mode) else "other"
+        except OSError:
+            r[str(n)] = "closed"
+    return r
+def listening():
+    s = socket.socket(fileno=os.dup(4))
+    try:
+        return s.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+    finally:
+        s.close()
+out["call_env"] = os.environ.get("FFX_CALL_FD")
 def note(name, fn):
     try:
         out[name] = ["ok", fn()]
@@ -70,6 +102,8 @@ note("jog", lambda: ffx.jog(x=1))
 note("nowhere", lambda: ffx.call("GET", "/v0/nowhere"))
 note("program", lambda: ffx.write_program("p.gcode", "G21\n"))
 note("program_dir", lambda: ffx.write_program("../p.gcode", "G21\n"))
+note("fds", fds)
+note("listening", listening)
 d = os.environ["FFX_DATA"]
 with open(os.path.join(d, "report.json.new"), "w") as f:
     json.dump(out, f)
@@ -123,6 +157,14 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def cg_frozen(id_):
+    try:
+        with open(os.path.join(CG_PARENT, id_, "cgroup.events")) as f:
+            return "frozen 1" in f.read()
+    except OSError:
+        return False
+
+
 def wait_for(cond, seconds, poll=0.25):
     end = time.time() + seconds
     while time.time() < end:
@@ -164,6 +206,8 @@ def main():
             return {"ok": None, "error": p.stdout[:200] + p.stderr[:200]}
 
     def package(id_, runtime, exe, files, caps, grants, settings=None):
+        if "ui" in caps:
+            files = dict(files, **{"ui/index.html": "<!doctype html><title>%s</title>\n" % id_})
         d = os.path.join(top, "src-" + id_)
         m = {"manifest": 1, "id": id_, "name": id_, "version": "1.0.0", "author": "Test", "license": "MIT", "api": "0.1",
              "runtime": runtime, "service": {"exec": exe}, "capabilities": list(caps)}
@@ -192,20 +236,22 @@ def main():
                        capture_output=True, text=True)
     check(b.returncode == 0, "ffx.h builds static with -Wall -Wextra -Werror: %s", b.stderr[-300:])
     package("org.example.sdkpy", "python", "bin/run.py", {"bin/run.py": PY_SERVICE, "lib/ffx.py": os.path.join(SDK, "python", "ffx.py")},
-            caps=["hold", "machine.read", "settings.own", "events"], grants=["hold"],
+            caps=["hold", "machine.read", "settings.own", "events", "ui"], grants=["hold"],
             settings={"threshold": {"type": "number", "default": 40, "min": 0, "max": 100}})
     package("org.example.sdksh", "shell", "bin/run.sh", {"bin/run.sh": SH_SERVICE, "lib/ffx.sh": os.path.join(SDK, "sh", "ffx.sh")},
             caps=["hold"], grants=["hold"])
-    package("org.example.sdkc", "native", "bin/run", {"bin/run": native}, caps=["hold", "machine.read"], grants=["hold"])
+    package("org.example.sdkc", "native", "bin/run", {"bin/run": native}, caps=["hold", "machine.read", "ui"], grants=["hold"])
 
     abi = int(subprocess.run([sys.executable, "-c", "import ctypes;print(ctypes.CDLL(None).syscall(444,None,0,1))"],
                              capture_output=True, text=True).stdout.strip() or 0)
     with open(conf, "w") as f:
         f.write("ext_enabled=1\n")
     log = open(os.path.join(top, "daemon.log"), "w")
+    call_dir = os.path.join(top, "call")
     daemon = subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "run", "--conf", conf, "--safe-file", safe,
                                "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir,
-                               "--holds-dir", os.path.join(top, "holds"), "--api-dir", os.path.join(top, "api")]
+                               "--holds-dir", os.path.join(top, "holds"), "--api-dir", os.path.join(top, "api"),
+                               "--call-dir", call_dir]
                               + (["--landlock-fs-only"] if abi < 4 else []),
                               stdout=log, stderr=subprocess.STDOUT)
     try:
@@ -239,6 +285,52 @@ def main():
               "a program written into its own data: %s", rep.get("program"))
         check(rep.get("program_dir", [""])[0] == "broke" and "ValueError" in rep["program_dir"][1],
               "a program name with a directory in it: %s", rep.get("program_dir"))
+        check(rep.get("call_env") == "4" and rep.get("fds") == ["ok", {"3": "closed", "4": "socket", "5": "closed"}]
+              and rep.get("listening") == ["ok", 1],
+              "its page's calls: FFX_CALL_FD=%s, descriptors %s, listening %s", rep.get("call_env"), rep.get("fds"),
+              rep.get("listening"))
+
+        def call(id_, method, path, *body):
+            return fx("call", id_, method, path, *body, "--call-dir", call_dir, "--cg-parent", CG_PARENT)
+
+        print("a page's calls to its own service (forgeext call, ffx.serve)")
+        py = "org.example.sdkpy"
+        st = os.lstat(os.path.join(call_dir, py + ".sock"))
+        dst = os.lstat(call_dir)
+        check(oct(dst.st_mode & 0o777) == "0o700" and dst.st_uid == 0 and st.st_uid == 0 and (st.st_mode & 0o777) == 0o600,
+              "the socket is root's, 0600, in root's 0700 directory: %o %d, %o %d", dst.st_mode & 0o777, dst.st_uid,
+              st.st_mode & 0o777, st.st_uid)
+        r = call(py, "POST", "/echo", '{"a": 1, "b": "two"}')
+        check(r.get("ok") is True and r.get("status") == 200
+              and r.get("body") == {"method": "POST", "path": "/echo", "body": {"a": 1, "b": "two"}}, "a POST: %s", r)
+        r = call(py, "POST", "/echo")
+        check(r.get("ok") is True and r.get("body", {}).get("body") == {}, "a POST without a body sends {}: %s", r)
+        r = call(py, "GET", "/echo")
+        check(r.get("ok") is True and r.get("body") == {"method": "GET", "path": "/echo", "body": {}}, "a GET: %s", r)
+        r = call(py, "GET", "/refuse")
+        check(r.get("ok") is True and r.get("status") == 409 and r.get("body") == {"error": "not now"},
+              "the service's own refusal is its status and words: %s", r)
+        r = call(py, "GET", "/nothing")
+        check(r.get("ok") is True and r.get("status") == 500 and "ValueError" in str(r.get("body")),
+              "a handler that raised answers 500: %s", r)
+        r = call(py, "GET", "/big")
+        check(r.get("ok") is True and r.get("status") == 500 and "more than" in str(r.get("body")),
+              "an answer past the limit is the SDK's 500: %s", r)
+        r = call(py, "GET", "/me")
+        check(r.get("ok") is True and r.get("body") == py, "a service asks the machine while it answers: %s", r)
+        for args, words in (((py, "PUT", "/echo"), "a call is GET or POST"),
+                            ((py, "GET", "/../etc"), "a call's path starts with"),
+                            ((py, "GET", "/a?b"), "a call's path starts with"),
+                            ((py, "GET", "echo"), "a call's path starts with"),
+                            ((py, "GET", "/echo", "{}"), "a GET call has no body"),
+                            ((py, "POST", "/echo", "[1]"), "a call's body is a JSON object"),
+                            ((py, "POST", "/echo", '{"a": 1, "a": 2}'), "a call's body is a JSON object"),
+                            ((py, "POST", "/echo", '{"a": "%s"}' % ("x" * 4100)), "a call's body is at most 4096 bytes"),
+                            (("org.example.sdksh", "GET", "/echo"), "this package has no page that calls a service"),
+                            (("org.example.nobody", "GET", "/echo"), "that package is not installed"),
+                            (("Not.An.Id", "GET", "/echo"), "that is not a package id")):
+            r = call(*args)
+            check(r.get("ok") is False and str(r.get("error", "")).startswith(words), "%s %s -> %s", args[1], args[2], r.get("error"))
 
         def lines(id_):
             p = wait_for(lambda: report(id_, "report.txt"), 60)
@@ -270,8 +362,32 @@ def main():
         check(c.get("clear", "").startswith("0 200 "), "and cleared: %s", c.get("clear"))
         check(c.get("mode", "").startswith("0 200 ") and '"grbl"' in c.get("mode", ""), "the machine's mode: %s", c.get("mode"))
         check(c.get("nowhere", "").startswith("0 404 "), "a path there is none of: %s", c.get("nowhere"))
-    finally:
+        check(c.get("call_fd") == "4", "its page's calls, at descriptor %s", c.get("call_fd"))
+        r = call("org.example.sdkc", "POST", "/echo", '{"x": [1, 2]}')
+        check(r.get("ok") is True and r.get("status") == 200
+              and r.get("body") == {"method": "POST", "path": "/echo", "body": {"x": [1, 2]}}, "ffx_serve_one answers: %s", r)
+        r = call("org.example.sdkc", "GET", "/nothing")
+        check(r.get("ok") is True and r.get("status") == 404 and r.get("body") == {"error": "there is no such thing"},
+              "and refuses in its own words: %s", r)
+
+        print("a frozen service, and a stopped one")
+        facts["armed"] = True
+        frozen = wait_for(lambda: cg_frozen(py), 15)
+        check(frozen, "armed: the service froze")
+        r = call(py, "GET", "/echo")
+        check(r.get("ok") is False and r.get("error") == "its service is frozen while a job is armed", "a call to it: %s", r)
+        facts["armed"] = False
+        check(wait_for(lambda: not cg_frozen(py), 15), "disarmed: it thawed")
+        r = call(py, "GET", "/echo")
+        check(r.get("ok") is True and r.get("status") == 200, "and answers again: %s", r)
         daemon.send_signal(signal.SIGTERM)
+        daemon.wait(20)
+        check(not os.path.exists(os.path.join(call_dir, py + ".sock")), "the host stopped: the socket's name is gone")
+        r = call(py, "GET", "/echo")
+        check(r.get("ok") is False and r.get("error") == "its service is not running", "a call now: %s", r)
+    finally:
+        if daemon.poll() is None:
+            daemon.send_signal(signal.SIGTERM)
         try:
             daemon.wait(20)
         except subprocess.TimeoutExpired:

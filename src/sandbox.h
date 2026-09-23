@@ -10,7 +10,8 @@
  *   is in the package's cgroup (the parent puts it there; the child waits)
  *   is idle-class in every scheduler: SCHED_IDLE, nice 19, I/O class idle
  *   is first in line for the OOM killer (oom_score_adj 900)
- *   holds no descriptor but stdin (/dev/null) and its log pipe
+ *   holds no descriptor but stdin (/dev/null), its log pipe, and the
+ *     listening end of its page's calls when it has a page
  *   has the package's account and no group but its own
  *   can gain nothing by exec (no_new_privs)
  *   sees of the file tree only the system's read-only parts, its package
@@ -50,6 +51,8 @@ typedef struct {
     int connect_ports[SANDBOX_MAX_PORTS];   /* TCP ports it may connect to; 0-ended */
     int bind_port;                          /* the TCP port it may listen on, or 0 */
     int log_fd;                             /* becomes stdout and stderr */
+    int call_fd;                            /* the listening end of its page's calls, which the service finds
+                                             * at descriptor 4 (CALL_FD); 0 for none */
     int need;                               /* SANDBOX_NEED_* */
     const char *cg_parent, *cg_id;          /* the group it is put in before it goes on; NULL parent = none (tests) */
 } sandbox_cfg_t;

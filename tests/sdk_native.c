@@ -6,7 +6,8 @@
  *
  * Built static by the test and run as a package's service in the sandbox.
  * It asks the host what a native package asks, and writes what it was told
- * into its data directory for the test to read.
+ * into its data directory for the test to read; then it answers its page's
+ * calls.
  */
 #define FFX_IMPLEMENTATION
 #include "../sdk/c/ffx.h"
@@ -15,6 +16,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static int handle(void *ctx, const char *method, const char *path, const char *body, char *answer, size_t alen)
+{
+    char m[16], p[300];
+    (void)ctx;
+    if (strcmp(path, "/echo") != 0) {
+        snprintf(answer, alen, "{\"error\":\"there is no such thing\"}");
+        return 404;
+    }
+    ffx_json_string(method, m, sizeof(m));
+    ffx_json_string(path, p, sizeof(p));
+    snprintf(answer, alen, "{\"method\":%s,\"path\":%s,\"body\":%s}", m, p, body);
+    return 200;
+}
 
 static void line(FILE *f, const char *what, const ffx_reply_t *r, int rc)
 {
@@ -72,10 +87,13 @@ int main(void)
     line(f, "nowhere", &r, rc);
     ffx_reply_free(&r);
 
+    fprintf(f, "call_fd %d\n", ffx_call_fd());
+
     fclose(f);
     char done[512];
     snprintf(done, sizeof(done), "%s/report.txt", data);
     rename(path, done);
     for (;;)
-        pause();
+        if (ffx_serve_one(handle, NULL, -1) < 0)
+            pause();
 }

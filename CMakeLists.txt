@@ -32,6 +32,7 @@ add_library(forgeext_core STATIC
   src/quota.c
   src/settings.c
   src/api.c
+  src/call.c
   src/fflog.c)
 target_include_directories(forgeext_core PUBLIC src
   ${JANSSON_INCLUDE_DIRS} ${LIBARCHIVE_INCLUDE_DIRS} ${SODIUM_INCLUDE_DIRS})

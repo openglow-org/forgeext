@@ -14,7 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "call.h"
 #include "caps.h"
+#include "cgroup.h"
 #include "fflog.h"
 #include "install.h"
 #include "manifest.h"
@@ -40,9 +42,12 @@ static int usage(void)
             "  ui <id>                            the package's interface, as JSON\n"
             "  settings <id> [json]               its settings, and the patch to apply\n"
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
+            "  call <id> GET|POST <path> [json] [--call-dir <dir>] [--cg-parent <dir>]\n"
+            "                                     one call from the package's page to its own service\n"
             "  caps                               the capabilities a manifest may ask for\n"
             "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
-            "      [--run-dir <dir>] [--holds-dir <dir>] [--api-dir <dir>] [--landlock-fs-only] [--ticks <n>]\n"
+            "      [--run-dir <dir>] [--holds-dir <dir>] [--api-dir <dir>] [--call-dir <dir>] [--landlock-fs-only]\n"
+            "      [--ticks <n>]\n"
             "                                     the daemon: run what is installed and enabled, in the sandbox\n"
             "  net-check                          is the image's deny table loaded, and the image's\n"
             "  net-allow <uid> [--listen <port>] [--dns] [<host>:<port>]...\n"
@@ -269,7 +274,7 @@ int main(int argc, char **argv)
      * here, once, before anything builds a path out of it. forgectrl holds
      * it to the same form before it ever runs this, and a command line is
      * still a command line. */
-    static const char *const takes_id[] = { "ui", "settings", "hold", "enable", "disable", "remove", NULL };
+    static const char *const takes_id[] = { "ui", "settings", "hold", "enable", "disable", "remove", "call", NULL };
     for (int k = 0; takes_id[k]; k++)
         if (strcmp(cmd, takes_id[k]) == 0 && i < argc && !manifest_id_ok(argv[i]))
             return refuse("that is not a package id");
@@ -308,6 +313,8 @@ int main(int argc, char **argv)
                 rc.holds_dir = val;
             } else if (strcmp(opt, "--api-dir") == 0) {
                 rc.api_dir = val;
+            } else if (strcmp(opt, "--call-dir") == 0) {
+                rc.call_dir = val;
             } else if (strcmp(opt, "--ticks") == 0) {
                 rc.ticks = atoi(val);
             } else if (strcmp(opt, "--forgectrl") == 0) {
@@ -448,6 +455,86 @@ int main(int argc, char **argv)
         json_object_set_new(obj, "bytes", json_integer((json_int_t)len));
         json_object_set_new(obj, "html", json_stringn(html, len));
         free(html);
+        return answer(obj, 1);
+    }
+    if (strcmp(cmd, "call") == 0 && i + 2 < argc) {
+        /* One call from a package's page to its own service, which the
+         * panel relays for the page (call.h). The call is held to a closed
+         * form here - GET or POST, a plain path, a JSON object of a few KB
+         * that this program writes out again - so that what reaches the
+         * service is what the host wrote, and the answer comes back as the
+         * service's status and the JSON it answered. */
+        const char *id = argv[i++], *method = argv[i++], *path = argv[i++], *text = NULL;
+        const char *dir = CALL_DIR_DEFAULT, *cg = CG_PARENT_DEFAULT;
+        if (i < argc && strncmp(argv[i], "--", 2) != 0)
+            text = argv[i++];
+        for (; i < argc; i++) {
+            if (strcmp(argv[i], "--call-dir") == 0 && i + 1 < argc)
+                dir = argv[++i];
+            else if (strcmp(argv[i], "--cg-parent") == 0 && i + 1 < argc)
+                cg = argv[++i];
+            else
+                return usage();
+        }
+        int post = strcmp(method, "POST") == 0;
+        if (!post && strcmp(method, "GET") != 0)
+            return refuse("a call is GET or POST");
+        if (!call_path_ok(path))
+            return refuse("a call's path starts with '/' and has only letters, digits, '/', '.', '-', and '_', "
+                          "at most 200 of them");
+        if (text && !post)
+            return refuse("a GET call has no body");
+        if (text && strlen(text) > CALL_BODY_MAX)
+            return refuse("a call's body is at most 4096 bytes");
+
+        static state_t call_st;
+        manifest_t m;
+        if (state_load(env.root, &call_st, err, sizeof(err)) != 0)
+            return refuse(err);
+        state_pkg_t *p = state_find(&call_st, id);
+        if (!p)
+            return refuse("that package is not installed");
+        if (!p->enabled)
+            return refuse("this package is disabled: its service is not running");
+        if (ext_manifest_of(&env, id, &m, err, sizeof(err)) != 0)
+            return refuse(err);
+        if (!manifest_has_cap(&m, "ui") || !manifest_has_service(&m))
+            return refuse("this package has no page that calls a service");
+        if (cg_frozen(cg, id) == 1)
+            return refuse("its service is frozen while a job is armed");
+
+        char *out = NULL;
+        if (post) {
+            json_error_t je;
+            json_t *req = json_loads(text ? text : "{}", JSON_REJECT_DUPLICATES, &je);
+            if (!json_is_object(req)) {
+                json_decref(req);
+                return refuse("a call's body is a JSON object");
+            }
+            out = json_dumps(req, JSON_COMPACT);
+            json_decref(req);
+            if (!out)
+                return refuse("out of memory");
+        }
+        int status = 0;
+        char *body = NULL;
+        size_t blen = 0;
+        int rc = call_service(dir, id, method, path, out, CALL_TIMEOUT_MS, &status, &body, &blen, err, sizeof(err));
+        free(out);
+        if (rc != 0)
+            return refuse(err);
+        json_t *ans = json_null();
+        if (blen > 0) {
+            json_error_t je;
+            ans = json_loadb(body, blen, JSON_DECODE_ANY | JSON_REJECT_DUPLICATES, &je);
+        }
+        free(body);
+        if (!ans)
+            return refuse("its service's answer is not JSON");
+        json_t *obj = json_object();
+        json_object_set_new(obj, "id", json_string(id));
+        json_object_set_new(obj, "status", json_integer(status));
+        json_object_set_new(obj, "body", ans);
         return answer(obj, 1);
     }
     if (strcmp(cmd, "keys") == 0) {
