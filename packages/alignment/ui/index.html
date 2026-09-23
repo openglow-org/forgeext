@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!--
+  Visual alignment - the org.openglow.alignment package's page
+  Copyright 2026 514 LLC d/b/a OpenGlow
+  Written by Scott Wiederhold
+  SPDX-License-Identifier: MIT
+-->
+<meta charset="utf-8">
+<title>Visual alignment</title>
+<style>
+:root { color-scheme: light dark; --fg: #1d1d1d; --bg: #fff; --mute: #666; --line: #bbb; --ok: #1d7a3a; --warn: #9a5a00; --bad: #b3261e; --btn: #eee; }
+@media (prefers-color-scheme: dark) { :root { --fg: #ddd; --bg: #181818; --mute: #999; --line: #444; --btn: #2a2a2a; } }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 10px; font: 14px/1.4 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+h3 { margin: 12px 0 6px; font-size: 14px; }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) 270px; gap: 14px; }
+@media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+canvas { display: block; width: 100%; height: auto; background: #000; border: 1px solid var(--line); touch-action: none; }
+button { font: inherit; padding: 5px 10px; border: 1px solid var(--line); border-radius: 4px; background: var(--btn); color: var(--fg); cursor: pointer; }
+button.primary { border-color: var(--ok); font-weight: 600; }
+button.on { outline: 2px solid var(--ok); }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+.pad { display: grid; grid-template-columns: repeat(3, 44px); gap: 4px; margin: 6px 0; }
+.pad button { height: 40px; padding: 0; }
+.steps button { min-width: 44px; }
+.nudge { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+.nudge button { min-width: 34px; padding: 4px; }
+#status { color: var(--mute); margin-bottom: 8px; font-variant-numeric: tabular-nums; }
+.msg { min-height: 1.4em; margin-top: 8px; }
+.msg.ok { color: var(--ok); } .msg.warn { color: var(--warn); } .msg.bad { color: var(--bad); }
+.hint { color: var(--mute); font-size: 13px; }
+input[type=number] { width: 80px; font: inherit; }
+</style>
+</head>
+<body>
+<div id="status">Asking the machine…</div>
+<div class="grid">
+  <div>
+    <canvas id="view" width="1296" height="972"></canvas>
+    <div class="row">
+      <button id="shot">New picture</button>
+      <button id="shotfull">Full detail</button>
+      <label><input type="checkbox" id="live"> Live</label>
+      <label>Light <input type="range" id="lamp" min="0" max="1023" step="1"></label> <span id="lampv"></span>
+    </div>
+    <div id="msg" class="msg"></div>
+  </div>
+  <div>
+    <h3>Jog</h3>
+    <div class="row steps">
+      <button data-step="0.1">0.1</button><button data-step="1" class="on">1</button><button data-step="5">5</button><button data-step="10">10</button> <span class="hint">mm</span>
+    </div>
+    <div class="pad">
+      <span></span><button data-jog="0,-1" title="Toward the back">▲</button><span></span>
+      <button data-jog="-1,0" title="Left">◀</button><button id="stop" title="Stop the jog">■</button><button data-jog="1,0" title="Right">▶</button>
+      <span></span><button data-jog="0,1" title="Toward the front">▼</button><span></span>
+    </div>
+    <p class="hint">The arrow keys jog too. Up is toward the back of the machine, as in the picture.</p>
+    <h3>Beam</h3>
+    <button id="tobeam" class="primary">Move the beam to the crosshair</button>
+    <p class="hint">Then start the job in LightBurn from Current Position.</p>
+    <button id="back">Move the crosshair to the beam</button>
+    <h3>Material</h3>
+    <label>Height <input type="number" id="height" min="0" max="40" step="0.1"> mm</label>
+    <p class="hint">Only the crosshair's millimeter scale follows it. The crosshair itself is right whatever it says.</p>
+    <h3>Calibration</h3>
+    <div id="cal"></div>
+  </div>
+</div>
+<script>
+/* ffx-bridge.js, extension API 0.1, from the forgeext SDK (sdk/js/ffx-bridge.js), pasted whole. */
+/*
+ * ffx-bridge.js - a package page's side of the control panel's bridge
+ * Copyright 2026 514 LLC d/b/a OpenGlow
+ * Written by Scott Wiederhold
+ * SPDX-License-Identifier: MIT
+ *
+ * A package's page runs in a sandboxed frame that can reach nothing: no
+ * network, no session, no panel. Everything it wants it asks the panel for
+ * over postMessage, and the panel decides by what the package may use. This
+ * is the asking side: one promise per call, resolved with the panel's answer
+ * or rejected with its words. A page is one self-contained file, so this
+ * script is pasted into it (inside a <script> element) rather than loaded.
+ *
+ *   ffx.self()                          -> {id, version, tier, capabilities}
+ *   ffx.machine.status() / .cool() / .mode()               (machine.read)
+ *   ffx.settings.get() / .set({key: value})               (settings.own)
+ *   ffx.camera.frame({camera, resolution, quality, lamp})  -> a Blob (JPEG)
+ *   ffx.motion.jog({x, y, z, feed}) / .cancel()           (motion.jog)
+ *   ffx.motion.job({program, lit_within_s, timeout_s})    (motion.job)
+ *   ffx.motion.jobState() / .jobAbort()                   (motion.job)
+ *   ffx.frame.height(px)                                  -> {px}, inside the panel's bounds
+ *
+ * Extension API 0.1. The panel answers only its own frame's parent window,
+ * and this script listens to nothing else.
+ */
+var ffx = (function () {
+  'use strict';
+  var n = 0,
+    waiting = {};
+
+  window.addEventListener('message', function (ev) {
+    var m = ev.data;
+    if (ev.source !== window.parent || !m || m.forgefirm !== 1 || !waiting[m.id]) return;
+    var w = waiting[m.id];
+    delete waiting[m.id];
+    clearTimeout(w.timer);
+    if (m.ok) w.ok(m.value);
+    else w.err(new Error(m.error || 'refused'));
+  });
+
+  /* One call. A camera frame can take seconds (the camera starts, and a
+   * capture waits for a viewer to go), so the default wait is long. */
+  function call(name, args, waitMs) {
+    return new Promise(function (ok, err) {
+      var id = ++n;
+      waiting[id] = {
+        ok: ok,
+        err: err,
+        timer: setTimeout(function () {
+          if (!waiting[id]) return;
+          delete waiting[id];
+          err(new Error('the panel did not answer ' + name));
+        }, waitMs || 40000)
+      };
+      window.parent.postMessage({ forgefirm: 1, id: id, call: name, args: args }, '*');
+    });
+  }
+
+  return {
+    version: '0.1',
+    call: call,
+    self: function () { return call('self'); },
+    machine: {
+      status: function () { return call('machine.status'); },
+      cool: function () { return call('machine.cool'); },
+      mode: function () { return call('machine.mode'); }
+    },
+    settings: {
+      get: function () { return call('settings.get'); },
+      set: function (patch) { return call('settings.set', patch); }
+    },
+    camera: {
+      frame: function (opts) { return call('camera.frame', opts || { camera: 'lid' }, 60000); }
+    },
+    motion: {
+      jog: function (move) { return call('motion.jog', move, 120000); },
+      cancel: function () { return call('motion.cancel'); },
+      job: function (spec) { return call('motion.job', spec); },
+      jobState: function () { return call('motion.job.state'); },
+      jobAbort: function () { return call('motion.job.abort'); }
+    },
+    frame: {
+      height: function (px) { return call('frame.height', { px: px }); }
+    }
+  };
+})();
+</script>
+<script>
+/* Visual alignment: the head camera's view, a crosshair at its center, a jog
+ * pad, and the one jog that puts the beam where the crosshair was. The image
+ * is shown as the camera gives it: nothing is dewarped or adjusted, and no
+ * point on it is ever a place the machine moves to. Only the crosshair's
+ * scale follows the material height, and a wrong height costs nothing but
+ * the ticks. */
+(function () {
+  'use strict';
+  /* The head camera's pinhole fit on the bench reference: the focal length
+   * in pixels at full resolution, and the camera's height above the tray in
+   * millimeters. They set the scale drawn on the crosshair, and the size of
+   * one corrective jog while calibrating; neither is ever a position. */
+  var F_PX = 3590,
+    CAM_MM = 49.6,
+    FULL_W = 2592;
+
+  var S = {},
+    img = null,
+    pos = null,
+    live = false,
+    shooting = false,
+    step = 1,
+    cal = { stage: 'idle', fire: null, mark: null };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var canvas = $('view'),
+    g = canvas.getContext('2d');
+
+  function say(text, kind) {
+    var m = $('msg');
+    m.textContent = text || '';
+    m.className = 'msg ' + (kind || '');
+  }
+  function words(e) {
+    return String((e && e.message) || e);
+  }
+  /* Said, and then passed on, so a caller that goes on only after a success
+   * stops where the machine said no. */
+  function fail(e) {
+    say(words(e), 'bad');
+    throw e;
+  }
+  /* The end of a chain the operator started: whatever went wrong is said. */
+  function shown(e) {
+    say(words(e), 'bad');
+  }
+  function num(v, d) {
+    return typeof v === 'number' && isFinite(v) ? v : d;
+  }
+
+  /* Pixels per millimeter at the image's own resolution. */
+  function pxPerMm() {
+    var h = num(S.height_mm, 3);
+    var full = F_PX / Math.max(5, CAM_MM - h);
+    return img ? full * (img.width / FULL_W) : full / 2;
+  }
+
+  /* ---- the machine ---- */
+  function status() {
+    return ffx.machine.status().then(function (st) {
+      pos = st.pos || null;
+      var bits = [];
+      bits.push(st.state || 'unknown');
+      if (pos) bits.push('X ' + pos.x.toFixed(2) + '  Y ' + pos.y.toFixed(2));
+      if (st.motors_released) bits.push('motors released: every jog is refused until they are energized');
+      else if (!st.homed) bits.push('not homed');
+      if (st.home_source === 'manual') bits.push('homed by hand');
+      $('status').textContent = bits.join(' · ');
+      return st;
+    });
+  }
+
+  /* ---- the picture ---- */
+  function picture(full) {
+    if (shooting) return Promise.resolve();
+    shooting = true;
+    return ffx.camera
+      .frame({ camera: 'head', resolution: full ? 'full' : 'half', quality: full ? 92 : 80, lamp: Math.round(num(S.lamp, 60)) })
+      .then(function (blob) { return createImageBitmap(blob); })
+      .then(function (bmp) {
+        img = bmp;
+        canvas.width = bmp.width;
+        canvas.height = bmp.height;
+        if (cal.stage === 'aligning' && !cal.mark) cal.mark = { x: bmp.width / 2, y: bmp.height / 2 };
+        draw();
+      })
+      .catch(function (e) {
+        say('No picture: ' + ((e && e.message) || e), 'warn');
+      })
+      .then(function () {
+        shooting = false;
+      });
+  }
+
+  function draw() {
+    if (!img) return;
+    var w = canvas.width,
+      h = canvas.height,
+      cx = w / 2,
+      cy = h / 2,
+      k = pxPerMm(),
+      lw = Math.max(1, w / 900);
+    g.drawImage(img, 0, 0);
+    g.lineWidth = lw;
+    g.strokeStyle = '#ff2a2a';
+    g.beginPath();
+    g.moveTo(0, cy); g.lineTo(w, cy);
+    g.moveTo(cx, 0); g.lineTo(cx, h);
+    g.stroke();
+    /* a millimeter tick to five each way, and a ring ten millimeters out */
+    g.beginPath();
+    for (var i = 1; i <= 5; i++) {
+      var t = i * k, len = (i === 5 ? 3 : 1.5) * k * 0.25;
+      g.moveTo(cx + t, cy - len); g.lineTo(cx + t, cy + len);
+      g.moveTo(cx - t, cy - len); g.lineTo(cx - t, cy + len);
+      g.moveTo(cx - len, cy + t); g.lineTo(cx + len, cy + t);
+      g.moveTo(cx - len, cy - t); g.lineTo(cx + len, cy - t);
+    }
+    g.stroke();
+    g.beginPath();
+    g.arc(cx, cy, 10 * k, 0, 2 * Math.PI);
+    g.stroke();
+    /* while calibrating, the operator's own crosshair over the burned mark */
+    if (cal.stage === 'aligning' && cal.mark) {
+      var mx = cal.mark.x, my = cal.mark.y, r = 2 * k;
+      g.strokeStyle = '#1ec8ff';
+      g.lineWidth = lw * 1.5;
+      g.beginPath();
+      g.moveTo(mx - r, my); g.lineTo(mx + r, my);
+      g.moveTo(mx, my - r); g.lineTo(mx, my + r);
+      g.stroke();
+    }
+  }
+
+  function liveLoop() {
+    if (!live) return;
+    picture(false).then(function () {
+      setTimeout(liveLoop, 1500);
+    });
+  }
+
+  /* ---- motion ---- */
+  function jog(dx, dy) {
+    var move = { feed: num(S.jog_feed, 3000) };
+    if (dx) move.x = Math.round(dx * 1000) / 1000;
+    if (dy) move.y = Math.round(dy * 1000) / 1000;
+    if (!move.x && !move.y) return Promise.resolve();
+    say('Jogging…');
+    return ffx.motion
+      .jog(move)
+      .then(function () {
+        say('');
+        return status();
+      }, fail)
+      .then(function () {
+        if (!live) return picture(cal.stage === 'aligning');
+      });
+  }
+
+  /* The camera sees the bed offset_x_mm, offset_y_mm away from where the
+   * beam lands: a fixed pair, calibrated once per machine. */
+  function beamToCrosshair() {
+    return jog(-num(S.offset_x_mm, 24.6), -num(S.offset_y_mm, 0)).then(function () {
+      say('The beam is where the crosshair was. Start the job in LightBurn from Current Position.', 'ok');
+    }, function () {});
+  }
+  function crosshairToBeam() {
+    return jog(num(S.offset_x_mm, 24.6), num(S.offset_y_mm, 0)).catch(function () {});
+  }
+
+  /* ---- calibration ---- */
+  function markProgram() {
+    var s = Math.round(num(S.burn_power, 20) * 10),
+      f = Math.round(num(S.burn_feed, 600));
+    /* A plus sign centered where the head stands, 3 mm each way, dark
+     * between the strokes, ending where it began. */
+    return ['G21', 'G91', 'M4 S' + s, 'G0 X-1.5', 'G1 X3 F' + f, 'G0 X-1.5 Y-1.5', 'G1 Y3', 'G0 Y-1.5', 'M5', 'G90', ''].join('\n');
+  }
+
+  function calRender() {
+    var c = $('cal'),
+      off = 'X ' + num(S.offset_x_mm, 24.6).toFixed(2) + ' mm, Y ' + num(S.offset_y_mm, 0).toFixed(2) + ' mm';
+    var html = {
+      idle:
+        '<p>' + (S.calibrated ? 'Calibrated: ' + off + '.' : 'Not calibrated: the offset is the one measured on the bench reference, ' + off + '.') +
+        '</p><p class="hint">Scrap material under the head, lid closed, and LightBurn disconnected: a job cannot run while a sender is connected. The mark is a 3 mm plus sign at ' +
+        num(S.burn_power, 20) + '% and ' + num(S.burn_feed, 600) + ' mm/min.</p><button id="c-burn">Burn the mark</button>',
+      burning: '<p><b>Press the button on the machine when it lights.</b> The mark burns where the head stands.</p><button id="c-abort">Stop</button>',
+      burned: '<p>The mark is burned. The head now moves by the offset, so the mark comes into view.</p><button id="c-show">Show the mark</button> <button id="c-cancel">Cancel</button>',
+      aligning:
+        '<p>Put the blue crosshair on the center of the burned plus: drag it, then nudge it. Then jog to it. When the burned plus sits under the red crosshair, save.</p>' +
+        '<div class="nudge">' +
+        '<button data-n="-10,0" title="10 pixels left">\u00ab</button><button data-n="-1,0" title="1 pixel left">\u2039</button>' +
+        '<button data-n="1,0" title="1 pixel right">\u203a</button><button data-n="10,0" title="10 pixels right">\u00bb</button>' +
+        '<button data-n="0,-10" title="10 pixels up">\u21c8</button><button data-n="0,-1" title="1 pixel up">\u2191</button>' +
+        '<button data-n="0,1" title="1 pixel down">\u2193</button><button data-n="0,10" title="10 pixels down">\u21ca</button></div>' +
+        '<button id="c-jog">Jog to the blue crosshair</button> <button id="c-save" class="primary">It lines up: save</button> <button id="c-cancel">Cancel</button>' +
+        '<p class="hint">If the burned arms are not parallel to the crosshair, the camera is turned in the head. Alignment is still right at the crosshair’s center.</p>'
+    }[cal.stage];
+    c.innerHTML = html;
+  }
+
+  function burn() {
+    var fire;
+    status()
+      .then(function (st) {
+        if (st.state !== 'idle') throw new Error('the machine is ' + st.state + ', not idle');
+        if (!pos) throw new Error('the machine gives no position');
+        fire = { x: pos.x, y: pos.y };
+        return ffx.motion.job({ program: markProgram(), lit_within_s: 120, timeout_s: 300 });
+      })
+      .then(function () {
+        cal = { stage: 'burning', fire: fire, mark: null };
+        calRender();
+        return waitJob();
+      })
+      .then(function (rec) {
+        if (rec.state !== 'done') throw new Error('the mark was not burned: ' + (rec.reason || rec.state));
+        cal.stage = 'burned';
+        calRender();
+        say('');
+      })
+      .catch(function (e) {
+        cal = { stage: 'idle', fire: null, mark: null };
+        calRender();
+        say(String((e && e.message) || e), 'bad');
+      });
+  }
+
+  function waitJob() {
+    return new Promise(function (done, stop) {
+      (function poll() {
+        ffx.motion.jobState().then(function (rec) {
+          if (rec.state === 'running') return setTimeout(poll, 1000);
+          done(rec);
+        }, stop);
+      })();
+    });
+  }
+
+  function showMark() {
+    live = false;
+    $('live').checked = false;
+    cal.stage = 'aligning';
+    cal.mark = null;
+    calRender();
+    jog(num(S.offset_x_mm, 24.6), num(S.offset_y_mm, 0)).catch(function () {});
+  }
+
+  function jogToMark() {
+    if (!img || !cal.mark) return;
+    var k = pxPerMm(),
+      dx = (cal.mark.x - img.width / 2) / k,
+      dy = (cal.mark.y - img.height / 2) / k;
+    /* The operator's crosshair stays where they put it until the jog is
+     * done, so a jog the machine refuses costs them nothing; after it the
+     * crosshair goes back to the center of the new picture. */
+    jog(dx, dy).then(function () {
+      cal.mark = img ? { x: img.width / 2, y: img.height / 2 } : null;
+      draw();
+    }, function () {});
+  }
+
+  function save() {
+    status()
+      .then(function () {
+        var ox = Math.round((pos.x - cal.fire.x) * 1000) / 1000,
+          oy = Math.round((pos.y - cal.fire.y) * 1000) / 1000;
+        return ffx.settings.set({ offset_x_mm: ox, offset_y_mm: oy, calibrated: true });
+      })
+      .then(function (doc) {
+        S = doc.settings;
+        cal = { stage: 'idle', fire: null, mark: null };
+        calRender();
+        draw();
+        say('Saved: the camera sees the bed ' + S.offset_x_mm.toFixed(2) + ' mm, ' + S.offset_y_mm.toFixed(2) + ' mm from the beam.', 'ok');
+      })
+      .catch(shown);
+  }
+
+  /* ---- the controls ---- */
+  document.addEventListener('click', function (ev) {
+    var b = ev.target.closest && ev.target.closest('button');
+    if (!b) return;
+    var j = b.getAttribute('data-jog'),
+      st = b.getAttribute('data-step'),
+      nd = b.getAttribute('data-n');
+    if (j) {
+      var d = j.split(',');
+      jog(Number(d[0]) * step, Number(d[1]) * step).catch(function () {});
+    } else if (st) {
+      step = Number(st);
+      Array.prototype.forEach.call(document.querySelectorAll('[data-step]'), function (e) {
+        e.classList.toggle('on', e === b);
+      });
+    } else if (nd && cal.mark) {
+      var n = nd.split(',');
+      cal.mark.x += Number(n[0]);
+      cal.mark.y += Number(n[1]);
+      draw();
+    } else if (b.id === 'stop') ffx.motion.cancel().catch(shown);
+    else if (b.id === 'tobeam') beamToCrosshair();
+    else if (b.id === 'back') crosshairToBeam();
+    else if (b.id === 'shot') picture(false);
+    else if (b.id === 'shotfull') picture(true);
+    else if (b.id === 'c-burn') burn();
+    else if (b.id === 'c-abort') ffx.motion.jobAbort().catch(shown);
+    else if (b.id === 'c-show') showMark();
+    else if (b.id === 'c-jog') jogToMark();
+    else if (b.id === 'c-save') save();
+    else if (b.id === 'c-cancel') {
+      cal = { stage: 'idle', fire: null, mark: null };
+      calRender();
+      draw();
+    }
+  });
+
+  /* The arrow keys jog by the step, image-wise: up is toward the back. */
+  document.addEventListener('keydown', function (ev) {
+    var k = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] }[ev.key];
+    if (!k || ev.target.tagName === 'INPUT') return;
+    ev.preventDefault();
+    jog(k[0] * step, k[1] * step).catch(function () {});
+  });
+
+  function toCanvas(ev) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (ev.clientX - r.left) * (canvas.width / r.width), y: (ev.clientY - r.top) * (canvas.height / r.height) };
+  }
+  var dragging = false;
+  canvas.addEventListener('pointerdown', function (ev) {
+    if (cal.stage !== 'aligning' || !img) return;
+    dragging = true;
+    canvas.setPointerCapture(ev.pointerId);
+    cal.mark = toCanvas(ev);
+    draw();
+  });
+  canvas.addEventListener('pointermove', function (ev) {
+    if (!dragging) return;
+    cal.mark = toCanvas(ev);
+    draw();
+  });
+  canvas.addEventListener('pointerup', function () { dragging = false; });
+
+  $('live').addEventListener('change', function () {
+    live = this.checked;
+    if (live) liveLoop();
+  });
+  var saveTimer = null;
+  function keep(key, value) {
+    S[key] = value;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () {
+      var patch = {};
+      patch[key] = value;
+      ffx.settings.set(patch).catch(shown);
+    }, 400);
+  }
+  $('lamp').addEventListener('input', function () {
+    $('lampv').textContent = this.value;
+    keep('lamp', Number(this.value));
+  });
+  $('height').addEventListener('change', function () {
+    var v = Number(this.value);
+    if (isFinite(v)) {
+      keep('height_mm', v);
+      draw();
+    }
+  });
+
+  /* ---- start ---- */
+  ffx.frame.height(1100).catch(function () {});
+  ffx
+    .settings.get()
+    .then(function (doc) {
+      S = doc.settings || {};
+      $('lamp').value = num(S.lamp, 60);
+      $('lampv').textContent = $('lamp').value;
+      $('height').value = num(S.height_mm, 3);
+      calRender();
+      return status();
+    })
+    .then(function () {
+      return picture(false);
+    })
+    .catch(function (e) {
+      say(String((e && e.message) || e), 'bad');
+    });
+  setInterval(function () {
+    if (!shooting) status().catch(function () {});
+  }, 3000);
+})();
+</script>
+</body>
+</html>
