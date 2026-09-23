@@ -61,6 +61,8 @@ int main(void)
     a->enabled = 1;
     snprintf(a->grants[a->ngrants++], CAP_MAX_LEN, "hold");
     snprintf(a->grants[a->ngrants++], CAP_MAX_LEN, "motion.job");
+    snprintf(a->dests[a->ndests++], CAP_MAX_LEN, "plug.lan:80");
+    snprintf(a->dests[a->ndests++], CAP_MAX_LEN, "[2001:db8::7]:1883");
     state_pkg_t *b = state_add(&s, "org.example.theme");
     snprintf(b->version, sizeof(b->version), "0.1.0");
     b->tier = TIER_UNVERIFIED;
@@ -76,8 +78,10 @@ int main(void)
               && strcmp(la->key_id, KEY64) == 0 && la->slot == 0 && la->enabled && !la->quarantined && la->ngrants == 2
               && state_granted(la, "hold") && state_granted(la, "motion.job") && !state_granted(la, "job_time.run"),
               "the service package's fields");
+        CHECK(la->ndests == 2 && strcmp(la->dests[0], "plug.lan:80") == 0 && strcmp(la->dests[1], "[2001:db8::7]:1883") == 0,
+              "the operator's destinations, in order: %d", la->ndests);
         CHECK(lb->tier == TIER_UNVERIFIED && !lb->key_id[0] && lb->slot == -1 && !lb->enabled && lb->quarantined
-              && lb->ngrants == 0, "the data package's fields");
+              && lb->ngrants == 0 && lb->ndests == 0, "the data package's fields");
     }
     snprintf(cmd, sizeof(cmd), "test \"$(stat -c %%a %s/state.json)\" = 600 && ! test -e %s/state.json.new", root, root);
     CHECK(system(cmd) == 0, "state.json is not 0600, or its temporary file stayed");
@@ -114,6 +118,15 @@ int main(void)
                        "\"org.example.y\":{" GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":3,\"grants\":[]}}}",
                        "two packages hold account ffx3"), "one account twice -> %s", err);
     CHECK(refused_with("{\"state\":1,\"packages\":{", "does not read"), "a file cut short -> %s", err);
+    CHECK(refused_with(PKG(GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":0,\"grants\":[],\"destinations\":[\"plug.lan\"]"),
+                       "does not read"), "a destination with no port -> %s", err);
+    CHECK(refused_with(PKG(GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":0,\"grants\":[],\"destinations\":\"plug.lan:80\""),
+                       "does not read"), "destinations that are not a list -> %s", err);
+    /* A state written before the operator could name destinations has none. */
+    snprintf(cmd, sizeof(cmd), "printf '%%s' '" PKG(GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":0,\"grants\":[]")
+             "' > %s/state.json", root);
+    CHECK(system(cmd) == 0 && state_load(root, &s, err, sizeof(err)) == 0 && s.n == 1 && s.pkgs[0].ndests == 0,
+          "a state with no destinations key: %s", err);
 
     snprintf(cmd, sizeof(cmd), "rm -rf %s", root);
     if (system(cmd) != 0)

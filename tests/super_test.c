@@ -345,6 +345,23 @@ int main(void)
     super_tick(&sv, &READY, 121);
     CHECK(!a->frozen && w.thaws == 1, "the thaw was not tried again: frozen %d, %d thaws", a->frozen, w.thaws);
 
+    /* what it runs with changed: stopped and started again, outside a
+     * window, and no crash */
+    fresh();
+    a = add("org.example.a", 0);
+    a->conf_wanted = 1;
+    super_tick(&sv, &READY, 100);
+    CHECK(a->state == SVC_RUNNING && a->conf_started == 1, "not running with what it was started with");
+    a->conf_wanted = 2;
+    super_tick(&sv, &ARMED, 110);
+    CHECK(a->state == SVC_RUNNING && w.stops == 0, "a restart inside the armed window: %s", super_state_name(a->state));
+    super_tick(&sv, &READY, 111);
+    CHECK(a->state == SVC_RUNNING && w.stops == 1 && w.starts == 2 && a->conf_started == 2 && a->ncrashes == 0
+          && a->backoff_s == 0, "not stopped and started again with what it now runs with, and no crash: %s, %d stops, "
+          "%d starts, %d crashes", super_state_name(a->state), w.stops, w.starts, a->ncrashes);
+    super_tick(&sv, &READY, 120);
+    CHECK(a->state == SVC_RUNNING && w.stops == 1, "a service with nothing changed was stopped");
+
     printf("%s: super_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

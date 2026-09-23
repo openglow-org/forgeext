@@ -6,6 +6,7 @@
  */
 #define _GNU_SOURCE
 #include "install.h"
+#include "netrules.h"
 
 #include "settings.h"
 
@@ -232,6 +233,15 @@ static int listen_port(const manifest_t *m)
     return 0;
 }
 
+/* How many net.outbound destinations the manifest declares. */
+static int outbound_count(const manifest_t *m)
+{
+    int n = 0;
+    for (int i = 0; i < m->ncaps; i++)
+        n += strncmp(m->caps[i], "net.outbound:", 13) == 0;
+    return n;
+}
+
 static int lists(const manifest_t *m, const char *id)
 {
     for (int i = 0; i < m->nconflicts; i++)
@@ -307,6 +317,9 @@ static int judge(const ext_env_t *env, state_t *st, install_result_t *res, char 
         if (port && listen_port(&other) == port)
             return fail(err, elen, "%s, which is installed, already listens on port %d", other.id, port);
     }
+    if (have && manifest_has_cap(m, "net.outbound.operator") && have->ndests + outbound_count(m) > EXT_DESTS_MAX)
+        return fail(err, elen, "the operator named %d destinations for %s and this version declares %d: a service has "
+                               "at most %d", have->ndests, m->id, outbound_count(m), EXT_DESTS_MAX);
     if (!have && st->n >= STATE_MAX_PKGS)
         return fail(err, elen, "%d packages are installed, and that is the limit", STATE_MAX_PKGS);
     if (manifest_has_service(m) && (!have || have->slot < 0) && state_slot_free(st) < 0)
@@ -543,6 +556,8 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
     p->ngrants = 0;
     for (int i = 0; i < res->nneeds; i++)
         snprintf(p->grants[p->ngrants++], CAP_MAX_LEN, "%s", res->needs_grant[i]);
+    if (!manifest_has_cap(m, "net.outbound.operator"))
+        p->ndests = 0;                                  /* a version that does not ask keeps none of them */
     if (p->slot >= 0) {
         snprintf(datadir, sizeof(datadir), "%.255s/data/%.63s", env->root, m->id);
         if (mkdir(datadir, 0700) != 0 && errno != EEXIST) {
@@ -852,6 +867,60 @@ int ext_set_enabled(const ext_env_t *env, const char *id, int on, char *err, siz
             rc = state_save(env->root, st, err, elen);
             if (rc == 0 && ext_required_holds_sync(env, st) != 0)
                 rc = fail(err, elen, "the required holds under %s could not be made to match", env->root);
+        }
+    }
+    ext_unlock(lock);
+    free(st);
+    return rc;
+}
+
+int ext_dest(const ext_env_t *env, const char *id, int add, const char *dest, char *err, size_t elen)
+{
+    char host[256];
+    int port;
+    manifest_t m;
+    if (!dest || strlen(dest) >= CAP_MAX_LEN || caps_outbound_parse(dest, host, sizeof(host), &port) != 0)
+        return fail(err, elen, "a destination is host:port, the host a lowercase DNS name, an IPv4 address, or an "
+                               "IPv6 address in brackets");
+    /* A numeric address is judged now; a name is judged by what it
+     * resolves to when the service starts, and the table refuses the
+     * machine whatever this says. */
+    if (net_addr_is_self(host) == 1)
+        return fail(err, elen, "%s is this machine: no package reaches the machine", host);
+    state_t *st = calloc(1, sizeof(*st));
+    if (!st)
+        return fail(err, elen, "out of memory");
+    int lock = ext_lock(env, err, elen), rc = -1;
+    if (lock >= 0 && state_load(env->root, st, err, elen) == 0) {
+        state_pkg_t *p = state_find(st, id);
+        int at = -1;
+        for (int i = 0; p && i < p->ndests; i++)
+            if (strcmp(p->dests[i], dest) == 0)
+                at = i;
+        if (!p) {
+            fail(err, elen, "%s is not installed", id);
+        } else if (ext_manifest_of(env, id, &m, err, elen) != 0) {
+            /* the words are the manifest's */
+        } else if (!manifest_has_cap(&m, "net.outbound.operator")) {
+            fail(err, elen, "%s does not ask for destinations of the operator's (net.outbound.operator)", id);
+        } else if (add && at >= 0) {
+            fail(err, elen, "%s is already one of its destinations", dest);
+        } else if (add && p->ndests >= STATE_MAX_DESTS) {
+            fail(err, elen, "the operator has named %d destinations for it, and that is the limit", STATE_MAX_DESTS);
+        } else if (add && p->ndests + outbound_count(&m) >= EXT_DESTS_MAX) {
+            fail(err, elen, "it has %d destinations, its manifest's and the operator's, and a service has at most %d",
+                 p->ndests + outbound_count(&m), EXT_DESTS_MAX);
+        } else if (!add && at < 0) {
+            fail(err, elen, "%s is not one of the destinations the operator named for it", dest);
+        } else {
+            if (add) {
+                snprintf(p->dests[p->ndests++], sizeof(p->dests[0]), "%s", dest);
+            } else {
+                for (int i = at; i + 1 < p->ndests; i++)
+                    memcpy(p->dests[i], p->dests[i + 1], sizeof(p->dests[0]));
+                p->ndests--;
+            }
+            rc = state_save(env->root, st, err, elen);
         }
     }
     ext_unlock(lock);

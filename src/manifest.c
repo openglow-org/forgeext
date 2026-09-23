@@ -24,7 +24,8 @@ static const char *const runtime_names[] = { "data", "ui", "shell", "native", "p
 
 /* Capabilities that are about a running process: a package with no
  * service has nothing that could use them. */
-static const char *const service_only[] = { "hold", "job_time.run", "net.outbound", "net.listen", "storage" };
+static const char *const service_only[] = { "hold", "job_time.run", "net.outbound", "net.outbound.operator", "net.listen",
+                                             "storage" };
 
 static int fail(char *err, size_t elen, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));

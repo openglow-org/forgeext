@@ -74,6 +74,8 @@ FIXTURES = [
     ("an outbound destination by name and by address", with_(capabilities=["net.outbound:mqtt.example.org:8883",
                                                                             "net.outbound:10.1.2.3:80",
                                                                             "net.outbound:[fd00::1]:443"]), {}),
+    ("the operator's destinations", with_(capabilities=["net.outbound.operator", "net.outbound:ntfy.sh:443"]), {}),
+    ("the operator's destinations with an argument", with_(capabilities=["net.outbound.operator:plug.lan:80"]), {}),
     ("a core range", with_(core={"min": "0.0.1", "max": "9.0.0"}), {}),
     ("not JSON", b"{\"manifest\": 1,", {}),
     ("a key twice", b'{"manifest": 1, "manifest": 1}', {}),
@@ -324,6 +326,20 @@ def main():
                 return json.loads(p.stdout)
             except ValueError:
                 return {"ok": None, "error": p.stdout + p.stderr}
+
+        print("ffx's capability list is the host's")
+        p = subprocess.run([FORGEEXT, "caps"], capture_output=True, text=True)
+        host = {c["name"]: (c["argument"], c["operator_grant"], c["offered"]) for c in json.loads(p.stdout)["capabilities"]}
+        check(host == ffx.CAPS, "the same names, arguments, grants, and offers: only in the host %s, only in ffx %s, "
+              "differing %s", sorted(set(host) - set(ffx.CAPS)), sorted(set(ffx.CAPS) - set(host)),
+              sorted(k for k in set(host) & set(ffx.CAPS) if host[k] != ffx.CAPS[k]))
+        svc = build(top, "a page asking for a service's capability",
+                    with_(runtime="ui", service=None, capabilities=["ui", "net.outbound.operator"]), {})
+        try:
+            ffx.lint(svc)
+            check(False, "a page with no service asking for net.outbound.operator is refused")
+        except ffx.Refused as e:
+            check("belongs to a service" in str(e), "a page asking for the operator's destinations: %s", e)
 
         print("ffx lint against forgeext inspect, fixture by fixture")
         for name, manifest, extra in FIXTURES:

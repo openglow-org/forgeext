@@ -7,8 +7,8 @@
  * One file under the extension root, written whole and renamed into
  * place. It holds what no package can say about itself: which key signed
  * it (an update must verify under the same one), which account of the
- * pool it runs as, what the operator granted it, and whether it is
- * enabled or quarantined.
+ * pool it runs as, what the operator granted it, the destinations the
+ * operator named for it, and whether it is enabled or quarantined.
  */
 #ifndef FORGEEXT_STATE_H
 #define FORGEEXT_STATE_H
@@ -22,6 +22,7 @@
 #define STATE_MAX_PKGS   64
 #define STATE_POOL_SIZE  32         /* ffx0 to ffx31: the image's account pool */
 #define STATE_POOL_UID   800        /* ffx<n> is uid and gid 800 + n */
+#define STATE_MAX_DESTS  8          /* the destinations the operator may name for one package */
 
 typedef struct {
     char id[64];
@@ -35,6 +36,10 @@ typedef struct {
     int hold_required;              /* the operator marked its hold required: it fails closed (holdkeep.h) */
     char grants[MANIFEST_MAX_CAPS][CAP_MAX_LEN];
     int ngrants;
+    /* The destinations the operator named for a package that asks for
+     * net.outbound.operator, as "host:port" in net.outbound's form. */
+    char dests[STATE_MAX_DESTS][CAP_MAX_LEN];
+    int ndests;
 } state_pkg_t;
 
 typedef struct {

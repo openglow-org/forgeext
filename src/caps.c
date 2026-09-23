@@ -29,6 +29,7 @@ static const cap_def_t defs[] = {
     { "ui",             0, 0, 1, "show its own tab or cards in the control panel" },
     { "wizard",         0, 0, 0, "add a check to the Setup tab" },
     { "net.outbound",   1, 0, 1, "connect to" },
+    { "net.outbound.operator", 0, 0, 1, "connect to the destinations the operator names for it" },
     { "net.listen",     1, 0, 1, "listen on port" },
     { "storage",        1, 0, 1, "keep data on the machine, in MiB up to" },
     { "mcode",          1, 0, 0, "handle the M-code" },

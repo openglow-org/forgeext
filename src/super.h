@@ -32,6 +32,9 @@
  *   A service that should not run (disabled, removed, quarantined, the
  *     wrong controller mode, extensions off) is stopped; its end is not a
  *     crash.
+ *   A service whose version or whose operator's destinations changed is
+ *     stopped and started again, outside an armed window; that is not a
+ *     crash either.
  */
 #ifndef FORGEEXT_SUPER_H
 #define FORGEEXT_SUPER_H
@@ -68,6 +71,11 @@ typedef struct {
     pid_t pid;
     int frozen, job_limited, healthy;
     int posture_tries;                  /* turns spent trying to take the open window's posture */
+    /* What it runs with, as a digest: its version and the destinations
+     * the operator named. The sync sets the one wanted; a start records
+     * it; a running service whose two differ is stopped and started again
+     * outside an armed window, and that is no crash. */
+    unsigned long long conf_wanted, conf_started;
     double started, next_start, backoff_s;
     double crashes[SUPER_QUARANTINE_CRASHES];
     int ncrashes;

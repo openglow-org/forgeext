@@ -288,6 +288,10 @@ void super_tick(super_t *sv, const super_inputs_t *in, double now)
         }
         if (s->state != SVC_RUNNING)
             continue;
+        if (!window && s->conf_started != s->conf_wanted) {
+            stop(sv, s, "started again: its version or its destinations changed");
+            continue;
+        }
         if (!s->healthy && now - s->started >= SUPER_HEALTHY_S) {
             s->healthy = 1;
             s->backoff_s = 0;
@@ -326,6 +330,7 @@ void super_tick(super_t *sv, const super_inputs_t *in, double now)
     pick->state = SVC_RUNNING;
     pick->pid = pid;
     pick->started = now;
+    pick->conf_started = pick->conf_wanted;
     pick->frozen = pick->job_limited = pick->healthy = pick->posture_tries = 0;
     pick->reason[0] = '\0';
     say(sv, LOG_NOTICE, "%s: started as ffx%d (pid %d)", pick->id, pick->slot, (int)pid);

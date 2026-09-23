@@ -129,6 +129,18 @@ static int pkg_from_json(const char *id, json_t *j, state_pkg_t *p)
             return -1;
         snprintf(p->grants[p->ngrants++], sizeof(p->grants[0]), "%s", cap);
     }
+    /* Absent in a state written before the operator could name any. */
+    json_t *dests = json_object_get(j, "destinations");
+    if (dests && (!json_is_array(dests) || json_array_size(dests) > STATE_MAX_DESTS))
+        return -1;
+    for (size_t i = 0; dests && i < json_array_size(dests); i++) {
+        const char *d = json_string_value(json_array_get(dests, i));
+        char host[256];
+        int port;
+        if (!d || strlen(d) >= CAP_MAX_LEN || caps_outbound_parse(d, host, sizeof(host), &port) != 0)
+            return -1;
+        snprintf(p->dests[p->ndests++], sizeof(p->dests[0]), "%s", d);
+    }
     return 0;
 }
 
@@ -192,6 +204,10 @@ int state_save(const char *root, const state_t *s, char *err, size_t elen)
         for (int k = 0; k < p->ngrants; k++)
             json_array_append_new(grants, json_string(p->grants[k]));
         json_object_set_new(j, "grants", grants);
+        json_t *dests = json_array();
+        for (int k = 0; k < p->ndests; k++)
+            json_array_append_new(dests, json_string(p->dests[k]));
+        json_object_set_new(j, "destinations", dests);
         json_object_set_new(pkgs, p->id, j);
     }
     char *text = json_dumps(top, JSON_INDENT(1) | JSON_SORT_KEYS);

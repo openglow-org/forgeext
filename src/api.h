@@ -88,6 +88,7 @@
 #include "manifest.h"
 
 #define API_DIR_DEFAULT     "/run/forgefirm/ext/api"
+#define API_MAX_DESTS       16                  /* netrules.h's NET_MAX_DESTS */
 #define API_VERSION         "0.1"
 #define API_MAX_SERVICES    32
 #define API_MAX_CONNS       16
@@ -107,6 +108,8 @@ typedef struct {
     uid_t uid;
     char caps[MANIFEST_MAX_CAPS][CAP_MAX_LEN];  /* the capabilities it may use: those that need no grant, and its grants */
     int ncaps;
+    char dests[API_MAX_DESTS][CAP_MAX_LEN];     /* where it may connect: its manifest's, then the operator's */
+    int ndests;
 } api_who_t;
 
 typedef struct {

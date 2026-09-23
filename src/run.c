@@ -188,17 +188,25 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
 
     sandbox_cfg_t sb;
     memset(&sb, 0, sizeof(sb));
-    for (int i = 0; i < m.ncaps; i++) {
-        if (strncmp(m.caps[i], "net.outbound:", 13) == 0 && ndests < NET_MAX_DESTS && ndests < SANDBOX_MAX_PORTS - 1
-            && caps_outbound_parse(m.caps[i] + 13, dests[ndests].host, sizeof(dests[ndests].host), &dests[ndests].port) == 0) {
-            /* A name, not an address: it has a letter, and no colon. */
-            dns |= dests[ndests].host[strcspn(dests[ndests].host, "abcdefghijklmnopqrstuvwxyz")] != '\0'
-                   && !strchr(dests[ndests].host, ':');
-            sb.connect_ports[ndests] = dests[ndests].port;
-            ndests++;
-        } else if (strncmp(m.caps[i], "net.listen:", 11) == 0) {
+    /* Where it may connect: its manifest's destinations, then those the
+     * operator named for it, each the same way through. */
+    static const char *where[NET_MAX_DESTS];
+    int nwhere = 0;
+    for (int i = 0; i < m.ncaps; i++)
+        if (strncmp(m.caps[i], "net.outbound:", 13) == 0 && nwhere < EXT_DESTS_MAX)
+            where[nwhere++] = m.caps[i] + 13;
+        else if (strncmp(m.caps[i], "net.listen:", 11) == 0)
             listen_port = atoi(m.caps[i] + 11);
-        }
+    for (int i = 0; manifest_has_cap(&m, "net.outbound.operator") && i < p->ndests && nwhere < EXT_DESTS_MAX; i++)
+        where[nwhere++] = p->dests[i];
+    for (int i = 0; i < nwhere; i++) {
+        if (caps_outbound_parse(where[i], dests[ndests].host, sizeof(dests[ndests].host), &dests[ndests].port) != 0)
+            continue;
+        /* A name, not an address: it has a letter, and no colon. */
+        dns |= dests[ndests].host[strcspn(dests[ndests].host, "abcdefghijklmnopqrstuvwxyz")] != '\0'
+               && !strchr(dests[ndests].host, ':');
+        sb.connect_ports[ndests] = dests[ndests].port;
+        ndests++;
     }
     if (dns)
         sb.connect_ports[ndests] = 53;                  /* a lookup that falls back to TCP */
@@ -241,6 +249,8 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
     for (int i = 0; i < m.ncaps && who.ncaps < MANIFEST_MAX_CAPS; i++)
         if (!caps_needs_grant(m.caps[i]) || state_granted(p, m.caps[i]))
             snprintf(who.caps[who.ncaps++], sizeof(who.caps[0]), "%s", m.caps[i]);
+    for (int i = 0; i < nwhere && who.ndests < API_MAX_DESTS; i++)
+        snprintf(who.dests[who.ndests++], sizeof(who.dests[0]), "%s", where[i]);
     if (api_open(&r->api, &who, api_path, sizeof(api_path), err, elen) != 0) {
         close(pfd[0]);
         close(pfd[1]);
@@ -622,6 +632,28 @@ static void holds_turn(run_t *r, const super_t *sv, const super_inputs_t *in)
     r->ndropped = nd;
 }
 
+_Static_assert(EXT_DESTS_MAX <= NET_MAX_DESTS && EXT_DESTS_MAX <= SANDBOX_MAX_PORTS - 1 && API_MAX_DESTS >= NET_MAX_DESTS,
+               "a service's destinations fit the rule table, the sandbox's ports (the resolver's besides), and its answer");
+
+/* What a service runs with, as the supervisor compares it: its version
+ * and the operator's destinations, in order (FNV-1a). */
+static unsigned long long conf_digest(const state_pkg_t *p)
+{
+    unsigned long long h = 1469598103934665603ULL;
+    const char *parts[1 + STATE_MAX_DESTS];
+    int n = 0;
+    parts[n++] = p->version;
+    for (int i = 0; i < p->ndests; i++)
+        parts[n++] = p->dests[i];
+    for (int i = 0; i < n; i++)
+        for (const unsigned char *c = (const unsigned char *)parts[i];; c++) {
+            h = (h ^ *c) * 1099511628211ULL;            /* the NUL too: it keeps "ab","c" from "a","bc" */
+            if (!*c)
+                break;
+        }
+    return h;
+}
+
 /* What is installed, into the policy's table. */
 static void sync_installed(run_t *r, super_t *sv)
 {
@@ -646,6 +678,7 @@ static void sync_installed(run_t *r, super_t *sv)
         s->hold = state_granted(p, "hold");
         s->hold_required = s->hold && p->hold_required;
         s->pkg_enabled = p->enabled;
+        s->conf_wanted = conf_digest(p);
         if (s->state != SVC_RUNNING && ext_manifest_of(&r->cfg->ext, p->id, &m, err, sizeof(err)) == 0) {
             s->mode_grbl = m.mode_grbl;
             s->mode_cloud = m.mode_cloud;

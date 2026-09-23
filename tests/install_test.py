@@ -209,6 +209,44 @@ def core_range(t):
           "a package refused by its core range was installed anyway")
 
 
+def operator_destinations(t):
+    """The destinations the operator names for a package that asks for
+    them: kept across an update that still asks, gone with one that does
+    not, and never more than a service's ports hold."""
+    D = "org.example.plugs"
+    lists = lambda: {x["id"]: x.get("destinations") for x in t.run("list").get("packages", [])}  # noqa: E731
+    page = t.tree(manifest("org.example.plugpage", runtime="ui", caps=["ui", "net.outbound.operator"]),
+                  {"ui/index.html": ("<p>a page</p>\n", 0o644)})
+    r = t.run("inspect", t.pack(page, "official"))
+    check("belongs to a service" in (r.get("error") or ""), "a page with no service asking for them -> %s" % r.get("error"))
+    v1 = t.pack(t.tree(manifest(D, caps=["net.outbound.operator", "net.outbound:api.example.org:443"]), RUN), "official")
+    check(t.run("install", v1).get("ok") is True, "a package that asks for the operator's destinations installs")
+    check(lists().get(D) == [], "and has none until the operator names one: %s" % lists().get(D))
+    for dest in ("plug.lan:80", "192.0.2.7:1883"):
+        r = t.run("dest", D, "add", dest)
+        check(r.get("ok") is True and dest in r.get("destinations", []), "the operator names %s: %s" % (dest, r))
+    for dest, words in (("[::1]:80", "is this machine"), ("127.0.0.5:80", "is this machine"), ("plug.lan", "host:port"),
+                        ("Plug.LAN:80", "host:port"), ("plug.lan:0", "host:port"), ("plug.lan:80", "already")):
+        r = t.run("dest", D, "add", dest)
+        check(r.get("ok") is False and words in (r.get("error") or ""), "dest add %s -> %s" % (dest, r.get("error")))
+    v2 = t.pack(t.tree(manifest(D, version="1.1.0", caps=["net.outbound.operator", "net.outbound:api.example.org:443"]), RUN),
+                "official")
+    check(t.run("install", v2).get("ok") is True and lists().get(D) == ["plug.lan:80", "192.0.2.7:1883"],
+          "an update that still asks keeps them: %s" % lists().get(D))
+    many = ["net.outbound:api%d.example.org:443" % i for i in range(14)]
+    v3 = t.pack(t.tree(manifest(D, version="1.2.0", caps=["net.outbound.operator"] + many), RUN), "official")
+    r = t.run("install", v3)
+    check(r.get("ok") is False and "the operator named 2 destinations" in (r.get("error") or "")
+          and lists().get(D) == ["plug.lan:80", "192.0.2.7:1883"],
+          "an update whose own 14 and the operator's 2 are more than a service has -> %s" % r.get("error"))
+    v4 = t.pack(t.tree(manifest(D, version="1.3.0", caps=["net.outbound:api.example.org:443"]), RUN), "official")
+    check(t.run("install", v4).get("ok") is True and lists().get(D) == [],
+          "an update that no longer asks keeps none of them: %s" % lists().get(D))
+    r = t.run("dest", D, "add", "plug.lan:80")
+    check(r.get("ok") is False and "does not ask for destinations" in (r.get("error") or ""), "and takes none -> %s" % r.get("error"))
+    check(t.run("remove", D).get("ok") is True, "the package goes")
+
+
 def main():
     if not FWUP or not os.path.isfile(FORGEEXT):
         print("skipped: needs fwup (FWUP) and the built forgeext (FORGEEXT)")
@@ -505,6 +543,9 @@ def run_all(w, top):
 
     print("the firmware range a package says it needs")
     core_range(w)
+
+    print("destinations the operator names")
+    operator_destinations(w)
 
     print("a change of owner takes everything the last one left")
     wipe(w, root, keydir)

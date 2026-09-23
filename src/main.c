@@ -42,6 +42,7 @@ static int usage(void)
             "  ui <id>                            the package's interface, as JSON\n"
             "  settings <id> [json]               its settings, and the patch to apply\n"
             "  hold <id> required|advisory        what its hold does when the package cannot speak: stand, or drop\n"
+            "  dest <id> add|remove <host>:<port> a destination the operator names for a package that asks for them\n"
             "  call <id> GET|POST <path> [json] [--call-dir <dir>] [--cg-parent <dir>]\n"
             "                                     one call from the package's page to its own service\n"
             "  caps                               the capabilities a manifest may ask for\n"
@@ -175,6 +176,7 @@ static int cmd_list(const ext_env_t *env, const char *only, int check)
         json_object_set_new(j, "enabled", json_boolean(p->enabled));
         json_object_set_new(j, "quarantined", json_boolean(p->quarantined));
         json_object_set_new(j, "grants", strings(p->grants, p->ngrants));
+        json_object_set_new(j, "destinations", strings(p->dests, p->ndests));
         if (state_granted(p, "hold"))
             json_object_set_new(j, "hold", json_string(p->hold_required ? "required" : "advisory"));
         if (p->slot >= 0)
@@ -274,7 +276,7 @@ int main(int argc, char **argv)
      * here, once, before anything builds a path out of it. forgectrl holds
      * it to the same form before it ever runs this, and a command line is
      * still a command line. */
-    static const char *const takes_id[] = { "ui", "settings", "hold", "enable", "disable", "remove", "call", NULL };
+    static const char *const takes_id[] = { "ui", "settings", "hold", "enable", "disable", "remove", "call", "dest", NULL };
     for (int k = 0; takes_id[k]; k++)
         if (strcmp(cmd, takes_id[k]) == 0 && i < argc && !manifest_id_ok(argv[i]))
             return refuse("that is not a package id");
@@ -575,6 +577,26 @@ int main(int argc, char **argv)
         json_t *obj = json_object();
         json_object_set_new(obj, "id", json_string(id));
         json_object_set_new(obj, "enabled", json_boolean(on));
+        return answer(obj, 1);
+    }
+    if (strcmp(cmd, "dest") == 0 && i + 2 < argc) {
+        /* The operator's own act: a way out that no manifest named, for a
+         * package that asks to be given some. Nothing a package does
+         * reaches this command. */
+        const char *id = argv[i], *how = argv[i + 1], *dest = argv[i + 2];
+        int add = strcmp(how, "add") == 0;
+        if (!add && strcmp(how, "remove") != 0)
+            return usage();
+        if (ext_dest(&env, id, add, dest, err, sizeof(err)) != 0)
+            return refuse(err);
+        fflog(LOG_NOTICE, "%s: the operator %s the destination %s", id, add ? "named" : "took away", dest);
+        static state_t dest_st;
+        if (state_load(env.root, &dest_st, err, sizeof(err)) != 0)
+            return refuse(err);
+        state_pkg_t *p = state_find(&dest_st, id);
+        json_t *obj = json_object();
+        json_object_set_new(obj, "id", json_string(id));
+        json_object_set_new(obj, "destinations", p ? strings(p->dests, p->ndests) : json_array());
         return answer(obj, 1);
     }
     if (strcmp(cmd, "hold") == 0 && i + 1 < argc) {

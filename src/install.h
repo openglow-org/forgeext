@@ -172,6 +172,17 @@ int ext_set_enabled(const ext_env_t *env, const char *id, int on, char *err, siz
  * operator's hold grant has a hold to mark. */
 int ext_set_hold_required(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
 
+/* How many destinations one service may have, the manifest's and the
+ * operator's together: the sandbox's TCP ports less the resolver's. */
+#define EXT_DESTS_MAX 15
+
+/* The operator names a destination for a package that asks for
+ * net.outbound.operator, or takes one away. dest is host:port in
+ * net.outbound's form, and never this machine. A running service is
+ * started again with its new way out at the host's next turn. 0, or -1
+ * with the words. */
+int ext_dest(const ext_env_t *env, const char *id, int add, const char *dest, char *err, size_t elen);
+
 /* <root>/required-holds holds one empty file named after each enabled
  * package whose hold is granted and marked required, and nothing else.
  * forgectrl reads the names: a required hold nobody speaks for (no host

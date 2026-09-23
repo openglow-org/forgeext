@@ -241,11 +241,13 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
     if (strcmp(p, "/v0/self") == 0) {
         if (req->method != HTTPREQ_GET)
             return refuse(body, blen, 405, "GET /v0/self");
-        json_t *caps = json_array();
+        json_t *caps = json_array(), *dests = json_array();
         for (int i = 0; i < who->ncaps; i++)
             json_array_append_new(caps, json_string(who->caps[i]));
-        return say(body, blen, 200, json_pack("{s:s, s:s, s:s, s:o}", "id", who->id, "version", who->version, "api",
-                                              API_VERSION, "capabilities", caps));
+        for (int i = 0; i < who->ndests; i++)
+            json_array_append_new(dests, json_string(who->dests[i]));
+        return say(body, blen, 200, json_pack("{s:s, s:s, s:s, s:o, s:o}", "id", who->id, "version", who->version, "api",
+                                              API_VERSION, "capabilities", caps, "destinations", dests));
     }
     for (size_t i = 0; i < sizeof(machine) / sizeof(machine[0]); i++) {
         if (strcmp(p, machine[i].path) != 0)

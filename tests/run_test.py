@@ -21,7 +21,9 @@ programs to run: the file that is really in its data directory gets as far as
 the machine, and a symbolic link out of the directory and a name with a
 directory in it are refused in words before anything does. A killed service
 comes back. The one that keeps ending is quarantined, and state.json
-remembers it.
+remembers it. A fifth package asks for destinations of the operator's: it
+reaches nothing until the operator names the peer, is started again with
+it, reaches it, and loses it again when the operator takes it away.
 Safe mode stops everything and leaves no group and no chain. SIGTERM does the
 same and the daemon exits 0.
 
@@ -143,6 +145,27 @@ def dial(host, p):
         s.close()
 while True:
     print("dial peer %s, machine %s" % (dial(name, port), dial("127.0.0.1", local)), flush=True)
+    time.sleep(1)
+'''
+
+# The one the operator gives its destinations: what it may reach, and whether it does.
+OPDIAL = API_CLIENT + r'''
+import socket, sys, time
+host, port = sys.argv[1], int(sys.argv[2])
+code, me = api("GET", "/v0/self")
+print("opdial self %d [%s]" % (code, ",".join(me.get("destinations", []))), flush=True)
+def dial():
+    s = socket.socket()
+    s.settimeout(3)
+    try:
+        s.connect((host, port))
+        return "ok"
+    except OSError as e:
+        return "errno %s" % e.errno
+    finally:
+        s.close()
+while True:
+    print("opdial dial %s" % dial(), flush=True)
     time.sleep(1)
 '''
 
@@ -494,6 +517,54 @@ def main():
               "state.json remembers it")
         check(logged("ext org.example.crash: about to end"), "its last words are in the log")
         check(not os.path.isdir(CG_PARENT + "/org.example.crash"), "and its group is gone")
+
+        print("destinations the operator names")
+        oid, where = "org.example.opdial", "%s:%d" % (PEER_ADDR, pport)
+
+        def since(mark, text):
+            log.flush()
+            return text in open(log_path).read()[mark:]
+
+        def mark():
+            log.flush()
+            return len(open(log_path).read())
+
+        at = mark()
+        package(oid, "python", OPDIAL, caps=["net.outbound.operator"], args=[PEER_ADDR, str(pport)])
+        check(wait_for(lambda: since(at, "ext %s: opdial self 200 []" % oid), 30),
+              "it runs, and may reach nothing: no destination is named")
+        check(wait_for(lambda: since(at, "ext %s: opdial dial errno" % oid), 10) and not since(at, "opdial dial ok"),
+              "and it does not reach the peer")
+        first = svc(oid).get("pid")
+        for args, words in (((oid, "add", "127.0.0.1:80"), "is this machine"),
+                            ((oid, "add", "peer.test"), "a destination is host:port"),
+                            ((oid, "remove", where), "is not one of the destinations"),
+                            (("org.example.dial", "add", where), "does not ask for destinations"),
+                            (("org.example.nothere", "add", where), "is not installed")):
+            r = fx("dest", *args)
+            check(r.get("ok") is False and words in r.get("error", ""), "dest %s -> %s", " ".join(args), r.get("error"))
+        at = mark()
+        r = fx("dest", oid, "add", where)
+        check(r.get("ok") is True and r.get("destinations") == [where], "the operator names the peer: %s", r)
+        check(fx("dest", oid, "add", where).get("ok") is False, "the same destination twice is refused")
+        listed = {x["id"]: x.get("destinations") for x in fx("list").get("packages", [])}
+        check(listed.get(oid) == [where] and listed.get("org.example.dial") == [], "the list names them: %s", listed)
+        check(wait_for(lambda: since(at, "ext %s: opdial self 200 [%s]" % (oid, where)), 30),
+              "it is started again with its new way out, and its own answer names it")
+        check(wait_for(lambda: since(at, "ext %s: opdial dial ok" % oid), 10), "and it reaches the peer")
+        s = svc(oid)
+        check(s.get("state") == "running" and s.get("pid") != first
+              and since(at, "%s: stopping (started again: its version or its destinations changed)" % oid),
+              "a new process, said in the log, and no crash: %s", s)
+        at = mark()
+        r = fx("dest", oid, "remove", where)
+        check(r.get("ok") is True and r.get("destinations") == [], "the operator takes it away: %s", r)
+        check(wait_for(lambda: since(at, "ext %s: opdial self 200 []" % oid), 30)
+              and wait_for(lambda: since(at, "ext %s: opdial dial errno" % oid), 10),
+              "started again, it reaches nothing again")
+        st = json.load(open(os.path.join(root, "state.json")))["packages"][oid]
+        check(st.get("destinations") == [] and not st.get("quarantined"), "state.json: %s", st)
+        check(fx("remove", oid).get("ok") is True and wait_for(lambda: oid not in running(), 10), "and it goes")
 
         print("the operator's switch for one package")
         r = fx("disable", "org.example.crash")
