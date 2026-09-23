@@ -1,0 +1,13 @@
+{
+  "manifest": 1,
+  "id": "@@ID@@",
+  "name": "@@NAME@@",
+  "version": "0.1.0",
+  "description": "A service that follows the machine's events.",
+  "author": "You",
+  "license": "MIT",
+  "api": "0.1",
+  "runtime": "python",
+  "service": { "exec": "bin/run.py" },
+  "capabilities": ["events", "machine.read", "storage:4"]
+}

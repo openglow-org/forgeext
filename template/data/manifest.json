@@ -1,0 +1,12 @@
+{
+  "manifest": 1,
+  "id": "@@ID@@",
+  "name": "@@NAME@@",
+  "version": "0.1.0",
+  "description": "Files, and nothing that runs.",
+  "author": "You",
+  "license": "MIT",
+  "api": "0.1",
+  "runtime": "data",
+  "capabilities": []
+}

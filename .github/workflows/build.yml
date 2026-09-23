@@ -68,6 +68,13 @@ jobs:
           sudo FORGEEXT=build/forgeext FWUP="$(command -v fwup)" \
             FFX_RULES=forgefirm-rules/meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files/ffx.nft \
             python3 -B tests/run_test.py
+      - name: "sdk_test (the author's kit: ffx.py, ffx.sh through curl, and ffx.h built static, each a real package under the host)"
+        run: |
+          sudo FORGEEXT=build/forgeext FWUP="$(command -v fwup)" \
+            FFX_RULES=forgefirm-rules/meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files/ffx.nft \
+            python3 -B tests/sdk_test.py
+      - name: "ffx_test (the author's tool: ffx lint agrees with forgeext inspect on every fixture, pack, keygen, new)"
+        run: FORGEEXT=build/forgeext FWUP="$(command -v fwup)" python3 -B tests/ffx_test.py
       - name: install_test (the built binary against real archives, hostile ones included)
         run: |
           # 77 is the script's "could not run here": on this runner that is a failure.

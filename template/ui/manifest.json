@@ -1,0 +1,15 @@
+{
+  "manifest": 1,
+  "id": "@@ID@@",
+  "name": "@@NAME@@",
+  "version": "0.1.0",
+  "description": "A page of its own in the control panel.",
+  "author": "You",
+  "license": "MIT",
+  "api": "0.1",
+  "runtime": "ui",
+  "capabilities": ["ui", "machine.read", "settings.own"],
+  "settings": {
+    "greeting": { "type": "string", "default": "hello", "max": 32, "label": "Greeting" }
+  }
+}

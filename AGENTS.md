@@ -24,7 +24,16 @@ FWUP=/path/to/fwup python3 -B tests/install_test.py
 sudo ./build/sandbox_test
 sudo FORGEEXT=build/forgeext python3 -B tests/netrules_test.py
 sudo FORGEEXT=build/forgeext FWUP=/path/to/fwup python3 -B tests/run_test.py
+FORGEEXT=build/forgeext FWUP=/path/to/fwup python3 -B tests/ffx_test.py
+sudo FORGEEXT=build/forgeext FWUP=/path/to/fwup python3 -B tests/sdk_test.py
 ```
+
+`tools/ffx` mirrors the host's judgment of a package (the manifest, the
+capabilities, the page, the entry point, the payload's limits), so a change
+to what the host takes changes it too: `tests/ffx_test.py` holds the two to
+the same verdict on every fixture, in the host's words. `tests/sdk_test.py`
+runs the kit's three service clients (`sdk/python/ffx.py`, `sdk/sh/ffx.sh`,
+`sdk/c/ffx.h`) as real packages under the daemon, in the sandbox.
 
 A warning is a failure. `tests/install_test.py` drives the built binary
 against real archives made with fwup and throwaway keys, hostile ones

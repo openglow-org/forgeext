@@ -1,0 +1,13 @@
+{
+  "manifest": 1,
+  "id": "@@ID@@",
+  "name": "@@NAME@@",
+  "version": "0.1.0",
+  "description": "A shell service that reads the machine's mode.",
+  "author": "You",
+  "license": "MIT",
+  "api": "0.1",
+  "runtime": "shell",
+  "service": { "exec": "bin/run.sh" },
+  "capabilities": ["machine.read"]
+}

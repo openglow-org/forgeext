@@ -1,0 +1,909 @@
+#!/usr/bin/env python3
+# Copyright 2026 514 LLC d/b/a OpenGlow
+# Written by Scott Wiederhold
+# SPDX-License-Identifier: MIT
+"""ffx - the package author's tool for ForgeFIRM extension packages.
+
+    ffx new DIR --id ID --runtime ui|python|shell|native|data [--name NAME]
+    ffx lint DIR
+    ffx pack DIR [--key KEY.priv] [--out FILE]
+    ffx keygen NAME
+    ffx install FILE --machine ADDR [--user NAME] [--grant CAPABILITY]...
+    ffx logs --machine ADDR [--user NAME] [--id ID] [--follow]
+
+`lint` judges a package the way the machine's extension host does, in its
+words, and stops where it would: the manifest, the capabilities, the page,
+the service's entry point, the payload's limits, and a Python package's
+imports against the release image's module list. `pack` lints, then builds
+the archive with fwup (the same one a machine verifies with), signs it when
+given a key, and checks the signature before it says so. `install` logs in
+to a machine over HTTPS, uploads, shows what the machine says the package is
+and asks for, and installs with the consent its tier takes. `logs` reads the
+extension host's log, a package's lines alone with --id.
+
+Extension API 0.1. Python 3.8 or later and the standard library; fwup for
+pack and keygen (set FWUP to its path).
+"""
+import argparse
+import ast
+import getpass
+import gzip
+import hashlib
+import http.client
+import io
+import json
+import os
+import re
+import shutil
+import ssl
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.parse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SDK = os.path.normpath(os.path.join(HERE, "..", "sdk"))
+TEMPLATE = os.path.normpath(os.path.join(HERE, "..", "template"))
+API = (0, 1)
+PRODUCT = "ForgeFIRM extension"
+
+# ---------------------------------------------------------------- the schema
+# Everything below mirrors the host (forgeext src/manifest.c, src/caps.c,
+# src/install.c, src/pkg.c); tests/ffx_test.py holds the two to agreeing on
+# every verdict.
+
+KNOWN_KEYS = ("manifest", "id", "name", "version", "description", "author", "license", "homepage",
+              "api", "core", "runtime", "service", "modes", "capabilities", "conflicts", "settings")
+RUNTIMES = ("data", "ui", "shell", "native", "python")
+SERVICE_RUNTIMES = ("shell", "native", "python")
+SERVICE_ONLY = ("hold", "job_time.run", "net.outbound", "net.listen", "storage")
+# name: (takes an argument, needs the operator's grant, offered)
+CAPS = {
+    "machine.read": (False, False, True), "events": (False, False, True), "settings.own": (False, False, True),
+    "camera.lid": (False, False, True), "camera.head": (False, False, True), "motion.jog": (False, False, True),
+    "motion.offsets": (False, True, False), "motion.job": (False, True, True), "hold": (False, True, True),
+    "job_time.run": (False, True, True), "ui": (False, False, True), "wizard": (False, False, False),
+    "net.outbound": (True, False, True), "net.listen": (True, False, True), "storage": (True, False, True),
+    "mcode": (True, False, False),
+}
+FIRMWARE_PORTS = (22, 23, 80, 443, 8090)
+CAP_MAX_LEN = 96
+TEXT = {"id": 64, "name": 65, "version": 33, "description": 257, "author": 129, "license": 65, "homepage": 257}
+MANIFEST_MAX_BYTES = 64 * 1024
+MAX_CAPS, MAX_ARGS, MAX_LIST, MAX_SETTINGS = 32, 16, 16, 16
+SETTING_NAME_MAX, SETTING_LABEL_MAX, SETTING_TEXT_MAX, SETTING_CHOICE_MAX, SETTING_CHOICES_MAX = 33, 49, 129, 33, 6
+UI_FILE, UI_MAX = "ui/index.html", 512 * 1024
+PAYLOAD_MAX, FILE_MAX, FILES_MAX, DEPTH_MAX, PATH_MAX = 64 << 20, 32 << 20, 4096, 16, 192
+
+
+class Refused(Exception):
+    """The host's refusal, in its words."""
+
+
+def _bytes(s):
+    return len(s.encode("utf-8"))
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def id_ok(i):
+    if not isinstance(i, str) or not 3 <= len(i) <= 63:
+        return False
+    label, labels = 0, 1
+    for k, c in enumerate(i):
+        if c == ".":
+            if label == 0 or i[k - 1] == "-":
+                return False
+            label, labels = 0, labels + 1
+        elif "a" <= c <= "z":
+            label += 1
+        elif (c.isdigit() or c == "-") and label > 0 and c.isascii():
+            label += 1
+        else:
+            return False
+        if label > 31:
+            return False
+    return label > 0 and i[-1] != "-" and labels >= 2
+
+
+def _number(s, pos):
+    m = re.compile(r"[0-9]+").match(s, pos)
+    if not m or (m.group()[0] == "0" and len(m.group()) > 1) or len(m.group()) > 9:
+        return None, pos
+    return int(m.group()), m.end()
+
+
+def version_split(v):
+    if not isinstance(v, str) or _bytes(v) > 32:
+        return None
+    nums, p = [], 0
+    for k in range(3):
+        n, p = _number(v, p)
+        if n is None:
+            return None
+        nums.append(n)
+        if k < 2:
+            if p >= len(v) or v[p] != ".":
+                return None
+            p += 1
+    if p == len(v):
+        return nums, None
+    if v[p] != "-" or p + 1 == len(v) or not re.fullmatch(r"[A-Za-z0-9.-]+", v[p + 1:]):
+        return None
+    return nums, v[p + 1:]
+
+
+def version_ok(v):
+    return version_split(v) is not None
+
+
+def version_cmp(a, b):
+    (na, pa), (nb, pb) = version_split(a) or ([0, 0, 0], None), version_split(b) or ([0, 0, 0], None)
+    if na != nb:
+        return -1 if na < nb else 1
+    if pa is None and pb is None:
+        return 0
+    if pa is None:
+        return 1
+    if pb is None:
+        return -1
+    return (pa > pb) - (pa < pb)
+
+
+def _text(root, key, required, size):
+    if key not in root:
+        if required:
+            raise Refused('"%s" is missing' % key)
+        return ""
+    s = root[key]
+    if not isinstance(s, str):
+        raise Refused('"%s" is not a string' % key)
+    if "\0" in s:
+        raise Refused('"%s" holds a NUL' % key)
+    if s == "" and required:
+        raise Refused('"%s" is empty' % key)
+    if _bytes(s) >= size:
+        raise Refused('"%s" is longer than %d bytes' % (key, size - 1))
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in s):
+        raise Refused('"%s" holds a control character' % key)
+    return s
+
+
+def inside_path_ok(p):
+    if not p or p[0] == "/":
+        return False
+    for seg in p.split("/"):
+        if seg in ("", ".", ".."):
+            return False
+    return all(" " < c <= "~" and c != "\\" for c in p)
+
+
+def _dns_name_ok(h):
+    if not 1 <= len(h) <= 253 or h[0] == "." or h[-1] == ".":
+        return False
+    label = 0
+    for k, c in enumerate(h):
+        if c == ".":
+            if label == 0 or h[k - 1] == "-":
+                return False
+            label = 0
+        elif (c.isascii() and c.isalnum()) or (c == "-" and label > 0):
+            label += 1
+            if c.isupper() or label > 63:
+                return False
+        else:
+            return False
+    return h[-1] != "-"
+
+
+def _outbound(arg):
+    if arg.startswith("["):
+        close = arg.find("]")
+        if close < 0 or arg[close + 1:close + 2] != ":":
+            return None
+        host, port = arg[1:close], arg[close + 2:]
+        if not (2 <= len(host) <= 45 and ":" in host and re.fullmatch(r"[0-9a-f:.]+", host)):
+            return None
+    else:
+        colon = arg.rfind(":")
+        if colon <= 0:
+            return None
+        host, port = arg[:colon], arg[colon + 1:]
+        if not _dns_name_ok(host):
+            return None
+    if not re.fullmatch(r"[1-9][0-9]{0,8}", port) or not 1 <= int(port) <= 65535:
+        return None
+    return host, int(port)
+
+
+def caps_check(cap):
+    """caps_check(): None when the capability is one a manifest may ask for, else the words."""
+    if not cap or len(cap) >= CAP_MAX_LEN:
+        return "a capability is 1 to %d characters" % (CAP_MAX_LEN - 1)
+    if any(not (" " < c <= "~") for c in cap):
+        return "a capability is printable ASCII with no space"
+    arg = cap.split(":", 1)[1] if ":" in cap else None
+    if cap == "role" or cap.startswith("role:"):
+        if arg in ("homing", "controller"):
+            return "role %s is part of the firmware: no package provides it" % arg
+        return "no package provides a role in this extension API"
+    name = cap.split(":", 1)[0]
+    if name not in CAPS:
+        return "%s is not a capability" % name
+    takes, _grant, offered = CAPS[name]
+    if not offered:
+        return "%s is not offered by this extension API" % name
+    if not takes:
+        return "%s takes no argument" % name if arg is not None else None
+    if not arg:
+        return "%s needs an argument (%s:<value>)" % (name, name)
+    if name == "net.outbound":
+        hp = _outbound(arg)
+        if hp is None:
+            return ("net.outbound names one destination, host:port, the host a lowercase DNS name, an IPv4 "
+                    "address, or an IPv6 address in brackets")
+        if hp[0] == "localhost" or hp[0].startswith("127.") or hp[0] == "::1":
+            return "net.outbound never names the machine itself"
+        return None
+    if name == "net.listen":
+        if not re.fullmatch(r"[1-9][0-9]{0,8}", arg) or not 1024 <= int(arg) <= 65535:
+            return "net.listen names one port, 1024 to 65535"
+        if int(arg) in FIRMWARE_PORTS:
+            return "port %d is the firmware's own" % int(arg)
+        return None
+    if name == "storage":
+        if not re.fullmatch(r"[1-9][0-9]{0,8}", arg) or not 1 <= int(arg) <= 256:
+            return "storage names a quota in MiB, 1 to 256"
+        return None
+    return "%s is not offered by this extension API" % name
+
+
+def needs_grant(cap):
+    return CAPS.get(cap.split(":", 1)[0], (0, 0, 0))[1]
+
+
+def _setting(name, o):
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", name) or len(name) >= SETTING_NAME_MAX:
+        raise Refused('setting "%s": a name is a to z, 0 to 9 and _, starting with a letter, at most %d bytes'
+                      % (name[:32], SETTING_NAME_MAX - 1))
+    if not isinstance(o, dict):
+        raise Refused('setting "%s" is not an object' % name)
+    for k in o:
+        if k not in ("type", "default", "label", "min", "max", "choices"):
+            raise Refused('setting "%s" has an unknown key "%s"' % (name, k[:32]))
+    t = o.get("type")
+    if t not in ("string", "number", "bool", "choice"):
+        raise Refused('setting "%s": "type" is string, number, bool, or choice' % name)
+    if "label" in o:
+        lb = o["label"]
+        if not isinstance(lb, str) or "\0" in lb or _bytes(lb) >= SETTING_LABEL_MAX:
+            raise Refused('setting "%s": "label" is a string of at most %d bytes' % (name, SETTING_LABEL_MAX - 1))
+    if "default" not in o:
+        raise Refused('setting "%s": "default" is missing (a setting is never unset)' % name)
+    d, mn, mx = o["default"], o.get("min"), o.get("max")
+    if t == "number":
+        if not _is_number(d):
+            raise Refused('setting "%s": its default is not a number' % name)
+        if "min" in o and not _is_number(mn):
+            raise Refused('setting "%s": "min" is not a number' % name)
+        if "max" in o and not _is_number(mx):
+            raise Refused('setting "%s": "max" is not a number' % name)
+        if "min" in o and "max" in o and mn > mx:
+            raise Refused('setting "%s": its min is above its max' % name)
+        if ("min" in o and d < mn) or ("max" in o and d > mx):
+            raise Refused('setting "%s": its default is outside its own bounds' % name)
+        return
+    if "min" in o:
+        raise Refused('setting "%s": "min" belongs to a number' % name)
+    if t == "bool":
+        if "max" in o:
+            raise Refused('setting "%s": "max" belongs to a number or a string' % name)
+        if not isinstance(d, bool):
+            raise Refused('setting "%s": its default is not true or false' % name)
+        return
+    if not isinstance(d, str) or "\0" in d:
+        raise Refused('setting "%s": its default is not a string' % name)
+    if t == "choice":
+        if "max" in o:
+            raise Refused('setting "%s": "max" belongs to a number or a string' % name)
+        ch = o.get("choices")
+        if not isinstance(ch, list) or not 2 <= len(ch) <= SETTING_CHOICES_MAX:
+            raise Refused('setting "%s": a choice has 2 to %d choices' % (name, SETTING_CHOICES_MAX))
+        seen = []
+        for k, c in enumerate(ch):
+            if not isinstance(c, str) or "\0" in c or not c or _bytes(c) >= SETTING_CHOICE_MAX:
+                raise Refused('setting "%s": choice %d is not a string of 1 to %d bytes' % (name, k, SETTING_CHOICE_MAX - 1))
+            if c in seen:
+                raise Refused('setting "%s": the choice "%s" is named twice' % (name, c[:32]))
+            seen.append(c)
+        if d not in seen:
+            raise Refused('setting "%s": its default is not one of its choices' % name)
+        return
+    if "choices" in o:
+        raise Refused('setting "%s": "choices" belongs to a choice' % name)
+    top = SETTING_TEXT_MAX - 1
+    if "max" in o:
+        if not _is_int(mx) or not 1 <= mx <= SETTING_TEXT_MAX - 1:
+            raise Refused('setting "%s": "max" is a whole number of bytes, 1 to %d' % (name, SETTING_TEXT_MAX - 1))
+        top = mx
+    if _bytes(d) > top:
+        raise Refused('setting "%s": its default is longer than its own max' % name)
+
+
+def _no_duplicates(pairs):
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise Refused("the manifest is not JSON: duplicate object key \"%s\"" % k)
+        out[k] = v
+    return out
+
+
+def _no_constant(name):
+    raise Refused("the manifest is not JSON: %s is not a JSON value" % name)
+
+
+def judge_manifest(raw):
+    """manifest_parse(): the manifest as a dict, or Refused with the host's words."""
+    if len(raw) > MANIFEST_MAX_BYTES:
+        raise Refused("the manifest is larger than %d bytes" % MANIFEST_MAX_BYTES)
+    try:
+        root = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates, parse_constant=_no_constant)
+    except (ValueError, UnicodeDecodeError) as e:
+        if isinstance(e, Refused):
+            raise
+        raise Refused("the manifest is not JSON: %s" % e)
+    if not isinstance(root, dict):
+        raise Refused("the manifest is not a JSON object")
+    for k in root:
+        if k not in KNOWN_KEYS:
+            raise Refused('unknown key "%s"' % k[:48])
+    if not _is_int(root.get("manifest")) or root["manifest"] != 1:
+        raise Refused('"manifest" is the schema number, 1')
+    pid = _text(root, "id", True, TEXT["id"])
+    if not id_ok(pid):
+        raise Refused('"id" is a reverse-DNS name in lowercase: two or more labels of a-z, 0-9, and -, each '
+                      'starting with a letter, 63 characters in all')
+    _text(root, "name", True, TEXT["name"])
+    if not version_ok(_text(root, "version", True, TEXT["version"])):
+        raise Refused('"version" is MAJOR.MINOR.PATCH with an optional -prerelease')
+    _text(root, "description", False, TEXT["description"])
+    _text(root, "author", True, TEXT["author"])
+    _text(root, "license", True, TEXT["license"])
+    _text(root, "homepage", False, TEXT["homepage"])
+    api = _text(root, "api", True, 17)
+    m = re.fullmatch(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})", api)
+    if not m:
+        raise Refused('"api" is MAJOR.MINOR, for example "%d.%d"' % API)
+    major, minor = int(m.group(1)), int(m.group(2))
+    if not (major == API[0] and (minor == API[1] if major == 0 else minor <= API[1])):
+        raise Refused("built for extension API %d.%d; this firmware serves %d.%d" % (major, minor, API[0], API[1]))
+    if "core" in root:
+        core = root["core"]
+        if not isinstance(core, dict):
+            raise Refused('"core" is not an object')
+        for k, v in core.items():
+            if k not in ("min", "max"):
+                raise Refused('"core" has an unknown key "%s"' % k[:32])
+            if not isinstance(v, str) or not version_ok(v):
+                raise Refused('"core"."%s" is not a version (MAJOR.MINOR.PATCH)' % k)
+        if "min" in core and "max" in core and version_cmp(core["min"], core["max"]) > 0:
+            raise Refused('"core"."min" is above "core"."max"')
+    runtime = _text(root, "runtime", True, 17)
+    if runtime not in RUNTIMES:
+        raise Refused('"runtime" is one of data, ui, shell, native, python')
+    service = runtime in SERVICE_RUNTIMES
+    svc = root.get("service")
+    if not service:
+        if "service" in root:
+            raise Refused('runtime %s runs nothing on the machine: it has no "service"' % runtime)
+    else:
+        if "service" not in root:
+            raise Refused('runtime %s needs a "service"' % runtime)
+        if not isinstance(svc, dict):
+            raise Refused('"service" is not an object')
+        for k in svc:
+            if k not in ("exec", "args"):
+                raise Refused('"service" has an unknown key "%s"' % k[:32])
+        if not inside_path_ok(_text(svc, "exec", True, 193)):
+            raise Refused('"service"."exec" is a path inside the package: relative, no "..", no space, forward slashes')
+        if "args" in svc:
+            args = svc["args"]
+            if not isinstance(args, list) or len(args) > MAX_ARGS:
+                raise Refused('"service"."args" is an array of at most %d strings' % MAX_ARGS)
+            for k, a in enumerate(args):
+                if not isinstance(a, str) or "\0" in a or _bytes(a) >= 129:
+                    raise Refused('"service"."args"[%d] is not a string of at most 128 bytes' % k)
+                if any(ord(c) < 0x20 or ord(c) == 0x7F for c in a):
+                    raise Refused('"service"."args"[%d] holds a control character' % k)
+    if "modes" in root:
+        modes = root["modes"]
+        if not isinstance(modes, list) or not modes:
+            raise Refused('"modes" is a list of grbl, cloud, or both')
+        seen = []
+        for s in modes:
+            if s not in ("grbl", "cloud") or s in seen:
+                raise Refused('"modes" is a list of grbl, cloud, or both, each once')
+            seen.append(s)
+    if "capabilities" not in root:
+        raise Refused('"capabilities" is missing (an empty list asks for nothing)')
+    caps = root["capabilities"]
+    if not isinstance(caps, list) or len(caps) > MAX_CAPS:
+        raise Refused('"capabilities" is an array of at most %d strings' % MAX_CAPS)
+    have = []
+    for k, c in enumerate(caps):
+        if not isinstance(c, str) or "\0" in c:
+            raise Refused('"capabilities"[%d] is not a string' % k)
+        why = caps_check(c)
+        if why:
+            raise Refused('capability "%s": %s' % (c[:80], why))
+        if c in have:
+            raise Refused('capability "%s" is listed twice' % c)
+        if runtime == "data":
+            raise Refused('runtime data executes nothing and holds no capability ("%s")' % c)
+        if not service and c.split(":", 1)[0] in SERVICE_ONLY:
+            raise Refused('capability "%s" belongs to a service, and runtime %s has none' % (c, runtime))
+        have.append(c)
+    if sum(1 for c in have if c.startswith("storage:")) > 1:
+        raise Refused('"storage" is asked for twice')
+    if "conflicts" in root:
+        lst = root["conflicts"]
+        if not isinstance(lst, list) or len(lst) > MAX_LIST:
+            raise Refused('"conflicts" is an array of at most %d package ids' % MAX_LIST)
+        seen = []
+        for k, i in enumerate(lst):
+            if not isinstance(i, str) or not id_ok(i):
+                raise Refused('"conflicts"[%d] is not a package id' % k)
+            if i == pid:
+                raise Refused("a package does not conflict with itself")
+            if i in seen:
+                raise Refused('"conflicts" lists %s twice' % i)
+            seen.append(i)
+    if "settings" in root:
+        st = root["settings"]
+        if not isinstance(st, dict):
+            raise Refused('"settings" is an object of named settings')
+        if len(st) > MAX_SETTINGS:
+            raise Refused('"settings" has at most %d keys' % MAX_SETTINGS)
+        for name, o in st.items():
+            _setting(name, o)
+    return root
+
+
+def payload_files(d):
+    """Every file and directory of the package, as the payload will hold them, or Refused."""
+    out, total = [], 0
+    for base, dirs, files in os.walk(d):
+        dirs.sort()
+        for name in sorted(dirs + files):
+            full = os.path.join(base, name)
+            rel = os.path.relpath(full, d).replace(os.sep, "/")
+            if name in ("__pycache__",) or name.endswith(".ffx"):
+                continue
+            if os.path.islink(full):
+                raise Refused("%s is a symbolic link: a payload holds regular files and directories only" % rel)
+            if len(rel) > PATH_MAX or rel.count("/") + 1 > DEPTH_MAX or any(not (" " <= c <= "~") or c == "\\" for c in rel):
+                raise Refused("%s: a payload path is printable ASCII, at most %d characters and %d directories deep"
+                              % (rel, PATH_MAX, DEPTH_MAX))
+            if os.path.isfile(full):
+                size = os.path.getsize(full)
+                if size > FILE_MAX:
+                    raise Refused("%s is larger than a file of a payload may be (%d MiB)" % (rel, FILE_MAX >> 20))
+                total += size
+                out.append((rel, full, False))
+            elif os.path.isdir(full):
+                out.append((rel, full, True))
+            else:
+                raise Refused("%s is neither a file nor a directory" % rel)
+        dirs[:] = [x for x in dirs if x != "__pycache__"]
+    if sum(1 for x in out if not x[2]) > FILES_MAX:
+        raise Refused("the payload holds more than %d files" % FILES_MAX)
+    if total > PAYLOAD_MAX:
+        raise Refused("the payload is larger than %d MiB unpacked" % (PAYLOAD_MAX >> 20))
+    return out
+
+
+def release_modules():
+    with open(os.path.join(SDK, "python", "modules.txt"), encoding="utf-8") as f:
+        return set(ln.strip() for ln in f if ln.strip() and not ln.startswith("#"))
+
+
+def python_imports(d, files):
+    """(file, line, module) for each import no module of the release image or of the package answers."""
+    have = release_modules()
+    own = set()
+    for rel, _full, isdir in files:
+        top = rel.split("/")
+        if not isdir and rel.endswith(".py"):
+            own.add(top[-1][:-3])
+        if isdir:
+            own.add(top[-1])
+    out = []
+    for rel, full, isdir in files:
+        if isdir or not rel.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(open(full, "rb").read(), rel)
+        except SyntaxError as e:
+            out.append((rel, e.lineno or 0, "(a syntax error: %s)" % e.msg))
+            continue
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                names = [node.module]
+            for n in names:
+                top = n.split(".")[0]
+                if top not in have and top not in own:
+                    out.append((rel, node.lineno, n))
+    return out
+
+
+def lint(d, quiet=False):
+    """The package in d judged as the host judges it. (manifest, [warnings]); Refused at the first fault."""
+    mpath = os.path.join(d, "manifest.json")
+    if not os.path.isfile(mpath):
+        raise Refused("the package has no manifest.json")
+    m = judge_manifest(open(mpath, "rb").read())
+    files = payload_files(d)
+    rels = {r for r, _f, isdir in files if not isdir}
+    wants_ui = "ui" in m["capabilities"]
+    if wants_ui and UI_FILE not in rels:
+        raise Refused("this package asks for ui and has no %s" % UI_FILE)
+    if not wants_ui and UI_FILE in rels:
+        raise Refused("this package has a %s and does not ask for ui" % UI_FILE)
+    warnings = []
+    if wants_ui:
+        size = os.path.getsize(os.path.join(d, UI_FILE))
+        if size > UI_MAX:
+            raise Refused("%s is %d bytes and at most %d are taken" % (UI_FILE, size, UI_MAX))
+        if size == 0:
+            raise Refused("%s is empty" % UI_FILE)
+        page = open(os.path.join(d, UI_FILE), "rb").read()
+        if b"\0" in page:
+            raise Refused("%s holds a NUL" % UI_FILE)
+        bridge = open(os.path.join(SDK, "js", "ffx-bridge.js"), "rb").read().replace(b"\r\n", b"\n")
+        if b"var ffx = (function" in page and bridge not in page.replace(b"\r\n", b"\n"):
+            warnings.append("%s carries a bridge client that is not the SDK's %s" % (UI_FILE, "sdk/js/ffx-bridge.js"))
+    if m["runtime"] in SERVICE_RUNTIMES:
+        ex = m["service"]["exec"]
+        if ex not in rels:
+            raise Refused("the service's entry point, %s, is not a file of the package" % ex)
+    if m["runtime"] == "python":
+        for rel, line, mod in python_imports(d, files):
+            raise Refused("%s:%d imports %s, which is not in the release image's module list (sdk/python/modules.txt)"
+                          % (rel, line, mod))
+    for c in m["capabilities"]:
+        if needs_grant(c):
+            warnings.append("%s takes the operator's own grant at install" % c)
+    if m["id"].startswith(("org.openglow.", "org.forgefirm.")):
+        warnings.append("%s is in the official namespace: only an archive signed with the OpenGlow extension key "
+                        "installs under it" % m["id"])
+    return m, warnings, files
+
+
+# ---------------------------------------------------------------- pack
+
+def fwup_bin():
+    b = os.environ.get("FWUP") or shutil.which("fwup")
+    if not b:
+        raise Refused("fwup is not found: install it, or set FWUP to its path")
+    return b
+
+
+def payload(d, m, files, out):
+    """A gzip-compressed tar of the package, the same bytes every time: sorted names, owner 0, time 0, and
+    each file 0644 or 0755 (0755 for the service's entry point and for what is executable here)."""
+    ex = (m.get("service") or {}).get("exec")
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as t:
+        for rel, full, isdir in sorted(files):
+            info = tarfile.TarInfo(rel)
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            info.mtime = 0
+            if isdir:
+                info.type, info.mode = tarfile.DIRTYPE, 0o755
+                t.addfile(info)
+                continue
+            data = open(full, "rb").read()
+            info.size = len(data)
+            info.mode = 0o755 if rel == ex or (os.name != "nt" and os.stat(full).st_mode & 0o111) else 0o644
+            t.addfile(info, io.BytesIO(data))
+    with open(out, "wb") as f:
+        with gzip.GzipFile(fileobj=f, mode="wb", compresslevel=9, mtime=0, filename="") as gz:
+            gz.write(raw.getvalue())
+
+
+def cmd_pack(a):
+    m, warnings, files = lint(a.dir)
+    for w in warnings:
+        print("note: " + w)
+    fwup = fwup_bin()
+    out = a.out or "%s-%s.ffx" % (m["id"], m["version"])
+    work = tempfile.mkdtemp(prefix="ffx-pack-")
+    try:
+        pl = os.path.join(work, "payload.tar.gz")
+        payload(a.dir, m, files, pl)
+        conf = os.path.join(work, "fwup.conf")
+        with open(conf, "w") as f:
+            f.write('meta-product = "%s"\nmeta-description = "%s"\nmeta-version = "%s"\nmeta-platform = "forgefirm-ext"\n'
+                    'file-resource payload.tar.gz {\n    host-path = "%s"\n}\n'
+                    % (PRODUCT, m["id"], m["version"], pl.replace("\\", "/")))
+        raw = os.path.join(work, "unsigned.ffx")
+        subprocess.run([fwup, "-c", "-f", conf, "-o", raw], check=True, capture_output=True)
+        if a.key:
+            pub = a.key[:-5] + ".pub" if a.key.endswith(".priv") else None
+            if not pub or not os.path.isfile(pub):
+                raise Refused("the key's public half (%s) is not beside it: a signature that cannot be checked is "
+                              "not made" % (pub or a.key + ".pub"))
+            signed = os.path.join(work, "signed.ffx")
+            subprocess.run([fwup, "-S", "-s", a.key, "-i", raw, "-o", signed], check=True, capture_output=True)
+            v = subprocess.run([fwup, "-V", "-i", signed, "-p", pub], capture_output=True)
+            if v.returncode != 0:
+                raise Refused("the signature does not check against %s" % pub)
+            shutil.copyfile(signed, out)
+            print("signed: %s (%s %s)" % (out, m["id"], m["version"]))
+        else:
+            shutil.copyfile(raw, out)
+            print("UNSIGNED: %s (%s %s) - a machine installs it only with its button held" % (out, m["id"], m["version"]))
+    except subprocess.CalledProcessError as e:
+        raise Refused("fwup failed: %s" % (e.stderr or b"").decode("utf-8", "replace").strip())
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return 0
+
+
+def cmd_keygen(a):
+    fwup = fwup_bin()
+    for ext in (".pub", ".priv"):
+        if os.path.exists(a.name + ext):
+            raise Refused("%s%s is already there: a key is never overwritten" % (a.name, ext))
+    subprocess.run([fwup, "-g", "-o", a.name], check=True, capture_output=True)
+    print("%s.priv  the private key: keep it, and keep it to yourself" % a.name)
+    print("%s.pub   the public key: what an owner adds on their machine to trust your packages" % a.name)
+    return 0
+
+
+# ---------------------------------------------------------------- new
+
+def cmd_new(a):
+    if not id_ok(a.id):
+        raise Refused('"%s" is not a package id: two or more lowercase labels, like org.example.notify' % a.id)
+    src = os.path.join(TEMPLATE, a.runtime)
+    if not os.path.isdir(src):
+        raise Refused("no template for runtime %s" % a.runtime)
+    if os.path.exists(a.dir):
+        raise Refused("%s is already there" % a.dir)
+    name = a.name or a.id.rsplit(".", 1)[-1].replace("-", " ").capitalize()
+    shutil.copytree(src, a.dir)
+    bridge = open(os.path.join(SDK, "js", "ffx-bridge.js"), encoding="utf-8").read()
+    for base, _dirs, files in os.walk(a.dir):
+        for fn in files:
+            p = os.path.join(base, fn)
+            try:
+                text = open(p, encoding="utf-8").read()
+            except UnicodeDecodeError:
+                continue
+            text = text.replace("@@ID@@", a.id).replace("@@NAME@@", name).replace("/* @@FFX_BRIDGE@@ */", bridge)
+            open(p, "w", encoding="utf-8", newline="\n").write(text)
+    kit = {"python": ("python/ffx.py", "lib/ffx.py"), "shell": ("sh/ffx.sh", "lib/ffx.sh"), "native": ("c/ffx.h", "src/ffx.h")}
+    if a.runtime in kit:
+        src_rel, dst_rel = kit[a.runtime]
+        os.makedirs(os.path.join(a.dir, os.path.dirname(dst_rel)), exist_ok=True)
+        shutil.copyfile(os.path.join(SDK, src_rel), os.path.join(a.dir, dst_rel))
+    print("%s: a %s package, %s. Next: ffx lint %s" % (a.dir, a.runtime, a.id, a.dir))
+    return 0
+
+
+def cmd_lint(a):
+    m, warnings, files = lint(a.dir)
+    for w in warnings:
+        print("note: " + w)
+    print("ok: %s %s, runtime %s, %d files, capabilities: %s" % (m["id"], m["version"], m["runtime"],
+          sum(1 for f in files if not f[2]), ", ".join(m["capabilities"]) or "none"))
+    return 0
+
+
+# ---------------------------------------------------------------- a machine
+
+class Machine:
+    """A machine's panel over HTTPS, logged in as its owner. Its certificate is its own, made on the machine,
+    so it is trusted on first use: the fingerprint is shown once and remembered."""
+
+    def __init__(self, addr, user):
+        self.host, _, port = addr.partition(":")
+        self.port = int(port or 443)
+        if not re.fullmatch(r"[0-9.]+|\[?[0-9a-fA-F:]+\]?", self.host):
+            raise Refused("the machine is an address, as the panel's own Host must be: %s" % self.host)
+        self.cx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self.cx.check_hostname = False
+        self.cx.verify_mode = ssl.CERT_NONE
+        self._pin()
+        self.cookie = None
+        self.token = None
+        self._login(user)
+
+    def _conn(self):
+        return http.client.HTTPSConnection(self.host.strip("[]"), self.port, timeout=60, context=self.cx)
+
+    def _pin(self):
+        c = self._conn()
+        c.connect()
+        der = c.sock.getpeercert(binary_form=True)
+        c.close()
+        fp = hashlib.sha256(der).hexdigest()
+        known = os.path.join(os.path.expanduser("~"), ".ffx", "machines.json")
+        seen = {}
+        try:
+            seen = json.load(open(known))
+        except (OSError, ValueError):
+            pass
+        key = "%s:%d" % (self.host, self.port)
+        if key in seen and seen[key] != fp:
+            raise Refused("%s presents a certificate that is not the one it presented before (%s, now %s). Compare "
+                          "it with the fingerprint on the panel's System tab before you trust it again, then remove "
+                          "its line from %s" % (key, seen[key][:16], fp[:16], known))
+        if key not in seen:
+            print("%s presents the certificate %s" % (key, ":".join(fp[i:i + 2] for i in range(0, 64, 2))))
+            print("The panel's System tab shows the machine's own. Is it the same?", end=" ")
+            if input("[y/N] ").strip().lower() != "y":
+                raise Refused("not trusted")
+            seen[key] = fp
+            os.makedirs(os.path.dirname(known), exist_ok=True)
+            json.dump(seen, open(known, "w"), indent=1)
+
+    def request(self, method, path, body=None, ctype=None, token=True):
+        hdrs = {"Host": "%s:%d" % (self.host, self.port) if self.port != 443 else self.host}
+        if ctype:
+            hdrs["Content-Type"] = ctype
+        if self.cookie:
+            hdrs["Cookie"] = self.cookie
+        if token and self.token:
+            hdrs["X-ForgeFIRM-Token"] = self.token
+        c = self._conn()
+        try:
+            c.request(method, path, body=body, headers=hdrs)
+            r = c.getresponse()
+            data = r.read()
+            return r.status, dict((k.lower(), v) for k, v in r.getheaders()), data
+        finally:
+            c.close()
+
+    def json(self, method, path, body=None, ctype=None):
+        st, _h, data = self.request(method, path, body, ctype)
+        try:
+            doc = json.loads(data or b"null")
+        except ValueError:
+            doc = None
+        if st != 200:
+            words = doc.get("error") if isinstance(doc, dict) else data[:300].decode("utf-8", "replace").strip()
+            raise Refused("%s %s: %d %s" % (method, path, st, words))
+        return doc
+
+    def _login(self, user):
+        user = user or input("The panel's name: ").strip()
+        pw = getpass.getpass("The panel's password for %s: " % user)
+        st, h, data = self.request("POST", "/login", urllib.parse.urlencode({"name": user, "password": pw}).encode(),
+                                   "application/x-www-form-urlencoded", token=False)
+        if st != 200 or "set-cookie" not in h:
+            raise Refused("the login was refused: %s" % data[:200].decode("utf-8", "replace").strip())
+        self.cookie = h["set-cookie"].split(";", 1)[0]
+        st, _h, page = self.request("GET", "/", token=False)
+        m = re.search(rb"var TOK = '([0-9a-f]{16,128})'", page)
+        if st != 200 or not m:
+            raise Refused("the panel page gave no token after the login (%d)" % st)
+        self.token = m.group(1).decode()
+
+
+def _multipart(field, name, data):
+    b = "ffx%s" % hashlib.sha256(data[:4096] + str(time.time()).encode()).hexdigest()[:24]
+    body = (("--%s\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+             "Content-Type: application/octet-stream\r\n\r\n" % (b, field, name)).encode() + data +
+            ("\r\n--%s--\r\n" % b).encode())
+    return body, "multipart/form-data; boundary=%s" % b
+
+
+def cmd_install(a):
+    data = open(a.file, "rb").read()
+    mc = Machine(a.machine, a.user)
+    body, ctype = _multipart("file", os.path.basename(a.file), data)
+    j = mc.json("POST", "/ext/upload", body, ctype)
+    pkg = j.get("package") or {}
+    print("%s %s, by %s: %s" % (pkg.get("id"), pkg.get("version"), pkg.get("author"), j.get("tier")))
+    if j.get("update"):
+        print("  an update of %s%s" % (j.get("from_version"), " (older than the installed one)" if j.get("downgrade") else ""))
+    for c in pkg.get("capabilities") or []:
+        tag = " (needs your grant)" if c in (j.get("needs_grant") or []) else ""
+        tag += " (new)" if c in (j.get("new_capabilities") or []) and j.get("update") else ""
+        print("  may: %s%s" % (c, tag))
+    grants = list(a.grant or [])
+    for g in grants:
+        if g not in (j.get("needs_grant") or []):
+            mc.request("POST", "/ext/upload/discard")
+            raise Refused("%s is not something this package needs a grant for" % g)
+    form = {"grants": ",".join(grants)}
+    consent = j.get("consent")
+    if consent == "typed":
+        form["phrase"] = input("A community package: type I UNDERSTAND to install it: ")
+    elif consent == "button":
+        input("An unverified package: hold the machine's button, and press Enter while you hold it. ")
+    try:
+        j = mc.json("POST", "/ext/install", urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded")
+    except Refused:
+        mc.request("POST", "/ext/upload/discard")
+        raise
+    print("installed: %s" % pkg.get("id"))
+    return 0
+
+
+def cmd_logs(a):
+    mc = Machine(a.machine, a.user)
+    frm = -1
+    while True:
+        q = {"name": "forgeext", "lines": "400"}
+        if frm >= 0:
+            q["from"] = str(frm)
+        j = mc.json("GET", "/logs/tail?" + urllib.parse.urlencode(q))
+        for line in (j.get("text") or "").splitlines():
+            if not a.id or a.id in line:
+                print(line)
+        frm = j.get("offset", -1)               # where the next read starts, as the panel follows it
+        if not a.follow:
+            return 0
+        time.sleep(2)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ffx", description="ForgeFIRM extension packages: make, check, pack, install.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("new", help="a new package from the template")
+    p.add_argument("dir")
+    p.add_argument("--id", required=True)
+    p.add_argument("--runtime", required=True, choices=("ui", "python", "shell", "native", "data"))
+    p.add_argument("--name")
+    p.set_defaults(fn=cmd_new)
+    p = sub.add_parser("lint", help="judge a package as the machine does")
+    p.add_argument("dir")
+    p.set_defaults(fn=cmd_lint)
+    p = sub.add_parser("pack", help="lint, then build the .ffx, signed with --key")
+    p.add_argument("dir")
+    p.add_argument("--key", help="the private key (NAME.priv from ffx keygen); its NAME.pub must be beside it")
+    p.add_argument("--out")
+    p.set_defaults(fn=cmd_pack)
+    p = sub.add_parser("keygen", help="an Ed25519 key pair for signing")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_keygen)
+    p = sub.add_parser("install", help="install a .ffx on a machine")
+    p.add_argument("file")
+    p.add_argument("--machine", required=True, help="the machine's address[:port]")
+    p.add_argument("--user")
+    p.add_argument("--grant", action="append", help="a capability that needs your grant (repeat)")
+    p.set_defaults(fn=cmd_install)
+    p = sub.add_parser("logs", help="the extension host's log on a machine")
+    p.add_argument("--machine", required=True)
+    p.add_argument("--user")
+    p.add_argument("--id", help="a package's lines alone")
+    p.add_argument("--follow", action="store_true")
+    p.set_defaults(fn=cmd_logs)
+    a = ap.parse_args(argv)
+    try:
+        return a.fn(a)
+    except Refused as e:
+        print("refused: %s" % e, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

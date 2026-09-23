@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>@@NAME@@</title>
+<style>
+:root { color-scheme: light dark; }
+body { margin: 12px; font: 14px/1.4 system-ui, sans-serif; }
+#mode { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<h3>@@NAME@@</h3>
+<p>The machine is <b id="mode">asking...</b>.</p>
+<p><label>Greeting <input id="greeting" maxlength="32"></label> <button id="save">Save</button> <span id="msg"></span></p>
+<script>
+/* ffx-bridge.js, extension API 0.1, from the forgeext SDK: pasted whole, since a page is one file. */
+/* @@FFX_BRIDGE@@ */
+</script>
+<script>
+/* Everything this page wants it asks the panel for, through ffx; the frame
+ * itself reaches nothing. */
+function say(t) { document.getElementById('msg').textContent = t; }
+function mode() {
+  ffx.machine.mode().then(function (m) {
+    document.getElementById('mode').textContent = m.mode + ', controller ' + m.controller;
+  }, function (e) { document.getElementById('mode').textContent = e.message; });
+}
+ffx.settings.get().then(function (doc) {
+  document.getElementById('greeting').value = doc.settings.greeting;
+}, function (e) { say(e.message); });
+document.getElementById('save').onclick = function () {
+  ffx.settings.set({ greeting: document.getElementById('greeting').value })
+    .then(function () { say('saved'); }, function (e) { say(e.message); });
+};
+mode();
+setInterval(mode, 5000);
+</script>
+</body>
+</html>
