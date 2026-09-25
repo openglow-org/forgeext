@@ -79,15 +79,3 @@ jobs:
         run: |
           # 77 is the script's "could not run here": on this runner that is a failure.
           python3 -B tests/install_test.py
-      - name: "automation: unit tests (its JSON, its rules, one MQTT publish)"
-        run: make -C packages/automation test
-      - name: "automation: built for the machine and staged as it ships, then linted as the machine takes it"
-        run: |
-          make -C packages/automation stage
-          python3 -B tools/ffx lint packages/automation/build/pkg
-      - name: "automation_test (the service under the real host: notifications, the exhaust and its run-on, MQTT, the hold)"
-        run: |
-          make -C packages/automation host
-          sudo FORGEEXT=build/forgeext FWUP="$(command -v fwup)" \
-            FFX_RULES=forgefirm-rules/meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files/ffx.nft \
-            AUTOMATION_BIN=packages/automation/build/automation python3 -B packages/automation/tests/automation_test.py

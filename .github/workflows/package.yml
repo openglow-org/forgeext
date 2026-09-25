@@ -1,0 +1,196 @@
+# Copyright 2026 514 LLC d/b/a OpenGlow
+# Written by Scott Wiederhold
+# SPDX-License-Identifier:    MIT
+
+# The shared workflow of an extension package's repository. The package's own
+# workflow calls it on every push and pull request
+# (uses: openglow-org/forgeext/.github/workflows/package.yml@main, with
+# secrets: inherit, and contents: write for the release):
+#
+#   build     the package's own tests; the package staged as it ships, linted
+#             as the machine judges it, and packed; and a test under the real
+#             extension host, as root.
+#   release   on a push to the default branch whose manifest names a version
+#             with no release yet: the package signed with
+#             EXTENSION_SIGNING_KEY, the secret of the repository's signing
+#             environment, checked against the public key the repository
+#             carries, and published as release v<version> with its catalog
+#             record (ffx index record), for a pull request to the catalog.
+#             A version already released publishes nothing.
+
+name: package
+
+on:
+  workflow_call:
+    inputs:
+      forgeext-ref:
+        description: The forgeext revision whose kit judges and packs the package
+        type: string
+        default: main
+      apt:
+        description: Ubuntu packages the build needs, space separated (a cross compiler, for example)
+        type: string
+        default: ''
+      test:
+        description: The package's own tests, as a shell command
+        type: string
+        default: ''
+      host-test:
+        description: A test under the real extension host, a shell command run as root with FORGEEXT, FWUP, FFX, MKFFX, and FFX_RULES set
+        type: string
+        default: ''
+      stage:
+        description: The shell command that lays the package out as it ships, in dir
+        type: string
+        default: make stage
+      dir:
+        description: The package as it ships, as stage lays it out
+        type: string
+        default: build/pkg
+      public-key:
+        description: The public half of the signing key, in the repository
+        type: string
+        default: key.pub
+      environment:
+        description: The environment whose secret EXTENSION_SIGNING_KEY signs a release
+        type: string
+        default: extension-signing
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: forgeext, for its kit
+        uses: actions/checkout@v4
+        with:
+          repository: openglow-org/forgeext
+          ref: ${{ inputs.forgeext-ref }}
+          path: .forgeext
+      - uses: ./.forgeext/.github/actions/kit
+        with:
+          host: ${{ inputs.host-test != '' }}
+      - name: What the build needs
+        if: inputs.apt != ''
+        env:
+          APT: ${{ inputs.apt }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq $APT > /dev/null
+      - name: The package's own tests
+        if: inputs.test != ''
+        env:
+          CMD: ${{ inputs.test }}
+        run: sh -c "$CMD"
+      - name: Staged as it ships, linted as the machine judges it, and packed
+        env:
+          STAGE: ${{ inputs.stage }}
+          DIR: ${{ inputs.dir }}
+        run: |
+          sh -c "$STAGE"
+          python3 -B "$FFX" lint "$DIR"
+          python3 -B "$FFX" pack "$DIR" --out "$RUNNER_TEMP/unsigned.ffx"
+      - name: Under the real extension host
+        if: inputs.host-test != ''
+        env:
+          CMD: ${{ inputs.host-test }}
+        run: |
+          sudo env PATH="$PATH" FORGEEXT="$FORGEEXT" FWUP="$FWUP" FFX="$FFX" MKFFX="$MKFFX" FFX_RULES="$FFX_RULES" \
+            sh -c "$CMD"
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: forgeext, for its kit
+        uses: actions/checkout@v4
+        with:
+          repository: openglow-org/forgeext
+          ref: ${{ inputs.forgeext-ref }}
+          path: .forgeext
+      - uses: ./.forgeext/.github/actions/kit
+      - name: The version, and whether it is released
+        id: pkg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIR: ${{ inputs.dir }}
+          STAGE: ${{ inputs.stage }}
+        run: |
+          python3 - manifest.json >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, sys
+          m = json.load(open(sys.argv[1]))
+          print("id=%s" % m["id"])
+          print("version=%s" % m["version"])
+          EOF
+          v=$(sed -n 's/^version=//p' "$GITHUB_OUTPUT" | tail -1)
+          if gh release view "v$v" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "v$v is released already: nothing to publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: What the build needs
+        if: steps.pkg.outputs.publish == 'true' && inputs.apt != ''
+        env:
+          APT: ${{ inputs.apt }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq $APT > /dev/null
+      - name: Staged as it ships, and linted
+        if: steps.pkg.outputs.publish == 'true'
+        env:
+          STAGE: ${{ inputs.stage }}
+          DIR: ${{ inputs.dir }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+        run: |
+          sh -c "$STAGE"
+          python3 -B "$FFX" lint "$DIR"
+          python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); sys.exit(0 if m["version"] == sys.argv[2] else "the staged manifest is not the version released")' "$DIR/manifest.json" "$VERSION"
+      - name: Signed with the repository's key, and checked against its public half
+        if: steps.pkg.outputs.publish == 'true'
+        env:
+          KEY: ${{ secrets.EXTENSION_SIGNING_KEY }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          PUB: ${{ inputs.public-key }}
+          DIR: ${{ inputs.dir }}
+          ID: ${{ steps.pkg.outputs.id }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+        run: |
+          [ -n "$KEY" ] || { echo "the $ENVIRONMENT environment holds no EXTENSION_SIGNING_KEY"; exit 1; }
+          [ -f "$PUB" ] || { echo "the repository carries no $PUB"; exit 1; }
+          umask 077
+          k="$RUNNER_TEMP/signing"
+          mkdir -p "$k" "$RUNNER_TEMP/out"
+          trap 'rm -rf "$k"' EXIT
+          printf '%s\n' "$KEY" | tr -d ' \r\t' | grep -v '^$' > "$k/key.priv"
+          cp "$PUB" "$k/key.pub"
+          # ffx pack checks the signature against key.pub beside the key before it says so.
+          python3 -B "$FFX" pack "$DIR" --key "$k/key.priv" --out "$RUNNER_TEMP/out/$ID-$VERSION.ffx"
+      - name: Its catalog record
+        if: steps.pkg.outputs.publish == 'true'
+        env:
+          PUB: ${{ inputs.public-key }}
+          ID: ${{ steps.pkg.outputs.id }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+        run: |
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/$ID-$VERSION.ffx"
+          case "$ID" in org.openglow.*|org.forgefirm.*) who=--official-key ;; *) who=--key ;; esac
+          python3 -B "$FFX" index record "$RUNNER_TEMP/out/$ID-$VERSION.ffx" --url "$url" "$who" "$PUB" \
+            --out "$RUNNER_TEMP/out/$VERSION.json"
+      - name: Published as release v<version>
+        if: steps.pkg.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ steps.pkg.outputs.id }}
+          VERSION: ${{ steps.pkg.outputs.version }}
+        run: |
+          gh release create "v$VERSION" "$RUNNER_TEMP/out/$ID-$VERSION.ffx" "$RUNNER_TEMP/out/$VERSION.json" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$ID $VERSION" \
+            --notes "$ID $VERSION, signed. $VERSION.json is its record for the catalog: packages/$ID/$VERSION.json in a pull request to openglow-org/forgefirm-extensions-catalog."

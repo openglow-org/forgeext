@@ -1,0 +1,65 @@
+# Copyright 2026 514 LLC d/b/a OpenGlow
+# Written by Scott Wiederhold
+# SPDX-License-Identifier:    MIT
+
+name: ForgeFIRM extension kit
+description: >
+  What an extension package's CI needs from forgeext, checked out at path: fwup
+  1.16.0 (the version the image carries), tools/ffx, and tools/mkffx.sh; and with
+  host, the extension host built from source and the image's deny rules, for a
+  test under the real host. Exports FORGEEXT_SRC, FFX, MKFFX, and FWUP, and with
+  host FORGEEXT and FFX_RULES.
+
+inputs:
+  path:
+    description: Where forgeext is checked out, relative to the workspace
+    default: .forgeext
+  host:
+    description: "'true' builds the extension host and fetches the image's deny rules"
+    default: 'false'
+  forgefirm-ref:
+    description: The forgefirm revision whose deny rules a test under the host runs against
+    default: master
+
+runs:
+  using: composite
+  steps:
+    - name: fwup 1.16.0 (the version the image carries), and the kit's paths
+      shell: bash
+      env:
+        KIT_PATH: ${{ inputs.path }}
+      run: |
+        if ! fwup --version 2>/dev/null | grep -qx '1\.16\.0'; then
+          curl -fsSL -o "$RUNNER_TEMP/fwup.deb" https://github.com/fwup-home/fwup/releases/download/v1.16.0/fwup_1.16.0_amd64.deb
+          sudo dpkg -i "$RUNNER_TEMP/fwup.deb" > /dev/null
+        fi
+        src="$GITHUB_WORKSPACE/$KIT_PATH"
+        [ -f "$src/tools/ffx" ] || { echo "no forgeext checkout at $src"; exit 1; }
+        {
+          echo "FORGEEXT_SRC=$src"
+          echo "FFX=$src/tools/ffx"
+          echo "MKFFX=$src/tools/mkffx.sh"
+          echo "FWUP=$(command -v fwup)"
+        } >> "$GITHUB_ENV"
+    - name: The image's deny rules
+      if: inputs.host == 'true'
+      uses: actions/checkout@v4
+      with:
+        repository: openglow-org/forgefirm
+        ref: ${{ inputs.forgefirm-ref }}
+        path: .forgefirm
+        sparse-checkout: meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files
+    - name: The extension host, built from source
+      if: inputs.host == 'true'
+      shell: bash
+      env:
+        KIT_PATH: ${{ inputs.path }}
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq libjansson-dev libarchive-dev libsodium-dev nftables > /dev/null
+        cmake -S "$GITHUB_WORKSPACE/$KIT_PATH" -B "$RUNNER_TEMP/forgeext-build" -DCMAKE_BUILD_TYPE=Release > /dev/null
+        cmake --build "$RUNNER_TEMP/forgeext-build" -j"$(nproc)" --target forgeext > /dev/null
+        {
+          echo "FORGEEXT=$RUNNER_TEMP/forgeext-build/forgeext"
+          echo "FFX_RULES=$GITHUB_WORKSPACE/.forgefirm/meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files/ffx.nft"
+        } >> "$GITHUB_ENV"
