@@ -6,6 +6,7 @@
  */
 #define _GNU_SOURCE
 #include "install.h"
+#include "index.h"
 #include "netrules.h"
 
 #include "settings.h"
@@ -279,6 +280,24 @@ static int judge(const ext_env_t *env, state_t *st, install_result_t *res, char 
                         m->core_max, env->core_version);
     }
 
+    /* What the kept index says of the listed package - this id, signed by
+     * the key the catalog names for it. A version OpenGlow withdrew is not
+     * installed, from the catalog or from anywhere else; a package it
+     * withdrew whole is the owner's to judge by who signed it, and the
+     * answer says so. */
+    json_t *idx = index_read(env);
+    char reason[260];
+    int w = index_withdrawn(idx, m->id, m->version, res->info.key_id, res->info.tier == TIER_OFFICIAL, reason,
+                            sizeof(reason));
+    json_decref(idx);
+    if (w == INDEX_VERSION_WITHDRAWN)
+        return fail(err, elen, "OpenGlow withdrew %s %s from its catalog%s%s", m->id, m->version, reason[0] ? ": " : "",
+                    reason);
+    if (w == INDEX_PACKAGE_WITHDRAWN) {
+        res->withdrawn = w;
+        snprintf(res->withdrawn_reason, sizeof(res->withdrawn_reason), "%s", reason);
+    }
+
     state_pkg_t *have = state_find(st, m->id);
     res->update = have != NULL;
     res->nnew = res->nneeds = 0;
@@ -410,10 +429,21 @@ static int stage(const ext_env_t *env, const char *file, state_t *st, install_re
     if (rc == 0)
         rc = manifest_load(mf, &res->manifest, err, elen);
     if (rc == 0 && res->info.endorsed_id[0] && strcmp(res->info.endorsed_id, res->manifest.id) != 0) {
-        /* A key the index endorses for another id: for this one it is
-         * nobody's, and the archive is judged as signed by nobody. */
-        res->info.tier = TIER_UNVERIFIED;
-        res->info.key_id[0] = res->info.key_file[0] = res->info.endorsed_id[0] = '\0';
+        /* The key that verified it is endorsed, and the file it was found
+         * in names another id. One author's key may be endorsed for
+         * several ids, so the question is whether the index endorses this
+         * same key for this id too; if it does not, for this id the key
+         * is nobody's, and the archive is judged as signed by nobody. */
+        char own[600], kid[65];
+        snprintf(own, sizeof(own), "%.400s/%s.pub", env->trust.endorsed_dir ? env->trust.endorsed_dir : "",
+                 res->manifest.id);
+        if (env->trust.endorsed_dir && pkg_key_id(own, kid) == 0 && strcmp(kid, res->info.key_id) == 0) {
+            snprintf(res->info.endorsed_id, sizeof(res->info.endorsed_id), "%s", res->manifest.id);
+            snprintf(res->info.key_file, sizeof(res->info.key_file), "%.255s", own);
+        } else {
+            res->info.tier = TIER_UNVERIFIED;
+            res->info.key_id[0] = res->info.key_file[0] = res->info.endorsed_id[0] = '\0';
+        }
     }
     if (rc == 0)
         rc = judge_exec(tree, &res->manifest, err, elen);

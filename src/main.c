@@ -52,7 +52,8 @@ static int usage(void)
             "                                     one call from the package's page to its own service\n"
             "  caps                               the capabilities a manifest may ask for\n"
             "  index-verify <file.ffi>            verify the signed index and keep it: its listing and its endorsed keys\n"
-            "  index                              the index this host keeps\n"
+            "                                     (never one older than the index kept)\n"
+            "  index                              the index this host keeps, judged against this firmware\n"
             "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
             "      [--run-dir <dir>] [--holds-dir <dir>] [--api-dir <dir>] [--call-dir <dir>] [--landlock-fs-only]\n"
             "      [--ticks <n>]\n"
@@ -149,6 +150,18 @@ static json_t *manifest_json(const manifest_t *m)
     return j;
 }
 
+/* What OpenGlow's kept index says was withdrawn: null, or the scope
+ * ("version" or "package") and OpenGlow's reason. */
+static json_t *withdrawn_json(int w, const char *reason)
+{
+    if (w == INDEX_NOT_WITHDRAWN)
+        return json_null();
+    json_t *o = json_object();
+    json_object_set_new(o, "scope", json_string(w == INDEX_VERSION_WITHDRAWN ? "version" : "package"));
+    json_object_set_new(o, "reason", json_string(reason ? reason : ""));
+    return o;
+}
+
 static json_t *result_json(install_result_t *r)
 {
     json_t *j = json_object();
@@ -169,6 +182,7 @@ static json_t *result_json(install_result_t *r)
      * version is a build stamp, so there is nothing to compare against;
      * saying so beats leaving an operator to guess. */
     json_object_set_new(j, "core_checked", json_boolean(r->core_checked));
+    json_object_set_new(j, "withdrawn", withdrawn_json(r->withdrawn, r->withdrawn_reason));
     return j;
 }
 
@@ -198,7 +212,7 @@ static int cmd_list(const ext_env_t *env, const char *only, int check)
         free(st);
         return refuse(st ? err : "out of memory");
     }
-    json_t *obj = json_object(), *arr = json_array();
+    json_t *obj = json_object(), *arr = json_array(), *idx = index_read(env);
     int all_ok = 1, found = 0;
     for (int i = 0; i < st->n; i++) {
         state_pkg_t *p = &st->pkgs[i];
@@ -220,6 +234,11 @@ static int cmd_list(const ext_env_t *env, const char *only, int check)
             json_object_set_new(j, "hold", json_string(p->hold_required ? "required" : "advisory"));
         if (p->slot >= 0)
             json_object_set_new(j, "account", json_sprintf("ffx%d", p->slot));
+        /* An installed copy stays installed when OpenGlow withdraws it: the
+         * machine removes nothing on its own, and says so here. */
+        char reason[260];
+        int w = index_withdrawn(idx, p->id, p->version, p->key_id, p->tier == TIER_OFFICIAL, reason, sizeof(reason));
+        json_object_set_new(j, "withdrawn", withdrawn_json(w, reason));
         if (ext_manifest_of(env, p->id, &m, err, sizeof(err)) == 0) {
             json_object_set_new(j, "package", manifest_json(&m));
             /* What the broker would honor for this package: the
@@ -248,6 +267,7 @@ static int cmd_list(const ext_env_t *env, const char *only, int check)
         json_array_append_new(arr, j);
     }
     free(st);
+    json_decref(idx);
     json_object_set_new(obj, "packages", arr);
     if (only && !found) {
         json_decref(obj);
@@ -706,8 +726,14 @@ int main(int argc, char **argv)
         return answer(obj, 1);
     }
     if (strcmp(cmd, "index") == 0) {
+        /* Judged against this firmware as it is read, not as it was kept:
+         * a firmware update sees what it now runs without a fetch. */
         json_t *obj = json_object(), *doc = index_read(&env);
+        if (doc)
+            index_judge(&env, doc);
         json_object_set_new(obj, "index", doc ? doc : json_null());
+        json_object_set_new(obj, "core_version", json_string(env.core_version));
+        json_object_set_new(obj, "core_checked", json_boolean(manifest_version_ok(env.core_version)));
         return answer(obj, 1);
     }
     if (strcmp(cmd, "keys") == 0) {

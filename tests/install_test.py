@@ -14,9 +14,10 @@ package, the namespace, key pinning across an update, the capability diff,
 conflicts, the budget, the integrity check, removal, the wipe a change of
 owner takes (every package, everything under data/, every key the owner
 added), and the signed index (kept only under the OpenGlow extension key,
-held to its form, endorsing its author key for one id and no other, and a
-listing withdrawn). After every refusal the root holds nothing the refused
-archive brought.
+held to its form, never older than the one kept, endorsing its author key
+for one id and no other, judged version by version against the firmware
+when read, and what it withdraws). After every refusal the root holds
+nothing the refused archive brought.
 
     python3 tests/install_test.py [-v]
 
@@ -272,41 +273,65 @@ def mcodes(t):
 
 
 def the_index(t):
-    """The signed index: verified only under the OpenGlow extension key, held to its form, and binding an id
-    to an author key that the owner never added - for that id and no other."""
+    """The signed index: verified only under the OpenGlow extension key, held to its form, never older than the
+    one kept, binding an id to an author key the owner never added - for that id and no other - and judged
+    version by version against this firmware when it is read. And what it says was withdrawn."""
     ffx = os.path.join(HERE, "..", "tools", "ffx")
     adir = t.path("author")
     os.mkdir(adir)
     subprocess.run([FWUP, "-g"], cwd=adir, check=True, capture_output=True)
     t.keys["author"] = os.path.join(adir, "fwup-key.priv")
+    author_pub = open(t.pub("author")).read().strip()
+    owner_pub = open(t.pub("owner")).read().strip()
     listed = t.pack(t.tree(manifest("org.example.listed"), RUN), "author")
     other = t.pack(t.tree(manifest("org.example.other"), RUN), "author")
     r = t.run("inspect", listed)
     check(r.get("tier") == "unverified", "an author's key the owner never added: unverified (%s)" % r.get("tier"))
     check(t.run("index").get("index") is None, "no index is kept yet")
+    serial = [0]
 
-    def build(entries, key="official", out_name="index.ffi"):
-        d = t.path("listing")
-        os.mkdir(d)
+    def next_version():
+        serial[0] += 1
+        return "2026.901.%d" % serial[0]
+
+    # Built the way OpenGlow builds it: a record per version from its signed archive, then the catalog.
+    def build(entries, key="official", version=None):
+        d = t.path("catalog")
         for e in entries:
-            shutil.copy(e["path"], os.path.join(d, os.path.basename(e["path"])))
-        shutil.copy(t.pub("author"), os.path.join(d, "author.pub"))
-        listing = os.path.join(d, "listing.json")
-        with open(listing, "w") as f:
-            json.dump({"packages": [{"file": os.path.basename(e["path"]), "url": "https://example.org/" + os.path.basename(e["path"]),
-                                     **({"key": "author.pub"} if e.get("key") else {})} for e in entries]}, f)
-        out = os.path.join(d, out_name)
-        p = subprocess.run([sys.executable, "-B", ffx, "index", "build", listing, "--version", "2026.9.1", "--out", out]
-                           + (["--key", t.keys[key]] if key else []), capture_output=True, text=True, env=dict(os.environ, FWUP=FWUP))
+            p = subprocess.run([sys.executable, "-B", ffx, "index", "record", e, "--url",
+                                "https://example.org/" + os.path.basename(e), "--key", t.pub("author")],
+                               capture_output=True, text=True, env=dict(os.environ, FWUP=FWUP))
+            check(p.returncode == 0, "ffx index record: %s" % p.stderr.strip())
+            m = json.loads(p.stdout)
+            pdir = os.path.join(d, "packages", m["id"])
+            os.makedirs(pdir, exist_ok=True)
+            shutil.copy(t.pub("author"), os.path.join(pdir, "key.pub"))
+            with open(os.path.join(pdir, m["version"] + ".json"), "w") as f:
+                json.dump(m, f)
+        os.makedirs(os.path.join(d, "packages"), exist_ok=True)
+        out = os.path.join(d, "index.ffi")
+        p = subprocess.run([sys.executable, "-B", ffx, "index", "build", d, "--version", version or next_version(),
+                            "--out", out] + (["--key", t.keys[key]] if key else []),
+                           capture_output=True, text=True, env=dict(os.environ, FWUP=FWUP))
         check(p.returncode == 0, "ffx index build: %s" % p.stderr.strip())
         return out
 
-    idx = build([{"path": listed, "key": True}])
+    idx = build([listed], version="2026.900.1")
+    fresh = t.path("fresh-root")
+    p = subprocess.run([FORGEEXT, "--root", fresh, "--fwup", FWUP, "--official-key", t.pub("official"), "--no-reserve",
+                        "index-verify", idx], capture_output=True, text=True)
+    check('"ok":true' in p.stdout.replace(" ", ""), "the catalog can be the first thing a root holds: %s" % p.stdout.strip())
+    idx = build([listed])
     r = t.run("index-verify", idx)
-    check(r.get("ok") is True and r.get("packages") == 1 and r.get("version") == "2026.9.1", "the index is kept: %s" % r)
-    kept = (t.run("index").get("index") or {}).get("packages") or [{}]
-    check(kept[0].get("id") == "org.example.listed" and len(kept[0].get("key_id", "")) == 64 and kept[0].get("size", 0) > 0,
-          "and read back, with the endorsed key's id: %s" % kept[0])
+    check(r.get("ok") is True and r.get("packages") == 1 and r.get("version") == "2026.901.1", "the index is kept: %s" % r)
+    got = t.run("index")
+    kept = (got.get("index") or {}).get("packages") or [{}]
+    v0 = (kept[0].get("versions") or [{}])[0]
+    check(kept[0].get("id") == "org.example.listed" and len(kept[0].get("key_id", "")) == 64 and v0.get("size", 0) > 0
+          and v0.get("api") == "0.1" and v0.get("usable") is True and kept[0].get("offer") == "1.0.0",
+          "and read back, with the endorsed key's id, judged usable here: %s" % kept[0])
+    check(got.get("core_checked") is False, "no firmware version given: the ranges are not judged, and it says so: %s"
+          % got.get("core_checked"))
     r = t.run("inspect", listed)
     check(r.get("tier") == "community" and r.get("endorsed") is True, "the listed package, signed by its endorsed key: "
           "community, endorsed (%s %s)" % (r.get("tier"), r.get("endorsed")))
@@ -318,41 +343,218 @@ def the_index(t):
 
     # An index the host does not keep, each refused in its words, the kept one left as it was.
     for key, words in (("owner", "not signed with the OpenGlow extension key"), (None, "not signed with the OpenGlow")):
-        r = t.run("index-verify", build([{"path": listed, "key": True}], key=key))
+        r = t.run("index-verify", build([listed], key=key))
         check(r.get("ok") is False and words in (r.get("error") or ""), "an index signed by %s -> %s" % (key or "nobody", r.get("error")))
     r = t.run("index-verify", listed)
     check(r.get("ok") is False and "product" in (r.get("error") or ""), "a package given as the index -> %s" % r.get("error"))
 
-    def raw_index(doc, extra=None):
+    def raw_index(doc, version=None, extra=None):
         members = [member("index.json", json.dumps(doc).encode())] + (extra or [])
-        return t.pack_raw(t.tar(members), "2026.9.2", "official", product="ForgeFIRM extension index")
-    good = dict(kept[0])
-    good.pop("key_id", None)
+        return t.pack_raw(t.tar(members), version or next_version(), "official", product="ForgeFIRM extension index")
+
+    def ver(v, **more):
+        e = {"version": v, "url": "https://example.org/x-%s.ffx" % v, "sha256": "ab" * 32, "size": 1000,
+             "capabilities": [], "api": "0.1"}
+        e.update(more)
+        return e
+
+    def pkg(id_, versions, key=author_pub, **more):
+        e = {"id": id_, "name": id_.split(".")[-1], "author": "Test", "versions": versions}
+        if key:
+            e["key"] = key
+        e.update(more)
+        return e
+
+    good = pkg("org.example.listed", [ver("1.0.0")])
     for doc, words in (({"index": 2, "packages": []}, "an index is"),
                        ({"index": 1, "packages": [good, good]}, "lists org.example.listed twice"),
-                       ({"index": 1, "packages": [dict(good, url="http://example.org/x.ffx")]}, "https://"),
-                       ({"index": 1, "packages": [dict(good, url="https://user:pw@example.org/x.ffx")]}, "no user or password"),
-                       ({"index": 1, "packages": [dict(good, sha256="ABC")]}, "sha256"),
-                       ({"index": 1, "packages": [dict(good, id="org.openglow.fake")]}, "OpenGlow's namespace"),
-                       ({"index": 1, "packages": [{k: v for k, v in good.items() if k != "key"}]}, "author's public key"),
-                       ({"index": 1, "packages": [dict(good, key="bm90IGEga2V5IGF0IGFsbCwgbm90IGFueSBvZiBpdCEhIQ==")]},
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0", url="http://example.org/x.ffx")])]},
+                        "https://"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0", url="https://u:pw@example.org/x")])]},
+                        "no user or password"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0", sha256="ABC")])]}, "sha256"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0", size=0)])]}, "whole number"),
+                       ({"index": 1, "packages": [pkg("org.openglow.fake", [ver("1.0.0")])]}, "OpenGlow's namespace"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0")], key=None)]}, "author's public key"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0")],
+                                                      key="bm90IGEga2V5IGF0IGFsbCwgbm90IGFueSBvZiBpdCEhIQ==")]},
                         "no Ed25519 public key"),
-                       ({"index": 1, "packages": [dict(good, capabilities=["role:homing"])]}, "role")):
+                       ({"index": 1, "packages": [pkg("org.example.listed", [])]}, "versions are a list of 1 to 16"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.%d" % i) for i in range(17)])]},
+                        "versions are a list of 1 to 16"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0"), ver("1.0.0")])]},
+                        "lists org.example.listed 1.0.0 twice"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("v1")])]}, "a listed version is not one"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0", core={"min": "0.0.9", "max": "0.0.7"})])]},
+                        "min is above its max"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0", core={"min": "latest"})])]},
+                        "core range is"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0", capabilities=["machine read"])])]},
+                        "printable text with no space"),
+                       ({"index": 1, "packages": [pkg("org.example.listed", [ver("1.0.0")],
+                                                      withdrawn=[{"version": "1.0.0", "reason": "x"}])]},
+                        "both lists and withdraws org.example.listed 1.0.0"),
+                       ({"index": 1, "packages": [good], "withdrawn": [{"id": "org.example.listed", "key": author_pub}]},
+                        "both lists and withdraws org.example.listed"),
+                       ({"index": 1, "packages": [], "withdrawn": [{"id": "org.openglow.gone", "key": author_pub}]},
+                        "OpenGlow's namespace"),
+                       ({"index": 1, "packages": [pkg("org.example.p%d" % i, [ver("1.0.0")]) for i in range(513)]},
+                        "at most 512")):
         r = t.run("index-verify", raw_index(doc))
         check(r.get("ok") is False and words in (r.get("error") or ""), "%s -> %s" % (words, r.get("error")))
-    r = t.run("index-verify", raw_index({"index": 1, "packages": []}, [member("extra.txt", b"x")]))
+    r = t.run("index-verify", raw_index({"index": 1, "packages": []}, extra=[member("extra.txt", b"x")]))
     check(r.get("ok") is False and "nothing else" in (r.get("error") or ""), "an index with a second file -> %s" % r.get("error"))
+    r = t.run("index-verify", raw_index({"index": 1, "packages": [good]}, version="latest"))
+    check(r.get("ok") is False and "not a version" in (r.get("error") or ""), "an index whose version is none -> %s" % r.get("error"))
     check(((t.run("index").get("index") or {}).get("packages") or [{}])[0].get("id") == "org.example.listed",
           "every refused index left the kept one as it was")
 
-    # Withdrawn: the installed version stays, and an update no longer reads as community.
-    idx = build([])
-    r = t.run("index-verify", idx)
+    # Never back: an older index is refused, however well signed; the same version again is kept.
+    kept_version = t.run("index")["index"]["version"]
+    r = t.run("index-verify", raw_index({"index": 1, "packages": []}, version="2026.831.9"))
+    check(r.get("ok") is False and "older than the one kept here (%s)" % kept_version in (r.get("error") or ""),
+          "an older index -> %s" % r.get("error"))
+    r = t.run("index-verify", raw_index({"index": 1, "packages": [good]}, version=kept_version))
+    check(r.get("ok") is True, "the same version again is kept: %s" % r.get("error"))
+
+    # A field this host does not know is passed over, at every level: a newer catalog is still kept here.
+    future = dict(good, future={"x": 1}, versions=[ver("1.0.0", future=[1, 2])])
+    r = t.run("index-verify", raw_index({"index": 1, "packages": [future], "future": True}))
+    check(r.get("ok") is True, "unknown fields are passed over: %s" % r.get("error"))
+
+    # Judged when read, version by version, against this firmware. A version this firmware cannot run is kept,
+    # and not offered; the newest one it can run is.
+    span = pkg("org.example.span", [
+        ver("3.0.0", core={"min": "0.0.9"}),
+        ver("2.0.0", capabilities=["machine.read", "frobnicate"]),
+        ver("1.5.0", api="0.2"),
+        ver("1.4.0", size=33 * 1024 * 1024),
+        ver("1.3.0", capabilities=["role:homing"]),
+        ver("1.2.0", core={"max": "0.0.7"}),
+        ver("1.1.0", capabilities=["machine.read"]),
+        ver("1.0.0")])
+    none_here = pkg("org.example.later", [ver("1.0.0", core={"min": "0.0.9"})])
+    r = t.run("index-verify", raw_index({"index": 1, "packages": [good, span, none_here]}))
+    check(r.get("ok") is True and r.get("packages") == 3, "an index of many versions is kept: %s" % r)
+
+    def judged(core):
+        got = t.run("index", core=core)
+        pk = {p["id"]: p for p in (got.get("index") or {}).get("packages", [])}
+        return got, pk, {v["version"]: v for v in pk.get("org.example.span", {}).get("versions", [])}
+    got, pk, vs = judged("0.0.8")
+    for v, words in (("3.0.0", "needs firmware 0.0.9 or newer, and this is 0.0.8"),
+                     ("2.0.0", "frobnicate is not a capability"),
+                     ("1.5.0", "built for extension API 0.2"),
+                     ("1.4.0", "larger than this firmware takes"),
+                     ("1.3.0", "role"),
+                     ("1.2.0", "needs firmware 0.0.7 or older")):
+        check(vs.get(v, {}).get("usable") is False and words in vs.get(v, {}).get("why", ""),
+              "on 0.0.8, %s is not offered: %s" % (v, vs.get(v)))
+    check(vs.get("1.1.0", {}).get("usable") is True and "why" not in vs.get("1.1.0", {}) and vs["1.0.0"].get("usable") is True,
+          "and 1.1.0 and 1.0.0 are: %s %s" % (vs.get("1.1.0"), vs.get("1.0.0")))
+    check(pk["org.example.span"].get("offer") == "1.1.0", "the offer is the newest it runs: %s" % pk["org.example.span"].get("offer"))
+    check(pk["org.example.later"].get("offer") is None and got.get("core_checked") is True and got.get("core_version") == "0.0.8"
+          and pk["org.example.later"].get("why") == "org.example.later 1.0.0 needs firmware 0.0.9 or newer, and this is 0.0.8",
+          "a package with no version this firmware runs is offered none, and says why: %s" % pk["org.example.later"])
+    check("why" not in pk["org.example.span"], "one that is offered a version has no why: %s" % pk["org.example.span"].get("why"))
+    got, pk, vs = judged("v0.0.9")
+    check(vs["3.0.0"].get("usable") is True and pk["org.example.span"].get("offer") == "3.0.0"
+          and pk["org.example.later"].get("offer") == "1.0.0",
+          "after a firmware update, the same kept index offers what it now runs: %s" % pk["org.example.span"].get("offer"))
+    got, pk, vs = judged("20260925205500")
+    check(got.get("core_checked") is False and vs["3.0.0"].get("usable") is True and vs["1.2.0"].get("usable") is True
+          and vs["2.0.0"].get("usable") is False and pk["org.example.span"].get("offer") == "3.0.0",
+          "a build stamp judges no range, and still judges the rest: %s" % pk["org.example.span"].get("offer"))
+    check(t.run("index")["index"]["packages"][1]["versions"][0].get("why", "") == ""
+          and "usable" not in open(os.path.join(t.root, "index", "index.json")).read(),
+          "the judgment is the reading's, never written into the index kept")
+
+    # Withdrawn: one version of a listed package, or a package whole. The key the catalog names for the id is
+    # what makes an archive the listed package; the same id under another key is another package.
+    wd = t.pack(t.tree(manifest("org.example.wd"), RUN), "author")
+    wd11 = t.pack(t.tree(manifest("org.example.wd", version="1.1.0"), RUN), "author")
+    wd_stranger = t.pack(t.tree(manifest("org.example.wd2"), RUN), "stranger")
+    wd_owner = t.pack(t.tree(manifest("org.example.wd3"), RUN), "owner")
+    og = t.pack(t.tree(manifest("org.openglow.wdprobe"), RUN), "official")
+    lists = lambda: {x["id"]: x for x in t.run("list").get("packages", [])}  # noqa: E731
+    r = t.run("index-verify", raw_index({"index": 1, "packages": [good, pkg("org.example.wd", [ver("1.0.0"), ver("1.1.0")])]}))
+    check(r.get("ok") is True, "an index listing org.example.wd: %s" % r.get("error"))
+    r = t.run("inspect", wd)
+    check(r.get("tier") == "community" and r.get("endorsed") is True,
+          "one author's key, endorsed for two ids, speaks for the second as well as the first: %s %s"
+          % (r.get("tier"), r.get("error")))
+    r = t.run("install", wd, "--consent-community")
+    check(r.get("ok") is True, "org.example.wd 1.0.0 installs as community: %s" % r.get("error"))
+    r = t.run("install", og)
+    check(r.get("ok") is True, "org.openglow.wdprobe 1.0.0 installs as official: %s" % r.get("error"))
+    check(lists()["org.example.wd"].get("withdrawn") is None, "and nothing is withdrawn yet: %s" % lists()["org.example.wd"])
+    r = t.run("index-verify", raw_index({"index": 1, "packages": [
+        good,
+        pkg("org.example.wd", [ver("1.1.0")], withdrawn=[{"version": "1.0.0", "reason": "a flaw in 1.0.0"}]),
+        pkg("org.example.wd2", [ver("2.0.0")], withdrawn=[{"version": "1.0.0", "reason": "x"}]),
+        pkg("org.example.wd3", [ver("2.0.0")], key=owner_pub, withdrawn=[{"version": "1.0.0", "reason": "y"}]),
+        pkg("org.openglow.wdprobe", [ver("1.1.0")], key=None, withdrawn=[{"version": "1.0.0", "reason": "z"}])]}))
+    check(r.get("ok") is True, "an index withdrawing single versions: %s" % r.get("error"))
+    have = lists()
+    check(have["org.example.wd"].get("withdrawn") == {"scope": "version", "reason": "a flaw in 1.0.0"},
+          "the installed copy of a withdrawn version stays, and says so: %s" % have["org.example.wd"].get("withdrawn"))
+    check(have["org.openglow.wdprobe"].get("withdrawn") == {"scope": "version", "reason": "z"},
+          "and so does OpenGlow's own: %s" % have["org.openglow.wdprobe"].get("withdrawn"))
+    check(have["org.example.listed"].get("withdrawn") is None, "a package not withdrawn says nothing")
+    t.run("remove", "org.example.wd")
+    r = t.run("inspect", wd)
+    check(r.get("ok") is False and "OpenGlow withdrew org.example.wd 1.0.0 from its catalog: a flaw in 1.0.0" in (r.get("error") or ""),
+          "a withdrawn version does not install, from anywhere: %s" % r.get("error"))
+    r = t.run("inspect", wd_owner)
+    check(r.get("ok") is False and "withdrew org.example.wd3 1.0.0" in (r.get("error") or ""),
+          "nor under the key the catalog endorses for it: %s" % r.get("error"))
+    check(t.run("key-add", "wd3-author", t.pub("owner")).get("ok") is True, "the owner adds that author's key")
+    r = t.run("inspect", wd_owner)
+    check(r.get("ok") is False and "withdrew org.example.wd3 1.0.0" in (r.get("error") or ""),
+          "nor under the owner's own copy of that key: %s" % r.get("error"))
+    r = t.run("inspect", wd_stranger)
+    check(r.get("ok") is True and r.get("tier") == "unverified" and r.get("withdrawn") is None,
+          "the same id and version under another key is another package: %s %s" % (r.get("tier"), r.get("error")))
+    check(t.run("remove", "org.openglow.wdprobe").get("ok") is True, "org.openglow.wdprobe goes")
+    r = t.run("inspect", og)
+    check(r.get("ok") is False and "withdrew org.openglow.wdprobe 1.0.0" in (r.get("error") or ""),
+          "OpenGlow's own withdrawn version does not install: %s" % r.get("error"))
+    r = t.run("install", wd11, "--consent-community")
+    check(r.get("ok") is True and lists()["org.example.wd"].get("withdrawn") is None,
+          "the version listed in its place installs, and is not withdrawn: %s" % r.get("error"))
+
+    # A package withdrawn whole: its key endorses nothing any more, an installed copy stays and says so, and an
+    # archive under the key the catalog named - here the owner's own copy of it - installs as the owner's key
+    # says, with the withdrawal shown.
+    r = t.run("index-verify", raw_index({"index": 1, "packages": [good], "withdrawn": [
+        {"id": "org.example.wd", "key": author_pub, "reason": "its author asked"},
+        {"id": "org.example.wd3", "key": owner_pub, "reason": "out of policy"}]}))
+    check(r.get("ok") is True and r.get("packages") == 1, "an index withdrawing packages whole: %s" % r)
+    check(lists()["org.example.wd"].get("withdrawn") == {"scope": "package", "reason": "its author asked"},
+          "the installed copy of a withdrawn package stays, and says so: %s" % lists()["org.example.wd"].get("withdrawn"))
+    check(not os.path.exists(os.path.join(t.root, "index", "keys", "org.example.wd.pub")), "and its key is endorsed for nothing")
+    r = t.run("inspect", wd_owner)
+    check(r.get("ok") is True and r.get("tier") == "community" and r.get("withdrawn") == {"scope": "package", "reason": "out of policy"},
+          "the owner's own key still speaks for it, and the answer shows the withdrawal: %s %s"
+          % (r.get("withdrawn"), {k: r.get(k) for k in ("ok", "tier", "error")}))
+    check(t.run("key-remove", "wd3-author").get("ok") is True, "the owner takes that key away again")
+    r = t.run("inspect", wd_owner)
+    check(r.get("ok") is True and r.get("tier") == "unverified" and r.get("withdrawn") is None,
+          "and with no key speaking for it, it is nobody's, and the withdrawal names another package: %s %s"
+          % (r.get("tier"), r.get("withdrawn")))
+    wd12 = t.pack(t.tree(manifest("org.example.wd", version="1.2.0"), RUN), "author")
+    r = t.run("inspect", wd12)
+    check(r.get("ok") is False and "signed by the key that signed the installed version" in (r.get("error") or ""),
+          "an update of it reads as unverified, and the pinned key refuses it: %s" % r.get("error"))
+    check(t.run("remove", "org.example.wd").get("ok") is True, "org.example.wd goes")
+
+    # Withdrawn by leaving the catalog: the installed version stays, and an update no longer reads as community.
+    r = t.run("index-verify", raw_index({"index": 1, "packages": []}))
     check(r.get("ok") is True and r.get("packages") == 0, "an index that lists nothing: %s" % r)
     update = t.pack(t.tree(manifest("org.example.listed", version="1.1.0"), RUN), "author")
     r = t.run("inspect", update)
     check(r.get("ok") is False and "signed by the key that signed the installed version" in (r.get("error") or ""),
-          "withdrawn: the update is unverified now, and the pinned key refuses it -> %s" % r.get("error"))
+          "delisted: the update is unverified now, and the pinned key refuses it -> %s" % r.get("error"))
     check("org.example.listed" in [p["id"] for p in t.run("list")["packages"]], "and the installed version stays")
     check(t.run("remove", "org.example.listed").get("ok") is True, "the package goes")
 

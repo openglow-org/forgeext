@@ -118,4 +118,9 @@ int manifest_id_reserved(const char *id);
  * pre-release sorts before its release. */
 int manifest_version_cmp(const char *a, const char *b);
 
+/* A package's "api" (MAJOR.MINOR) against the extension API this firmware
+ * serves: 0, or -1 with the words. The manifest is judged by it, and so is
+ * a version the signed index lists. */
+int manifest_api_check(const char *api, char *err, size_t elen);
+
 #endif

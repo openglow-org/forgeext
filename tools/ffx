@@ -10,7 +10,8 @@
     ffx keygen NAME
     ffx install FILE --machine ADDR [--user NAME] [--grant CAPABILITY]...
     ffx logs --machine ADDR [--user NAME] [--id ID] [--follow]
-    ffx index build LISTING --version V [--key KEY.priv] --out FILE
+    ffx index record FILE.ffx --url URL [--key AUTHOR.pub | --official-key OPENGLOW.pub] [--out FILE]
+    ffx index build CATALOG --version V [--key KEY.priv] --out FILE
 
 `lint` judges a package the way the machine's extension host does, in its
 words, and stops where it would: the manifest, the capabilities, the page,
@@ -20,14 +21,16 @@ the archive with fwup (the same one a machine verifies with), signs it when
 given a key, and checks the signature before it says so. `install` logs in
 to a machine over HTTPS, uploads, shows what the machine says the package is
 and asks for, and installs with the consent its tier takes. `logs` reads the
-extension host's log, a package's lines alone with --id. `index build` is
-OpenGlow's: the signed index of the catalog, from a listing of archives.
+extension host's log, a package's lines alone with --id. `index record` and
+`index build` are OpenGlow's: a listed version's record from its signed
+archive, and the signed index of the catalog from those records.
 
 Extension API 0.1. Python 3.8 or later and the standard library; fwup for
 pack and keygen (set FWUP to its path).
 """
 import argparse
 import ast
+import functools
 import getpass
 import gzip
 import hashlib
@@ -771,8 +774,25 @@ def cmd_pack(a):
 
 
 # ---------------------------------------------------------------- the index
+# OpenGlow's own tools for the catalog. A catalog is a directory:
+#
+#   packages/<id>/key.pub          the author's public key (none for an id in OpenGlow's namespace)
+#   packages/<id>/<version>.json   one listed version, as `ffx index record` wrote it
+#   packages/<id>/withdrawn.json   {"reason": "..."} withdraws the package whole, or
+#                                  {"versions": {"<version>": "<reason>", ...}} those versions of it
+#
+# `index record` verifies one archive and writes its record; `index build` makes the index every machine keeps
+# from the directory. index_check() below mirrors forgeext's (src/index.c), and tests/ffx_test.py holds the two
+# to agreeing.
 
 INDEX_PRODUCT = "ForgeFIRM extension index"
+INDEX_SCHEMA = 1
+INDEX_MAX_PKGS, INDEX_MAX_VERSIONS, INDEX_MAX_WITHDRAWN, INDEX_MAX_CAPS = 512, 16, 64, 64
+INDEX_MAX_BYTES = 1024 * 1024
+ARCHIVE_MAX = 32 << 20
+OFFICIAL_NS = ("org.openglow.", "org.forgefirm.")
+RECORD_KEYS = ("id", "version", "name", "author", "description", "license", "homepage", "api", "capabilities",
+               "core", "url", "sha256", "size")
 
 
 def archive_manifest(path):
@@ -792,41 +812,313 @@ def archive_manifest(path):
         return judge_manifest(f.read())
 
 
-def cmd_index_build(a):
-    """The signed index from a listing: {"packages": [{"file": "x.ffx", "url": "https://...", "key": "author.pub"}]}.
-    Each entry's id, name, version, and the rest come from the archive's own manifest; its sha256 and size from its
-    bytes; the author's public key from the named file (none for an id in OpenGlow's namespace)."""
-    listing = json.load(open(a.listing, encoding="utf-8"))
-    base = os.path.dirname(os.path.abspath(a.listing))
-    out_pkgs, seen = [], set()
-    for e in listing.get("packages", []):
-        path = os.path.join(base, e["file"])
-        m = archive_manifest(path)
-        if m["id"] in seen:
-            raise Refused("the listing names %s twice" % m["id"])
-        seen.add(m["id"])
-        data = open(path, "rb").read()
-        entry = {"id": m["id"], "name": m["name"], "version": m["version"], "author": m["author"],
-                 "url": e["url"], "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
-                 "capabilities": list(m.get("capabilities") or [])}
-        for k in ("description", "license", "homepage"):
-            if m.get(k):
-                entry[k] = m[k]
-        official = m["id"].startswith(("org.openglow.", "org.forgefirm."))
-        if e.get("key") and official:
-            raise Refused("%s is in OpenGlow's namespace: the index endorses no key for it" % m["id"])
-        if e.get("key"):
-            entry["key"] = open(os.path.join(base, e["key"]), encoding="ascii").read().strip()
+def _archive_meta(path):
+    """The meta-* lines of an archive's meta.conf, as {name: value}."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            conf = z.read("meta.conf").decode("utf-8", "replace")
+    except (OSError, KeyError, zipfile.BadZipFile) as e:
+        raise Refused("%s is not an extension archive: %s" % (path, e))
+    out = {}
+    for ln in conf.splitlines():
+        # fwup quotes a value only when it has to: meta-product="ForgeFIRM extension", meta-version=1.0.0
+        m = re.match(r'\s*(meta-[a-z-]+)\s*=\s*(?:"(.*)"|(\S*))\s*$', ln)
+        if m:
+            out[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return out
+
+
+def _unpack_payload(path, d):
+    """The archive's payload unpacked into d, regular files and directories only, nothing outside d."""
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        data = z.read("data/payload.tar.gz")
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
+        for info in t.getmembers():
+            rel = info.name[2:] if info.name.startswith("./") else info.name
+            if rel in ("", "."):
+                continue
+            if rel.startswith("/") or ".." in rel.split("/") or not (info.isfile() or info.isdir()):
+                raise Refused("%s: the payload holds %s, which no package may" % (path, info.name))
+            full = os.path.join(d, *rel.split("/"))
+            if info.isdir():
+                os.makedirs(full, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "wb") as f:
+                f.write(t.extractfile(info).read())
+            os.chmod(full, 0o755 if info.mode & 0o111 else 0o644)
+
+
+def _https_ok(u, most):
+    if not isinstance(u, str) or not u.startswith("https://") or _bytes(u) > most or len(u) == 8:
+        return False
+    if any(b <= 0x20 or b == 0x7F for b in u.encode("utf-8")):
+        return False
+    rest = u[8:]
+    ends = [i for i in (rest.find("/"), rest.find("?"), rest.find("#")) if i >= 0]
+    at = rest.find("@")
+    return at < 0 or (bool(ends) and at > min(ends))        # no user or password in the authority
+
+
+def _index_text_ok(o, key, required, most):
+    if key not in o:
+        return not required
+    s = o[key]
+    if not isinstance(s, str) or _bytes(s) > most or (required and not s):
+        return False
+    return not any(ord(c) < 0x20 or ord(c) == 0x7F for c in s)
+
+
+def _index_key_ok(o, id_):
+    k = o.get("key")
+    if id_.startswith(OFFICIAL_NS) and "key" in o:
+        raise Refused("%s is in OpenGlow's namespace: only the OpenGlow extension key signs it, and the index "
+                      "endorses no key for it" % id_)
+    if not id_.startswith(OFFICIAL_NS) and (not isinstance(k, str) or not 40 <= _bytes(k) <= 64 or "\n" in k):
+        raise Refused("%s: the index names its author's public key, as fwup writes it" % id_)
+
+
+def _cap_form_ok(c):
+    return isinstance(c, str) and 1 <= _bytes(c) <= 255 and all(0x21 <= b <= 0x7E for b in c.encode("utf-8"))
+
+
+def _index_version_check(v, id_):
+    ver = v.get("version") if isinstance(v, dict) else None
+    if not isinstance(v, dict) or not isinstance(ver, str) or not version_ok(ver):
+        raise Refused("%s: a listed version is not one" % id_)
+    if not _https_ok(v.get("url"), 1024):
+        raise Refused("%s %s: it is fetched from an https:// address, with no user or password in it" % (id_, ver))
+    sha = v.get("sha256")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise Refused("%s %s: its sha256 is 64 lowercase hex digits" % (id_, ver))
+    if not _is_int(v.get("size")) or v["size"] < 1:
+        raise Refused("%s %s: its size is a whole number of bytes" % (id_, ver))
+    if "capabilities" in v:
+        caps = v["capabilities"]
+        if not isinstance(caps, list) or len(caps) > INDEX_MAX_CAPS:
+            raise Refused("%s %s: its capabilities are a list of at most %d" % (id_, ver, INDEX_MAX_CAPS))
+        if not all(_cap_form_ok(c) for c in caps):
+            raise Refused("%s %s: a capability is printable text with no space" % (id_, ver))
+    if not _index_text_ok(v, "api", False, 16):
+        raise Refused("%s %s: its api is MAJOR.MINOR" % (id_, ver))
+    if "core" in v:
+        core = v["core"]
+        if (not isinstance(core, dict) or ("min" in core and not version_ok(core["min"]))
+                or ("max" in core and not version_ok(core["max"]))):
+            raise Refused('%s %s: its core range is {"min", "max"}, each a version' % (id_, ver))
+        if "min" in core and "max" in core and version_cmp(core["min"], core["max"]) > 0:
+            raise Refused("%s %s: its core range's min is above its max" % (id_, ver))
+
+
+def _strings_of(lst, field):
+    return [e.get(field) for e in lst if isinstance(e, dict) and isinstance(e.get(field), str)]
+
+
+def _index_package_check(pkgs, i):
+    p = pkgs[i]
+    id_ = p.get("id") if isinstance(p, dict) else None
+    if not isinstance(p, dict) or not isinstance(id_, str) or not id_ok(id_):
+        raise Refused("entry %d of the index has no package id" % (i + 1))
+    if id_ in _strings_of(pkgs[:i], "id"):
+        raise Refused("the index lists %s twice" % id_)
+    if (not _index_text_ok(p, "name", True, 64) or not _index_text_ok(p, "description", False, 256)
+            or not _index_text_ok(p, "author", True, 128) or not _index_text_ok(p, "license", False, 64)):
+        raise Refused("%s: its name, author, description, or license is not text of its size" % id_)
+    if "homepage" in p and not _https_ok(p["homepage"], 256):
+        raise Refused("%s: its homepage is an https:// address" % id_)
+    _index_key_ok(p, id_)
+    vers = p.get("versions")
+    if not isinstance(vers, list) or not 1 <= len(vers) <= INDEX_MAX_VERSIONS:
+        raise Refused("%s: its versions are a list of 1 to %d" % (id_, INDEX_MAX_VERSIONS))
+    for k, v in enumerate(vers):
+        _index_version_check(v, id_)
+        if v["version"] in _strings_of(vers[:k], "version"):
+            raise Refused("the index lists %s %s twice" % (id_, v["version"]))
+    if "withdrawn" in p:
+        gone = p["withdrawn"]
+        if not isinstance(gone, list) or len(gone) > INDEX_MAX_WITHDRAWN:
+            raise Refused("%s: its withdrawn versions are a list of at most %d" % (id_, INDEX_MAX_WITHDRAWN))
+        for k, w in enumerate(gone):
+            ver = w.get("version") if isinstance(w, dict) else None
+            if not isinstance(w, dict) or not isinstance(ver, str) or not version_ok(ver) \
+                    or not _index_text_ok(w, "reason", False, 256):
+                raise Refused('%s: a withdrawn version is {"version", "reason"}' % id_)
+            if ver in _strings_of(gone[:k], "version"):
+                raise Refused("the index withdraws %s %s twice" % (id_, ver))
+            if ver in _strings_of(vers, "version"):
+                raise Refused("the index both lists and withdraws %s %s" % (id_, ver))
+
+
+def index_check(doc):
+    """forgeext's index_check(): the form every machine keeps an index in, or Refused in its words."""
+    if not isinstance(doc, dict) or not _is_int(doc.get("index")) or doc["index"] != INDEX_SCHEMA:
+        raise Refused('an index is {"index": %d, "packages": [...]}' % INDEX_SCHEMA)
+    pkgs = doc.get("packages")
+    if not isinstance(pkgs, list) or len(pkgs) > INDEX_MAX_PKGS:
+        raise Refused("the index's packages are a list of at most %d" % INDEX_MAX_PKGS)
+    for i in range(len(pkgs)):
+        _index_package_check(pkgs, i)
+    if "withdrawn" in doc:
+        gone = doc["withdrawn"]
+        if not isinstance(gone, list) or len(gone) > INDEX_MAX_PKGS:
+            raise Refused("the index's withdrawn packages are a list of at most %d" % INDEX_MAX_PKGS)
+        for i, w in enumerate(gone):
+            id_ = w.get("id") if isinstance(w, dict) else None
+            if not isinstance(w, dict) or not isinstance(id_, str) or not id_ok(id_) \
+                    or not _index_text_ok(w, "reason", False, 256):
+                raise Refused('withdrawn package %d of the index is {"id", "key", "reason"}' % (i + 1))
+            _index_key_ok(w, id_)
+            if id_ in _strings_of(gone[:i], "id"):
+                raise Refused("the index withdraws %s twice" % id_)
+            if id_ in _strings_of(pkgs, "id"):
+                raise Refused("the index both lists and withdraws %s" % id_)
+
+
+def cmd_index_record(a):
+    """One listed version, from its signed archive: verified against its signer's key, linted as the machine
+    judges it, and written as the record `index build` lists."""
+    if not _https_ok(a.url, 1024):
+        raise Refused("the archive is fetched from an https:// address, with no user or password in it")
+    data = open(a.file, "rb").read()
+    if len(data) > ARCHIVE_MAX:
+        raise Refused("the archive is larger than a machine takes (%d MiB)" % (ARCHIVE_MAX >> 20))
+    meta = _archive_meta(a.file)
+    if meta.get("meta-product") != PRODUCT:
+        raise Refused("%s is not an extension package: its product is %r" % (a.file, meta.get("meta-product")))
+    m = archive_manifest(a.file)
+    if meta.get("meta-version") != m["version"]:
+        raise Refused("the archive says version %s and its manifest says %s" % (meta.get("meta-version"), m["version"]))
+    official = m["id"].startswith(OFFICIAL_NS)
+    if official and a.key:
+        raise Refused("%s is in OpenGlow's namespace: the index endorses no author key for it" % m["id"])
+    pub = a.official_key if official else a.key
+    if not pub:
+        raise Refused("%s is in OpenGlow's namespace: its signature is checked against the OpenGlow extension key "
+                      "(--official-key)" % m["id"] if official else
+                      "%s: its signature is checked against its author's public key (--key)" % m["id"])
+    v = subprocess.run([fwup_bin(), "-V", "-i", a.file, "-p", pub], capture_output=True)
+    if v.returncode != 0:
+        raise Refused("%s is not signed with %s" % (a.file, pub))
+    work = tempfile.mkdtemp(prefix="ffx-record-")
+    try:
+        _unpack_payload(a.file, work)
+        lint(work, quiet=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    rec = {"id": m["id"], "version": m["version"], "name": m["name"], "author": m["author"], "api": m["api"],
+           "capabilities": list(m.get("capabilities") or []), "url": a.url,
+           "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+    for k in ("description", "license", "homepage", "core"):
+        if m.get(k):
+            rec[k] = m[k]
+    text = json.dumps(rec, indent=1, sort_keys=True, ensure_ascii=False) + "\n"
+    if a.out:
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        print("%s: %s %s" % (a.out, m["id"], m["version"]))
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def _newest_first(vs):
+    return sorted(vs, key=functools.cmp_to_key(lambda x, y: version_cmp(y, x)))
+
+
+def catalog_doc(d):
+    """The catalog directory d, read and checked: index.json as every machine keeps it."""
+    pdir = os.path.join(d, "packages")
+    if not os.path.isdir(pdir):
+        raise Refused("%s has no packages/ directory" % d)
+    pkgs, gone = [], []
+    for id_ in sorted(n for n in os.listdir(pdir) if not n.startswith(".")):     # .gitkeep keeps an empty catalog
+        base = os.path.join(pdir, id_)
+        if not os.path.isdir(base) or not id_ok(id_):
+            raise Refused("packages/%s is not a package's directory, named for its id" % id_)
+        official = id_.startswith(OFFICIAL_NS)
+        names = sorted(os.listdir(base))
+        key = None
+        if "key.pub" in names:
+            if official:
+                raise Refused("packages/%s is in OpenGlow's namespace: it names no key" % id_)
+            key = open(os.path.join(base, "key.pub"), encoding="ascii").read().strip()
         elif not official:
-            raise Refused("%s: the listing names no author key for it" % m["id"])
-        out_pkgs.append(entry)
-    doc = {"index": 1, "packages": out_pkgs}
+            raise Refused("packages/%s: its author's key.pub is missing" % id_)
+        w = {}
+        if "withdrawn.json" in names:
+            w = json.load(open(os.path.join(base, "withdrawn.json"), encoding="utf-8"))
+            ok = isinstance(w, dict) and not set(w) - {"reason", "versions"} and ("reason" in w) != ("versions" in w)
+            ok = ok and ("reason" not in w or (isinstance(w["reason"], str) and w["reason"].strip()))
+            ok = ok and ("versions" not in w or (isinstance(w["versions"], dict) and w["versions"] and all(
+                version_ok(k) and isinstance(r, str) and r.strip() for k, r in w["versions"].items())))
+            if not ok:
+                raise Refused('packages/%s/withdrawn.json is {"reason": "why"} for the whole package, or '
+                              '{"versions": {"<version>": "why", ...}}' % id_)
+        records = {}
+        for n in names:
+            if n in ("key.pub", "withdrawn.json"):
+                continue
+            if not n.endswith(".json") or not version_ok(n[:-5]):
+                raise Refused("packages/%s/%s is not a version's record (<version>.json)" % (id_, n))
+            rec = json.load(open(os.path.join(base, n), encoding="utf-8"))
+            if not isinstance(rec, dict) or rec.get("id") != id_ or rec.get("version") != n[:-5]:
+                raise Refused("packages/%s/%s is not the record of %s %s" % (id_, n, id_, n[:-5]))
+            extra = sorted(set(rec) - set(RECORD_KEYS))
+            if extra:
+                raise Refused("packages/%s/%s holds what a record does not: %s" % (id_, n, ", ".join(extra)))
+            records[rec["version"]] = rec
+        order = _newest_first(list(records))
+        if "reason" in w:
+            if records:
+                raise Refused("packages/%s is withdrawn whole and still lists %s" % (id_, ", ".join(order)))
+            e = {"id": id_, "reason": w["reason"]}
+            if key:
+                e["key"] = key
+            gone.append(e)
+            continue
+        if not records:
+            raise Refused("packages/%s lists no version, and is not withdrawn" % id_)
+        top = records[order[0]]
+        entry = {"id": id_, "name": top.get("name"), "author": top.get("author"), "versions": []}
+        for k in ("description", "license", "homepage"):
+            if top.get(k):
+                entry[k] = top[k]
+        if key:
+            entry["key"] = key
+        for ver in order:
+            r = records[ver]
+            v = {k: r.get(k) for k in ("version", "url", "sha256", "size")}
+            v["capabilities"] = list(r.get("capabilities") or [])
+            for k in ("api", "core"):
+                if r.get(k):
+                    v[k] = r[k]
+            entry["versions"].append(v)
+        wv = w.get("versions") or {}
+        if wv:
+            entry["withdrawn"] = [{"version": ver, "reason": wv[ver]} for ver in _newest_first(list(wv))]
+        pkgs.append(entry)
+    doc = {"index": INDEX_SCHEMA, "packages": pkgs}
+    if gone:
+        doc["withdrawn"] = gone
+    index_check(doc)
+    return doc
+
+
+def cmd_index_build(a):
+    """The signed index of a catalog directory, the same bytes for the same catalog every time."""
+    if not version_ok(a.version):
+        raise Refused("the index's version is MAJOR.MINOR.PATCH, as YYYY.MMDD.N")
+    doc = catalog_doc(a.catalog)
+    text = (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode()
+    if len(text) > INDEX_MAX_BYTES:
+        raise Refused("index.json is %d bytes, more than a machine keeps (%d)" % (len(text), INDEX_MAX_BYTES))
     fwup = fwup_bin()
     work = tempfile.mkdtemp(prefix="ffx-index-")
     try:
         raw = io.BytesIO()
         with tarfile.open(fileobj=raw, mode="w", format=tarfile.GNU_FORMAT) as t:
-            text = (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode()
             info = tarfile.TarInfo("index.json")
             info.size, info.mode, info.mtime, info.uname, info.gname = len(text), 0o644, 0, "root", "root"
             t.addfile(info, io.BytesIO(text))
@@ -847,8 +1139,11 @@ def cmd_index_build(a):
             shutil.copyfile(signed, a.out)
         else:
             shutil.copyfile(unsigned, a.out)
-        print("%s: %d package%s, version %s%s" % (a.out, len(out_pkgs), "" if len(out_pkgs) == 1 else "s", a.version,
-                                                  "" if a.key else " (UNSIGNED: no machine keeps it)"))
+        nver = sum(len(p["versions"]) for p in doc["packages"])
+        print("%s: %d package%s, %d version%s, %d withdrawn whole, version %s, index.json sha256 %s%s"
+              % (a.out, len(doc["packages"]), "" if len(doc["packages"]) == 1 else "s", nver, "" if nver == 1 else "s",
+                 len(doc.get("withdrawn", [])), a.version, hashlib.sha256(text).hexdigest(),
+                 "" if a.key else " (UNSIGNED: no machine keeps it)"))
     except subprocess.CalledProcessError as e:
         raise Refused("fwup failed: %s" % (e.stderr or b"").decode("utf-8", "replace").strip())
     finally:
@@ -1073,11 +1368,19 @@ def main(argv=None):
     p.add_argument("--key", help="the private key (NAME.priv from ffx keygen); its NAME.pub must be beside it")
     p.add_argument("--out")
     p.set_defaults(fn=cmd_pack)
-    p = sub.add_parser("index", help="the signed index: build one from a listing")
+    p = sub.add_parser("index", help="OpenGlow's catalog: a version's record, and the signed index")
     isub = p.add_subparsers(dest="icmd", required=True)
-    q = isub.add_parser("build")
-    q.add_argument("listing", help='{"packages": [{"file": "x.ffx", "url": "https://...", "key": "author.pub"}]}')
-    q.add_argument("--version", required=True, help="the index's own version")
+    q = isub.add_parser("record", help="one listed version, from its signed archive")
+    q.add_argument("file", help="the package's .ffx")
+    q.add_argument("--url", required=True, help="the https:// address a machine fetches it from")
+    q.add_argument("--key", help="its author's public key (NAME.pub); none for an id in OpenGlow's namespace")
+    q.add_argument("--official-key", help="the OpenGlow extension key's public half, for OpenGlow's own packages")
+    q.add_argument("--out", help="the record's file (packages/<id>/<version>.json); standard output without it")
+    q.set_defaults(fn=cmd_index_record)
+    q = isub.add_parser("build", help="the signed index of a catalog directory")
+    q.add_argument("catalog", help="the catalog: packages/<id>/key.pub, <version>.json, withdrawn.json")
+    q.add_argument("--version", required=True, help="the index's own version, YYYY.MMDD.N: a machine never keeps "
+                   "one older than the index it has")
     q.add_argument("--key", help="the OpenGlow extension key's private half: no machine keeps an index signed otherwise")
     q.add_argument("--out", required=True)
     q.set_defaults(fn=cmd_index_build)

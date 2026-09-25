@@ -77,6 +77,8 @@ typedef struct {
     int nneeds;
     char new_caps[MANIFEST_MAX_CAPS][CAP_MAX_LEN];      /* asked for and not held by the installed version */
     int nnew;
+    int withdrawn;                          /* index.h's INDEX_PACKAGE_WITHDRAWN: OpenGlow withdrew the package whole */
+    char withdrawn_reason[260];
 } install_result_t;
 
 void ext_env_defaults(ext_env_t *env);

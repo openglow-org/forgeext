@@ -8,7 +8,7 @@
 #define _GNU_SOURCE
 #include "pkg.h"
 
-#define INDEX_KEYS_SCAN 256                             /* index.h's INDEX_MAX_PKGS: one endorsed key per id */
+#define INDEX_KEYS_SCAN 512                             /* index.h's INDEX_MAX_PKGS: one endorsed key per id */
 
 #include <archive.h>
 #include <archive_entry.h>

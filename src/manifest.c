@@ -222,21 +222,35 @@ static int inside_path_ok(const char *p)
     }
 }
 
-static int take_api(json_t *root, manifest_t *m, char *err, size_t elen)
+static int api_split(const char *api, long *major, long *minor)
 {
-    char api[17];
-    if (take_text(root, "api", 1, api, sizeof(api), err, elen) != 0)
+    const char *p = api ? api : "";
+    if (version_number(&p, major) != 0 || *p++ != '.' || version_number(&p, minor) != 0 || *p)
         return -1;
-    const char *p = api;
+    return 0;
+}
+
+int manifest_api_check(const char *api, char *err, size_t elen)
+{
     long major, minor;
-    if (version_number(&p, &major) != 0 || *p++ != '.' || version_number(&p, &minor) != 0 || *p)
+    if (api_split(api, &major, &minor) != 0)
         return fail(err, elen, "\"api\" is MAJOR.MINOR, for example \"%d.%d\"", EXT_API_MAJOR, EXT_API_MINOR);
-    m->api_major = (int)major;
-    m->api_minor = (int)minor;
     int fits = major == EXT_API_MAJOR && (major == 0 ? minor == EXT_API_MINOR : minor <= EXT_API_MINOR);
     if (!fits)
         return fail(err, elen, "built for extension API %ld.%ld; this firmware serves %d.%d",
                     major, minor, EXT_API_MAJOR, EXT_API_MINOR);
+    return 0;
+}
+
+static int take_api(json_t *root, manifest_t *m, char *err, size_t elen)
+{
+    char api[17];
+    long major = 0, minor = 0;
+    if (take_text(root, "api", 1, api, sizeof(api), err, elen) != 0 || manifest_api_check(api, err, elen) != 0)
+        return -1;
+    api_split(api, &major, &minor);
+    m->api_major = (int)major;
+    m->api_minor = (int)minor;
     return 0;
 }
 

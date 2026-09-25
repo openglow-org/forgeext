@@ -11,8 +11,11 @@ directory, packed unsigned by tools/mkffx.sh, is judged by the built
 refuses a manifest the words must be the host's. Then `ffx pack` builds an
 archive the host takes, the same bytes twice over; `ffx new` makes a package
 for each runtime that lints as its template says; `ffx keygen` refuses to
-overwrite a key; and `ffx index build` makes an index the host keeps, the
-same bytes twice over, and refuses a listing out of form.
+overwrite a key; `ffx index record` writes a listed version's record only
+for an archive its signer's key verifies; `ffx index build` makes an index
+of a catalog directory that the host keeps, the same bytes twice over,
+and refuses a catalog out of form; and ffx's index form is the host's,
+document by document.
 
 Needs fwup (FWUP) and the built forgeext (FORGEEXT). Exits 77 without them.
 """
@@ -478,24 +481,49 @@ def main():
                 check("entry point, bin/run" in why and os.path.isfile(os.path.join(d, "src", "ffx.h")),
                       "and says so, with ffx.h beside its source: %s", why)
 
-        print("ffx index build: the listing's archives, as the host keeps them")
-        idx = os.path.join(top, "idx")
-        os.mkdir(idx)
-        shutil.copyfile(signed, os.path.join(idx, "fixture.ffx"))
-        shutil.copyfile(key + ".pub", os.path.join(idx, "author.pub"))
-        off = build(top, "an official one", with_(id="org.openglow.fixture"), {})
-        subprocess.run(["sh", os.path.join(TOOLS, "mkffx.sh"), off, os.path.join(idx, "official.ffx")], check=True,
-                       capture_output=True, env=env)
+        print("ffx index record and build: a catalog directory, as the host keeps it")
         ogkey = os.path.join(top, "openglow")
         check(ffx.main(["keygen", ogkey]) == 0, "a stand-in for the OpenGlow extension key")
+        off = build(top, "an official one", with_(id="org.openglow.fixture"), {})
+        official = os.path.join(top, "official.ffx")
+        check(ffx.main(["pack", off, "--key", ogkey + ".priv", "--out", official]) == 0, "OpenGlow's own, signed with it")
+        cat = os.path.join(top, "catalog")
+        fxdir, ogdir = os.path.join(cat, "packages", "org.example.fixture"), os.path.join(cat, "packages", "org.openglow.fixture")
+        os.makedirs(fxdir)
+        os.makedirs(ogdir)
+        shutil.copyfile(key + ".pub", os.path.join(fxdir, "key.pub"))
 
-        def index_build(entries, out, signer=None):
-            with open(os.path.join(idx, "listing.json"), "w") as f:
-                json.dump({"packages": entries}, f)
-            p = subprocess.run([sys.executable, "-B", os.path.join(TOOLS, "ffx"), "index", "build",
-                                os.path.join(idx, "listing.json"), "--version", "2026.9.23", "--out", out]
-                               + (["--key", signer + ".priv"] if signer else []), capture_output=True, text=True, env=env)
+        def ffx_run(*args):
+            p = subprocess.run([sys.executable, "-B", os.path.join(TOOLS, "ffx")] + list(args), capture_output=True,
+                               text=True, env=env)
             return p.returncode, (p.stdout + p.stderr).strip()
+
+        url = "https://example.org/fixture-1.0.0.ffx"
+        for args, words in ((["--url", url], "(--key)"),
+                            (["--url", url, "--key", ogkey + ".pub"], "is not signed with"),
+                            (["--url", "http://example.org/x.ffx", "--key", key + ".pub"], "https://"),
+                            (["--url", "https://me:pw@example.org/x.ffx", "--key", key + ".pub"], "https://")):
+            rc, said = ffx_run("index", "record", signed, *args)
+            check(rc == 1 and words in said, "record refused: %s", said)
+        rc, said = ffx_run("index", "record", official, "--url", url, "--key", key + ".pub")
+        check(rc == 1 and "endorses no author key" in said, "an official one takes no author key: %s", said)
+        rc, said = ffx_run("index", "record", a1, "--url", url, "--key", key + ".pub")
+        check(rc == 1 and "is not signed with" in said, "an unsigned archive: %s", said)
+        rc, said = ffx_run("index", "record", signed, "--url", url, "--key", key + ".pub", "--out",
+                           os.path.join(fxdir, "1.0.0.json"))
+        check(rc == 0, "the fixture's record: %s", said)
+        rc, said = ffx_run("index", "record", official, "--url", "https://example.org/official.ffx", "--official-key",
+                           ogkey + ".pub", "--out", os.path.join(ogdir, "1.0.0.json"))
+        check(rc == 0, "OpenGlow's own record, checked against its key: %s", said)
+        rec = json.load(open(os.path.join(fxdir, "1.0.0.json")))
+        data = open(signed, "rb").read()
+        check(rec.get("sha256") == hashlib.sha256(data).hexdigest() and rec.get("size") == len(data) and rec.get("url") == url
+              and rec.get("name") == "Fixture" and rec.get("capabilities") == ["machine.read"] and rec.get("api") == "0.1",
+              "the record is the archive's own: %s", rec)
+
+        def index_build(out, signer=None, version="2026.923.1"):
+            return ffx_run("index", "build", cat, "--version", version, "--out", out,
+                           *(["--key", signer + ".priv"] if signer else []))
 
         def host(*args):
             p = subprocess.run([FORGEEXT, "--root", root, "--fwup", FWUP, "--no-reserve", "--official-key", ogkey + ".pub"]
@@ -504,33 +532,151 @@ def main():
                 return json.loads(p.stdout)
             except ValueError:
                 return {"ok": None, "error": p.stdout + p.stderr}
-        fx = {"file": "fixture.ffx", "url": "https://example.org/fixture.ffx"}
-        og = {"file": "official.ffx", "url": "https://example.org/official.ffx"}
+
+        # A catalog out of form is refused, and nothing is written.
         out = os.path.join(top, "index.ffi")
-        for entries, words in (([fx], "names no author key"), ([dict(og, key="author.pub")], "endorses no key"),
-                               ([dict(fx, key="author.pub"), dict(fx, key="author.pub")], "twice")):
-            rc, said = index_build(entries, out)
-            check(rc == 1 and words in said and not os.path.exists(out), "refused, and nothing written: %s", said)
-        listing = [dict(fx, key="author.pub"), og]
+        saved = json.load(open(os.path.join(fxdir, "1.0.0.json")))
+
+        def put(path, obj):
+            with open(path, "w") as f:
+                f.write(obj if isinstance(obj, str) else json.dumps(obj))
+        for what, act, undo, words in (
+                ("no key.pub", lambda: os.rename(os.path.join(fxdir, "key.pub"), os.path.join(top, "k")),
+                 lambda: os.rename(os.path.join(top, "k"), os.path.join(fxdir, "key.pub")), "key.pub is missing"),
+                ("a key in OpenGlow's namespace", lambda: shutil.copyfile(key + ".pub", os.path.join(ogdir, "key.pub")),
+                 lambda: os.remove(os.path.join(ogdir, "key.pub")), "names no key"),
+                ("a record under another version's name", lambda: put(os.path.join(fxdir, "1.0.1.json"), saved),
+                 lambda: os.remove(os.path.join(fxdir, "1.0.1.json")), "is not the record of"),
+                ("a record holding more", lambda: put(os.path.join(fxdir, "1.0.0.json"), dict(saved, stars=5)),
+                 lambda: put(os.path.join(fxdir, "1.0.0.json"), saved), "holds what a record does not: stars"),
+                ("a withdrawal of both kinds", lambda: put(os.path.join(fxdir, "withdrawn.json"),
+                                                          {"reason": "x", "versions": {"0.9.0": "y"}}),
+                 lambda: os.remove(os.path.join(fxdir, "withdrawn.json")), "withdrawn.json is"),
+                ("a withdrawal with no reason", lambda: put(os.path.join(fxdir, "withdrawn.json"), {"versions": {"0.9.0": " "}}),
+                 lambda: os.remove(os.path.join(fxdir, "withdrawn.json")), "withdrawn.json is"),
+                ("withdrawn whole and still listed", lambda: put(os.path.join(fxdir, "withdrawn.json"), {"reason": "x"}),
+                 lambda: os.remove(os.path.join(fxdir, "withdrawn.json")), "withdrawn whole and still lists 1.0.0"),
+                ("a version both listed and withdrawn", lambda: put(os.path.join(fxdir, "withdrawn.json"),
+                                                                   {"versions": {"1.0.0": "y"}}),
+                 lambda: os.remove(os.path.join(fxdir, "withdrawn.json")), "both lists and withdraws org.example.fixture 1.0.0"),
+                ("a package that lists nothing", lambda: os.makedirs(os.path.join(cat, "packages", "org.openglow.empty")),
+                 lambda: shutil.rmtree(os.path.join(cat, "packages", "org.openglow.empty")), "lists no version")):
+            act()
+            rc, said = index_build(out)
+            undo()
+            check(rc == 1 and words in said and not os.path.exists(out), "%s: refused, and nothing written: %s", what, said)
+        rc, said = index_build(out, version="2026.9")
+        check(rc == 1 and "YYYY.MMDD.N" in said, "an index version that is none: %s", said)
+
         i1, i2 = os.path.join(top, "i1.ffi"), os.path.join(top, "i2.ffi")
         for o in (i1, i2):
-            rc, said = index_build(listing, o, ogkey)
-            check(rc == 0 and "2 packages" in said, "built and signed: %s", said)
-        check(open(i1, "rb").read() == open(i2, "rb").read(), "two builds of one listing are one index")
+            rc, said = index_build(o, ogkey)
+            check(rc == 0 and "2 packages, 2 versions" in said, "built and signed: %s", said)
+        check(open(i1, "rb").read() == open(i2, "rb").read(), "two builds of one catalog are one index")
         r = host("index-verify", i1)
-        check(r.get("ok") is True and r.get("packages") == 2 and r.get("version") == "2026.9.23", "the host keeps it: %s", r)
+        check(r.get("ok") is True and r.get("packages") == 2 and r.get("version") == "2026.923.1", "the host keeps it: %s", r)
         kept = {p["id"]: p for p in (host("index").get("index") or {}).get("packages", [])}
-        data = open(signed, "rb").read()
         mine = kept.get("org.example.fixture", {})
-        check(mine.get("sha256") == hashlib.sha256(data).hexdigest() and mine.get("size") == len(data)
+        v0 = (mine.get("versions") or [{}])[0]
+        check(v0.get("sha256") == hashlib.sha256(data).hexdigest() and v0.get("size") == len(data) and v0.get("api") == "0.1"
               and mine.get("key") == open(key + ".pub").read().strip() and mine.get("name") == "Fixture"
-              and mine.get("capabilities") == ["machine.read"], "the entry is the archive's own: %s", mine)
+              and v0.get("capabilities") == ["machine.read"] and mine.get("offer") == "1.0.0",
+              "the entry is the archive's own: %s", mine)
         check("key" not in kept.get("org.openglow.fixture", {"key": 1}), "the official entry names no key")
-        rc, said = index_build(listing, out)
+        rc, said = index_build(out)
         check(rc == 0 and "UNSIGNED" in said, "unsigned, it says so: %s", said)
         r = host("index-verify", out)
         check(r.get("ok") is False and "not signed" in (r.get("error") or ""), "and the host keeps none of it: %s",
               r.get("error"))
+
+        # Versions, a narrowed range, and withdrawals, as the host keeps them. A newer version of the fixture is
+        # recorded beside the first, its range narrowed by hand; an older one withdrawn; OpenGlow's withdrawn whole.
+        d2 = build(top, "a second version", with_(version="1.1.0"), {})
+        signed2 = os.path.join(top, "signed2.ffx")
+        check(ffx.main(["pack", d2, "--key", key + ".priv", "--out", signed2]) == 0, "1.1.0, packed and signed")
+        rc, said = ffx_run("index", "record", signed2, "--url", "https://example.org/fixture-1.1.0.ffx", "--key", key + ".pub",
+                           "--out", os.path.join(fxdir, "1.1.0.json"))
+        check(rc == 0, "its record: %s", said)
+        rec = json.load(open(os.path.join(fxdir, "1.1.0.json")))
+        put(os.path.join(fxdir, "1.1.0.json"), dict(rec, core={"min": "0.0.9"}))
+        put(os.path.join(fxdir, "withdrawn.json"), {"versions": {"0.9.0": "a flaw"}})
+        os.remove(os.path.join(ogdir, "1.0.0.json"))
+        put(os.path.join(ogdir, "withdrawn.json"), {"reason": "replaced"})
+        rc, said = index_build(i1, ogkey, version="2026.923.2")
+        check(rc == 0 and "1 package, 2 versions, 1 withdrawn whole" in said, "the catalog of versions and withdrawals: %s", said)
+        r = host("index-verify", i1)
+        check(r.get("ok") is True and r.get("packages") == 1, "the host keeps it: %s", r)
+        p = subprocess.run([FORGEEXT, "--root", root, "--fwup", FWUP, "--no-reserve", "--official-key", ogkey + ".pub",
+                            "--core-version", "0.0.8", "index"], capture_output=True, text=True)
+        doc = json.loads(p.stdout).get("index") or {}
+        fx = (doc.get("packages") or [{}])[0]
+        vs = [(v.get("version"), v.get("usable")) for v in fx.get("versions", [])]
+        check(vs == [("1.1.0", False), ("1.0.0", True)] and fx.get("offer") == "1.0.0"
+              and fx.get("withdrawn") == [{"version": "0.9.0", "reason": "a flaw"}]
+              and doc.get("withdrawn") == [{"id": "org.openglow.fixture", "reason": "replaced"}],
+              "newest first, judged, the narrowed range honored, the withdrawals named: %s %s %s", vs, fx.get("withdrawn"),
+              doc.get("withdrawn"))
+        r = host("index-verify", i2)
+        check(r.get("ok") is False and "older than the one kept here (2026.923.2)" in (r.get("error") or ""),
+              "and the first index, older, is refused now: %s", r.get("error"))
+
+        print("ffx's index form is the host's, doc by doc")
+        serial = [2]
+
+        def host_says(doc):
+            serial[0] += 1
+            work = tempfile.mkdtemp(dir=top)
+            idxjson = os.path.join(work, "index.json")
+            with open(idxjson, "w") as f:
+                json.dump(doc, f)
+            pl = os.path.join(work, "payload.tar.gz")
+            subprocess.run(["tar", "-C", work, "-czf", pl, "index.json"], check=True)
+            conf = os.path.join(work, "fwup.conf")
+            with open(conf, "w") as f:
+                f.write('meta-product = "ForgeFIRM extension index"\nmeta-version = "2026.923.%d"\n'
+                        'meta-platform = "forgefirm-ext"\nfile-resource payload.tar.gz {\n    host-path = "%s"\n}\n'
+                        % (serial[0], pl))
+            raw, sig = os.path.join(work, "i.raw"), os.path.join(work, "i.ffi")
+            subprocess.run([FWUP, "-c", "-f", conf, "-o", raw], check=True, capture_output=True)
+            subprocess.run([FWUP, "-S", "-s", ogkey + ".priv", "-i", raw, "-o", sig], check=True, capture_output=True)
+            r = host("index-verify", sig)
+            return None if r.get("ok") is True else (r.get("error") or "")
+        k = open(key + ".pub").read().strip()
+        v = {"version": "1.0.0", "url": "https://example.org/x.ffx", "sha256": "0f" * 32, "size": 9}
+        pk = {"id": "org.example.a", "name": "A", "author": "T", "key": k, "versions": [v]}
+        docs = [
+            {"index": 1, "packages": [pk]},
+            {"index": 1, "packages": [pk], "later": {"any": "thing"}},
+            {"index": 1.0, "packages": []},
+            {"index": 1, "packages": [pk, pk]},
+            {"index": 1, "packages": [dict(pk, name="")]},
+            {"index": 1, "packages": [dict(pk, homepage="ftp://x")]},
+            {"index": 1, "packages": [dict(pk, homepage=None)]},
+            {"index": 1, "packages": [dict(pk, key=None)]},
+            {"index": 1, "packages": [dict(pk, id="org.forgefirm.a")]},
+            {"index": 1, "packages": [dict(pk, versions=[dict(v, size=True)])]},
+            {"index": 1, "packages": [dict(pk, versions=[dict(v, size=-1)])]},
+            {"index": 1, "packages": [dict(pk, versions=[dict(v, url="https://a@b/")])]},
+            {"index": 1, "packages": [dict(pk, versions=[dict(v, url="https://b/@a")])]},
+            {"index": 1, "packages": [dict(pk, versions=[dict(v, capabilities=["x" * 256])])]},
+            {"index": 1, "packages": [dict(pk, versions=[dict(v, capabilities=["unheard.of"])])]},
+            {"index": 1, "packages": [dict(pk, versions=[dict(v, api=None)])]},
+            {"index": 1, "packages": [dict(pk, versions=[dict(v, core={"min": None})])]},
+            {"index": 1, "packages": [dict(pk, versions=[dict(v, core={"later": "1"})])]},
+            {"index": 1, "packages": [dict(pk, withdrawn=[{"version": "0.1.0"}, {"version": "0.1.0"}])]},
+            {"index": 1, "packages": [dict(pk, withdrawn=[{"version": "0.1.0", "reason": 5}])]},
+            {"index": 1, "packages": [], "withdrawn": None},
+            {"index": 1, "packages": [], "withdrawn": [{"id": "org.example.b", "key": k}, {"id": "org.example.b", "key": k}]},
+            {"index": 1, "packages": [], "withdrawn": [{"id": "org.openglow.b"}]},
+        ]
+        for doc in docs:
+            try:
+                ffx.index_check(doc)
+                mine = None
+            except ffx.Refused as e:
+                mine = str(e)
+            theirs = host_says(doc)
+            check(mine == theirs, "%s: the host says %s, ffx says %s", json.dumps(doc)[:90], theirs, mine)
 
         machine_client(ffx, top, a1)
     finally:
