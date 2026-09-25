@@ -1,0 +1,5 @@
+build/
+.forgeext/
+.forgefirm/
+__pycache__/
+@@IGNORE@@

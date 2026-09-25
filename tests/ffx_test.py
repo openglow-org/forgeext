@@ -463,23 +463,58 @@ def main():
         except ffx.Refused as e:
             check(False, "a vendored import refused: %s", e)
 
-        print("ffx new: a package for each runtime")
+        print("ffx new: a package's repository for each runtime")
+        make = shutil.which("make")
+        cross = shutil.which("arm-linux-gnueabihf-gcc")
         for runtime, lints in (("ui", True), ("python", True), ("shell", True), ("data", True), ("native", False)):
             d = os.path.join(top, "new-" + runtime)
-            rc = ffx.main(["new", d, "--id", "org.example.new" + runtime, "--runtime", runtime])
+            rc = ffx.main(["new", d, "--id", "org.example.new" + runtime, "--runtime", runtime, "--key", key + ".pub"])
             try:
-                ffx.lint(d)
+                _m, warnings, _f = ffx.lint(d)
                 ok, why = True, ""
             except ffx.Refused as e:
-                ok, why = False, str(e)
+                ok, why, warnings = False, str(e), []
             check(rc == 0 and ok == lints, "%s: made, and %s%s", runtime, "lints" if lints else "wants its binary built",
                   (": " + why) if why else "")
+            if lints:
+                check(any("the package's repository, not the package as it ships" in w for w in warnings),
+                      "%s: lint of the repository says to stage it: %s", runtime, warnings)
+            wf = open(os.path.join(d, ".github", "workflows", "package.yml")).read()
+            mk = open(os.path.join(d, "Makefile")).read()
+            files = {n: os.path.exists(os.path.join(d, n)) for n in ("Makefile", ".gitignore", "README.md", "key.pub")}
+            check(all(files.values()) and "uses: openglow-org/forgeext/.github/workflows/package.yml@main" in wf
+                  and "secrets: inherit" in wf and ("apt: gcc-arm-linux-gnueabihf" in wf) == (runtime == "native")
+                  and "\n\trm -rf build/pkg\n" in mk and ("bin/run:" in mk) == (runtime == "native")
+                  and "@@" not in wf + mk + open(os.path.join(d, "README.md")).read()
+                  and open(os.path.join(d, "key.pub")).read() == open(key + ".pub").read(),
+                  "%s: the repository's files: %s", runtime, files)
+            if make and (runtime != "native" or cross):
+                p = subprocess.run([make, "-C", d, "stage"], capture_output=True, text=True)
+                staged = sorted(os.listdir(os.path.join(d, "build", "pkg"))) if p.returncode == 0 else p.stderr[-300:]
+                try:
+                    _m, warnings, _f = ffx.lint(os.path.join(d, "build", "pkg"))
+                    ok, why = True, ""
+                except ffx.Refused as e:
+                    ok, why, warnings = False, str(e), []
+                check(p.returncode == 0 and ok and ".github" not in staged and "Makefile" not in staged
+                      and not any("repository" in w for w in warnings),
+                      "%s: make stage lays out what ships, and it lints: %s %s", runtime, staged, why)
+            else:
+                print("  note: no make%s here: %s is not staged" % ("" if make else "", runtime))
             if runtime == "ui":
                 page = open(os.path.join(d, "ui", "index.html")).read()
                 check("var ffx = (function" in page and "@@" not in page, "the page carries the bridge client")
             if runtime == "native":
-                check("entry point, bin/run" in why and os.path.isfile(os.path.join(d, "src", "ffx.h")),
-                      "and says so, with ffx.h beside its source: %s", why)
+                check("entry point, bin/run" in why or os.path.isfile(os.path.join(d, "bin", "run")),
+                      "and wants its binary built, with ffx.h beside its source: %s", why)
+                check(os.path.isfile(os.path.join(d, "src", "ffx.h")), "ffx.h is beside its source")
+        clone = os.path.join(top, "clone")
+        os.makedirs(os.path.join(clone, ".git"))
+        check(ffx.main(["new", clone, "--id", "org.example.clone", "--runtime", "ui"]) == 0
+              and os.path.isfile(os.path.join(clone, "manifest.json")) and os.path.isdir(os.path.join(clone, ".git")),
+              "a fresh clone, .git alone, takes a new package")
+        check(ffx.main(["new", clone, "--id", "org.example.clone", "--runtime", "ui"]) == 1,
+              "and a directory that holds anything more is refused")
 
         print("ffx index record and build: a catalog directory, as the host keeps it")
         ogkey = os.path.join(top, "openglow")

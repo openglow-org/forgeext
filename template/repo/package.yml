@@ -1,0 +1,21 @@
+# @@ID@@'s CI and its releases, by forgeext's shared workflow. On every push
+# and pull request: the package staged as it ships (make stage), linted as the
+# machine judges it, and packed. On main, a manifest version with no release
+# yet is signed with EXTENSION_SIGNING_KEY, the secret of this repository's
+# extension-signing environment, checked against key.pub, and published as
+# release v<version> with its catalog record.
+
+name: package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    uses: openglow-org/forgeext/.github/workflows/package.yml@main
+@@WITH@@    secrets: inherit

@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: MIT
 """ffx - the package author's tool for ForgeFIRM extension packages.
 
-    ffx new DIR --id ID --runtime ui|python|shell|native|data [--name NAME]
+    ffx new DIR --id ID --runtime ui|python|shell|native|data [--name NAME] [--key NAME.pub]
     ffx lint DIR
     ffx pack DIR [--key KEY.priv] [--out FILE]
     ffx keygen NAME
@@ -660,6 +660,7 @@ def lint(d, quiet=False):
     if not os.path.isfile(mpath):
         raise Refused("the package has no manifest.json")
     m = judge_manifest(open(mpath, "rb").read())
+    repo = [n for n in REPO_FILES if os.path.exists(os.path.join(d, n))]
     files = payload_files(d)
     rels = {r for r, _f, isdir in files if not isdir}
     wants_ui = "ui" in m["capabilities"]
@@ -695,6 +696,9 @@ def lint(d, quiet=False):
     for c in m["capabilities"]:
         if needs_grant(c):
             warnings.append("%s takes the operator's own grant at install" % c)
+    if repo:
+        warnings.append("%s holds %s: that is the package's repository, not the package as it ships. "
+                        "make stage lays that out in build/pkg; lint and pack build/pkg" % (d, ", ".join(repo)))
     if m["id"].startswith(("org.openglow.", "org.forgefirm.")):
         warnings.append("%s is in the official namespace: only an archive signed with the OpenGlow extension key "
                         "installs under it" % m["id"])
@@ -1164,32 +1168,71 @@ def cmd_keygen(a):
 
 # ---------------------------------------------------------------- new
 
+REPO_FILES = (".github", ".git", "Makefile", "key.pub")     # a package's repository, not the package as it ships
+
+
 def cmd_new(a):
+    """A package's repository: the package as the runtime's template has it, with the kit's client for its
+    runtime, and the repository's own files around it - a Makefile whose stage target lays out what ships in
+    build/pkg, the call to forgeext's shared workflow, .gitignore, a README, and key.pub when --key names one."""
     if not id_ok(a.id):
         raise Refused('"%s" is not a package id: two or more lowercase labels, like org.example.notify' % a.id)
     src = os.path.join(TEMPLATE, a.runtime)
     if not os.path.isdir(src):
         raise Refused("no template for runtime %s" % a.runtime)
-    if os.path.exists(a.dir):
+    # A directory that holds nothing but a clone's .git is where a new repository's package goes.
+    if os.path.exists(a.dir) and (not os.path.isdir(a.dir) or set(os.listdir(a.dir)) - {".git"}):
         raise Refused("%s is already there" % a.dir)
+    if a.key and not os.path.isfile(a.key):
+        raise Refused("%s is not a file: the public key, NAME.pub from ffx keygen" % a.key)
     name = a.name or a.id.rsplit(".", 1)[-1].replace("-", " ").capitalize()
-    shutil.copytree(src, a.dir)
     bridge = open(os.path.join(SDK, "js", "ffx-bridge.js"), encoding="utf-8").read()
-    for base, _dirs, files in os.walk(a.dir):
+    native = a.runtime == "native"
+    repo = os.path.join(TEMPLATE, "repo")
+    subst = {"@@ID@@": a.id, "@@NAME@@": name, "@@RUNTIME@@": a.runtime, "/* @@FFX_BRIDGE@@ */": bridge,
+             "@@BUILD@@": ("\n" + open(os.path.join(repo, "Makefile.native"), encoding="utf-8").read()) if native else "",
+             "@@STAGE_NEEDS@@": " bin/run" if native else "", "@@CLEAN@@": " bin" if native else "",
+             "@@WITH@@": "    with:\n      apt: gcc-arm-linux-gnueabihf\n" if native else "",
+             "@@IGNORE@@": "bin/\n" if native else ""}
+
+    def put(rel, text):
+        for k, v in subst.items():
+            text = text.replace(k, v)
+        out = os.path.join(a.dir, rel)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return out
+
+    os.makedirs(a.dir, exist_ok=True)
+    for base, _dirs, files in os.walk(src):
         for fn in files:
-            p = os.path.join(base, fn)
+            full = os.path.join(base, fn)
+            rel = os.path.relpath(full, src)
             try:
-                text = open(p, encoding="utf-8").read()
+                text = open(full, encoding="utf-8").read()
             except UnicodeDecodeError:
+                os.makedirs(os.path.dirname(os.path.join(a.dir, rel)), exist_ok=True)
+                shutil.copyfile(full, os.path.join(a.dir, rel))
                 continue
-            text = text.replace("@@ID@@", a.id).replace("@@NAME@@", name).replace("/* @@FFX_BRIDGE@@ */", bridge)
-            open(p, "w", encoding="utf-8", newline="\n").write(text)
+            out = put(rel, text)
+            if os.stat(full).st_mode & 0o111:
+                os.chmod(out, 0o755)
     kit = {"python": ("python/ffx.py", "lib/ffx.py"), "shell": ("sh/ffx.sh", "lib/ffx.sh"), "native": ("c/ffx.h", "src/ffx.h")}
     if a.runtime in kit:
         src_rel, dst_rel = kit[a.runtime]
         os.makedirs(os.path.join(a.dir, os.path.dirname(dst_rel)), exist_ok=True)
         shutil.copyfile(os.path.join(SDK, src_rel), os.path.join(a.dir, dst_rel))
-    print("%s: a %s package, %s. Next: ffx lint %s" % (a.dir, a.runtime, a.id, a.dir))
+    for tpl, rel in (("Makefile", "Makefile"), ("package.yml", os.path.join(".github", "workflows", "package.yml")),
+                     ("gitignore", ".gitignore"), ("README.md", "README.md")):
+        put(rel, open(os.path.join(repo, tpl), encoding="utf-8").read())
+    if a.key:
+        shutil.copyfile(a.key, os.path.join(a.dir, "key.pub"))
+    print("%s: a %s package, %s, and its repository's files." % (a.dir, a.runtime, a.id))
+    print("Next: make -C %s lint%s" % (a.dir, " (it builds bin/run first)" if native else ""))
+    if not a.key:
+        print("No key.pub yet: ffx keygen NAME, then copy NAME.pub to %s. NAME.priv's text is the "
+              "EXTENSION_SIGNING_KEY secret that signs a release." % os.path.join(a.dir, "key.pub"))
     return 0
 
 
@@ -1359,6 +1402,7 @@ def main(argv=None):
     p.add_argument("--id", required=True)
     p.add_argument("--runtime", required=True, choices=("ui", "python", "shell", "native", "data"))
     p.add_argument("--name")
+    p.add_argument("--key", help="the public key that signs the package (NAME.pub from ffx keygen), kept as key.pub")
     p.set_defaults(fn=cmd_new)
     p = sub.add_parser("lint", help="judge a package as the machine does")
     p.add_argument("dir")

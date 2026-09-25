@@ -1,0 +1,10 @@
+CROSS  ?= arm-linux-gnueabihf-
+CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
+
+# The service for the machine: one ARMv7 hard-float binary, static, so
+# nothing ties it to the image's own libraries (Debian and Ubuntu: apt
+# install gcc-arm-linux-gnueabihf).
+bin/run: $(wildcard src/*.c src/*.h)
+	@mkdir -p bin
+	$(CROSS)gcc -static $(CFLAGS) -I src -o $@ $(filter %.c,$^)
+	$(CROSS)strip $@
