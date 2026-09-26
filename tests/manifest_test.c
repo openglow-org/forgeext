@@ -128,6 +128,13 @@ int main(void)
           "a UI package with a destination -> %s", err);
     CHECK(parses(BASE_HEAD "\"runtime\":\"ui\",\"capabilities\":[\"ui\",\"camera.lid\",\"motion.jog\"]}"),
           "a UI package with what its page uses: %s", err);
+    /* A page kept running off its tab is a page first. */
+    CHECK(parses(BASE_HEAD "\"runtime\":\"ui\",\"capabilities\":[\"ui\",\"ui.background\"]}"),
+          "a page kept running: %s", err);
+    CHECK(parses(BASE_HEAD SERVICE "\"capabilities\":[\"ui.background\",\"ui\"]}"),
+          "a service whose page is kept running: %s", err);
+    CHECK(refused_with(BASE_HEAD SERVICE "\"capabilities\":[\"ui.background\"]}", "which takes ui: ask for it too"),
+          "ui.background with no page -> %s", err);
 
     CHECK(refused_with(BASE_HEAD SERVICE "\"capabilities\":[],\"modes\":[]}", "grbl, cloud, or both"), "empty modes -> %s", err);
     CHECK(refused_with(BASE_HEAD SERVICE "\"capabilities\":[],\"modes\":[\"grbl\",\"grbl\"]}", "each once"), "grbl twice -> %s", err);

@@ -272,6 +272,36 @@ def mcodes(t):
         check(t.run("remove", id_).get("ok") is True, "%s goes" % id_)
 
 
+def background_page(t):
+    """A page kept running while the panel shows another tab is the operator's to grant, and only a page's."""
+    page = {"ui/index.html": ("<p>a page</p>\n", 0o644)}
+    r = t.run("inspect", t.pack(t.tree(manifest("org.example.bg0", caps=["ui.background"]), RUN), "owner"))
+    check(r.get("ok") is False and "which takes ui: ask for it too" in (r.get("error") or ""),
+          "ui.background with no page -> %s" % r.get("error"))
+    a = t.pack(t.tree(manifest("org.example.bg", runtime="ui", caps=["ui", "ui.background"]), page), "owner")
+    r = t.run("inspect", a)
+    check(r.get("ok") is True and r.get("needs_grant") == ["ui.background"], "inspect names the grant: %s" % r)
+    r = t.run("install", a, "--consent-unverified")
+    check(r.get("ok") is False and "only the operator grants: ui.background" in (r.get("error") or ""),
+          "no grant -> %s" % r.get("error"))
+    r = t.run("install", a, "--consent-unverified", "--grant", "ui.background")
+    check(r.get("ok") is True, "installed with the grant: %s" % r.get("error"))
+    b = t.pack(t.tree(manifest("org.example.fg", runtime="ui", caps=["ui"]), page), "owner")
+    r = t.run("install", b, "--consent-unverified", "--grant", "ui.background")
+    check(r.get("ok") is False and "does not ask for" in (r.get("error") or ""),
+          "a grant for a page that does not ask -> %s" % r.get("error"))
+    check(t.run("install", b, "--consent-unverified").get("ok") is True, "a page of its own installs with no grant")
+    pk = {x["id"]: x for x in t.run("list").get("packages", [])}
+    check("ui.background" in (pk.get("org.example.bg") or {}).get("effective", [])
+          and (pk.get("org.example.bg") or {}).get("grants") == ["ui.background"],
+          "granted, it holds it: %s" % pk.get("org.example.bg"))
+    check("ui.background" not in (pk.get("org.example.fg") or {}).get("effective", ["ui.background"])
+          and "ui" in (pk.get("org.example.fg") or {}).get("effective", []),
+          "not asked for, it does not: %s" % pk.get("org.example.fg"))
+    for id_ in ("org.example.bg", "org.example.fg"):
+        check(t.run("remove", id_).get("ok") is True, "%s goes" % id_)
+
+
 def the_index(t):
     """The signed index: verified only under the OpenGlow extension key, held to its form, never older than the
     one kept, binding an id to an author key the owner never added - for that id and no other - and judged
@@ -861,6 +891,9 @@ def run_all(w, top):
 
     print("the M-codes a package answers")
     mcodes(w)
+
+    print("a page kept running off its tab")
+    background_page(w)
 
     print("the signed index")
     the_index(w)

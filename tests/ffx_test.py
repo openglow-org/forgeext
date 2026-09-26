@@ -154,6 +154,9 @@ FIXTURES = [
     ("a setting with an unknown key", with_(settings={"a": {"type": "bool", "default": False, "unit": "mm"}}), {}),
     ("a ui package without its page", with_(runtime="ui", service=None, capabilities=["ui"]), {"__no_page__": ""}),
     ("a page without ui", with_(), {"ui/index.html": "<p>x</p>"}),
+    ("a page kept running", with_(runtime="ui", service=None, capabilities=["ui", "ui.background"]), {}),
+    ("a page kept running with no page", with_(capabilities=["ui.background"]), {}),
+    ("a page kept running with an argument", with_(runtime="ui", service=None, capabilities=["ui", "ui.background:1"]), {}),
     ("an entry point that is not there", with_(service={"exec": "bin/other.py"}), {}),
 ]
 

@@ -390,6 +390,8 @@ static int take_caps(json_t *root, manifest_t *m, char *err, size_t elen)
         if (strncmp(m->caps[i], "mcode:", 6) == 0 && !manifest_has_cap(m, "job_time.run"))
             return fail(err, elen, "capability \"%s\" is answered while a job runs, which takes job_time.run: "
                                    "ask for it too", m->caps[i]);
+    if (manifest_has_cap(m, "ui.background") && !manifest_has_cap(m, "ui"))
+        return fail(err, elen, "capability \"ui.background\" keeps a page running, which takes ui: ask for it too");
     return 0;
 }
 

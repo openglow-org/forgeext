@@ -39,7 +39,7 @@ int main(void)
         "machine.read", "events", "settings.own", "camera.lid", "camera.head", "motion.jog", "motion.job",
         "hold", "job_time.run", "ui", "net.outbound:mqtt.example.org:8883", "net.outbound:192.168.1.20:1883",
         "net.outbound:[2001:db8::1]:443", "net.listen:8123", "storage:16", "storage:256", "mcode:160", "mcode:179",
-        "wizard",
+        "wizard", "ui.background",
     };
     for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++)
         CHECK(ok(good[i]), "%s refused: %s", good[i], why);
@@ -63,9 +63,12 @@ int main(void)
     int needs = 0;
     for (size_t i = 0; i < caps_count(); i++)
         needs += caps_at(i)->explicit_grant;
-    CHECK(needs == 4, "%d capabilities need the operator's grant, expected 4", needs);
+    CHECK(needs == 5, "%d capabilities need the operator's grant, expected 5", needs);
     CHECK(caps_needs_grant("hold") && caps_needs_grant("job_time.run") && caps_needs_grant("motion.job")
-          && caps_needs_grant("motion.offsets"), "one of the four does not need a grant");
+          && caps_needs_grant("motion.offsets") && caps_needs_grant("ui.background"),
+          "one of the five does not need a grant");
+    CHECK(!caps_needs_grant("ui"), "a page of its own needs a grant");
+    CHECK(refused_with("ui.background:1", "takes no argument"), "ui.background:1 -> %s", why);
     CHECK(!caps_needs_grant("machine.read") && !caps_needs_grant("net.outbound:a.example:1")
           && !caps_needs_grant("nonsense"), "a plain capability needs a grant");
 
