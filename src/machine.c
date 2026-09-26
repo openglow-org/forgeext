@@ -180,8 +180,11 @@ int machine_get_blob(const machine_cfg_t *cfg, const char *path, unsigned char *
             goto done;
     }
     char req[300];
-    int rlen = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n",
-                        path, cfg->host);
+    /* The host's own client header: a camera asked for by the host is a
+     * local viewer's (forgectrl's auth_local_viewer()), which only this
+     * machine's loopback carries and no package reaches. */
+    int rlen = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nX-ForgeFIRM-Client: extension-host\r\n"
+                        "Connection: close\r\n\r\n", path, cfg->host);
     if (rlen <= 0 || (size_t)rlen >= sizeof(req) || wait_fd(fd, POLLOUT, deadline) != 0
         || send(fd, req, (size_t)rlen, MSG_NOSIGNAL) != rlen)
         goto done;
@@ -241,6 +244,11 @@ void machine_host_token(char *out, size_t olen)
 
 int machine_post(const machine_cfg_t *cfg, const char *path, char *out, size_t olen)
 {
+    return machine_request(cfg, "POST", path, out, olen);
+}
+
+int machine_request(const machine_cfg_t *cfg, const char *method, const char *path, char *out, size_t olen)
+{
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons((uint16_t)cfg->port) };
     struct timespec ts;
     char token[64];
@@ -269,8 +277,8 @@ int machine_post(const machine_cfg_t *cfg, const char *path, char *out, size_t o
     /* The credential goes in a header and never in the path: a path
      * ends up in a log. */
     int rlen = snprintf(req, sizeof(req),
-                        "POST %s HTTP/1.0\r\nHost: %s\r\nX-ForgeFIRM-Token: %s\r\n"
-                        "Content-Length: 0\r\nConnection: close\r\n\r\n", path, cfg->host, token);
+                        "%s %s HTTP/1.0\r\nHost: %s\r\nX-ForgeFIRM-Token: %s\r\n"
+                        "Content-Length: 0\r\nConnection: close\r\n\r\n", method, path, cfg->host, token);
     if (rlen <= 0 || (size_t)rlen >= sizeof(req) || wait_fd(fd, POLLOUT, deadline) != 0
         || send(fd, req, (size_t)rlen, MSG_NOSIGNAL) != rlen)
         goto done;

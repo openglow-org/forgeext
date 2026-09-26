@@ -375,6 +375,8 @@ int main(int argc, char **argv)
                 rc.run_dir = val;
             } else if (strcmp(opt, "--holds-dir") == 0) {
                 rc.holds_dir = val;
+            } else if (strcmp(opt, "--senders-dir") == 0) {
+                rc.senders_dir = val;
             } else if (strcmp(opt, "--api-dir") == 0) {
                 rc.api_dir = val;
             } else if (strcmp(opt, "--call-dir") == 0) {

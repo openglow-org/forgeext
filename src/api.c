@@ -82,7 +82,7 @@ static int hold_from(const httpreq_t *req, api_hold_t *out, const char **why)
     const char *key;
     json_t *v;
     int have = 0;
-    api_hold_t h = { 0, "" };
+    api_hold_t h = { 0, "", 0 };
     json_object_foreach(j, key, v) {
         if (strcmp(key, "raised") == 0 && json_is_boolean(v)) {
             h.raised = json_is_true(v);
@@ -327,8 +327,14 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
             return refuse(body, blen, 403, "this package does not hold motion.jog");
         if (!world || !world->motion)
             return refuse(body, blen, 502, "the host cannot reach the machine's motion");
-        if (cancel)
-            return world->motion(world->motion_ctx, "/motion/cancel", body, blen);
+        char path[200];
+        /* The package's id rides along: an extension that keeps the
+         * Grbl sender out holds the machine, and its own jogs are its own.
+         * forgectrl takes it from the host's credential alone. */
+        if (cancel) {
+            snprintf(path, sizeof(path), "/motion/cancel?id=%s", who->id);
+            return world->motion(world->motion_ctx, path, body, blen);
+        }
         if (!req->json_body)
             return refuse(body, blen, 415, "POST /v0/motion/jog takes application/json");
 
@@ -370,8 +376,8 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
         if (axis[0] == 0 && axis[1] == 0 && axis[2] == 0)
             return refuse(body, blen, 400, "a jog moves at least one axis");
 
-        char path[200];
-        int n = snprintf(path, sizeof(path), "/motion/jog?x=%.3f&y=%.3f&z=%.3f", axis[0], axis[1], axis[2]);
+        int n = snprintf(path, sizeof(path), "/motion/jog?x=%.3f&y=%.3f&z=%.3f&id=%s", axis[0], axis[1], axis[2],
+                         who->id);
         if (feed != 0 && n > 0 && (size_t)n < sizeof(path))
             snprintf(path + n, sizeof(path) - (size_t)n, "&feed=%.3f", feed);
         return world->motion(world->motion_ctx, path, body, blen);
@@ -432,6 +438,38 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
         }
         return api_events_answer(feed, since, body, blen);
     }
+    if (strcmp(p, "/v0/sender") == 0) {
+        if (!api_may(who, "sender.keep_out"))
+            return refuse(body, blen, 403, "this package may not keep the Grbl sender out: the operator did not grant it");
+        if (!world || !world->sender)
+            return refuse(body, blen, 502, "the host cannot reach the machine's motion");
+        if (req->method == HTTPREQ_GET)
+            return world->sender(world->sender_ctx, who->id, -1, body, blen);
+        if (req->method != HTTPREQ_POST)
+            return refuse(body, blen, 405, "GET or POST /v0/sender");
+        if (!req->json_body)
+            return refuse(body, blen, 415, "POST /v0/sender takes application/json");
+        json_error_t je;
+        json_t *j = json_loadb(req->body, req->body_len, JSON_REJECT_DUPLICATES, &je), *v;
+        const char *key;
+        int out = -1, bad = !json_is_object(j);
+        json_object_foreach(j, key, v) {
+            if (strcmp(key, "out") == 0 && json_is_boolean(v))
+                out = json_is_true(v);
+            else
+                bad = 1;
+        }
+        json_decref(j);
+        if (bad || out < 0)
+            return refuse(body, blen, 400, "the body is {\"out\": true} or {\"out\": false} and nothing else");
+        int st = world->sender(world->sender_ctx, who->id, out, body, blen);
+        /* Kept out, the host keeps the claim fresh for forgectrl while the
+         * service runs (senders_turn); let in, whatever the machine said,
+         * it keeps it no more. */
+        if (!out || st == 200)
+            hold->sender_out = out && st == 200;
+        return st;
+    }
     if (strcmp(p, "/v0/hold") == 0) {
         if (!api_may(who, "hold"))
             return refuse(body, blen, 403, "this package has no hold: the operator did not grant it one");
@@ -443,6 +481,7 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
             return refuse(body, blen, 415, "POST /v0/hold takes application/json");
         if (hold_from(req, &h, &why) != 0)
             return refuse(body, blen, 400, why);
+        h.sender_out = hold->sender_out;       /* a hold says nothing about the sender */
         *hold = h;
         return say(body, blen, 200, hold_json(hold));
     }
@@ -613,6 +652,9 @@ static int serve(api_t *a, api_conn_t *c, const httpreq_t *req)
             else
                 fflog(LOG_NOTICE, "%s: it cleared its hold", who.id);
         }
+        if (s->hold.sender_out != hold.sender_out)
+            fflog(LOG_NOTICE, "%s: %s", who.id, hold.sender_out ? "it keeps the Grbl sender out"
+                                                                : "it lets the Grbl sender back in");
         s->hold = hold;
     }
     if (c->fd != fd)
@@ -795,7 +837,8 @@ int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t
               api_settings_fn settings, void *settings_ctx,
               api_camera_fn camera, void *camera_ctx,
               api_motion_fn motion, void *motion_ctx,
-              api_job_fn job, void *job_ctx, char *err, size_t elen)
+              api_job_fn job, void *job_ctx,
+              api_sender_fn sender, void *sender_ctx, char *err, size_t elen)
 {
     memset(a, 0, sizeof(*a));
     pthread_mutex_init(&a->mu, NULL);
@@ -812,6 +855,8 @@ int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t
     a->world.motion_ctx = motion_ctx;
     a->world.job = job;
     a->world.job_ctx = job_ctx;
+    a->world.sender = sender;
+    a->world.sender_ctx = sender_ctx;
     if (strlen(dir) >= sizeof(a->dir) - 72) {
         snprintf(err, elen, "the API directory's path is too long");
         return -1;

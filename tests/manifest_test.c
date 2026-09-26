@@ -135,6 +135,11 @@ int main(void)
           "a service whose page is kept running: %s", err);
     CHECK(refused_with(BASE_HEAD SERVICE "\"capabilities\":[\"ui.background\"]}", "which takes ui: ask for it too"),
           "ui.background with no page -> %s", err);
+    /* Keeping the sender out is a service's: its claim lives while the service does. */
+    CHECK(parses(BASE_HEAD SERVICE "\"capabilities\":[\"sender.keep_out\",\"motion.jog\"]}"),
+          "a service that keeps the sender out: %s", err);
+    CHECK(refused_with(BASE_HEAD "\"runtime\":\"ui\",\"capabilities\":[\"ui\",\"sender.keep_out\"]}",
+                       "belongs to a service"), "a page that keeps the sender out -> %s", err);
 
     CHECK(refused_with(BASE_HEAD SERVICE "\"capabilities\":[],\"modes\":[]}", "grbl, cloud, or both"), "empty modes -> %s", err);
     CHECK(refused_with(BASE_HEAD SERVICE "\"capabilities\":[],\"modes\":[\"grbl\",\"grbl\"]}", "each once"), "grbl twice -> %s", err);

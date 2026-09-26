@@ -88,6 +88,25 @@ static int fake_job(void *ctx, const char *id, const char *program, const char *
     return 200;
 }
 
+/* The sender side, faked: the package and the word the broker carried,
+ * and the machine's answer (sender_status). */
+static int sender_calls, sender_word, sender_status = 200;
+static char sender_id[64];
+
+static int fake_sender(void *ctx, const char *id, int out, char *body_, size_t olen)
+{
+    (void)ctx;
+    sender_calls++;
+    sender_word = out;
+    snprintf(sender_id, sizeof(sender_id), "%s", id);
+    if (sender_status != 200) {
+        snprintf(body_, olen, "{\"error\":\"the machine is not idle\"}");
+        return sender_status;
+    }
+    snprintf(body_, olen, "{\"out\":%s,\"released\":false}", out == 1 ? "true" : "false");
+    return 200;
+}
+
 static int fake_motion(void *ctx, const char *path, char *out, size_t olen)
 {
     (void)ctx;
@@ -141,11 +160,12 @@ int main(void)
     world.camera = fake_camera;
     world.motion = fake_motion;
     world.job = fake_job;
+    world.sender = fake_sender;
     world.feed = &feed;
     api_who_t reader = { .id = "org.example.reader", .version = "1.2.0", .uid = 800, .caps = { "machine.read", "events" }, .ncaps = 2 };
     api_who_t holder = { .id = "org.example.badge", .version = "1.0.0", .uid = 801, .caps = { "hold" }, .ncaps = 1 };
     api_who_t nobody = { .id = "org.example.plain", .version = "1.0.0", .uid = 802, .ncaps = 0 };
-    api_hold_t hold = { 0, "" };
+    api_hold_t hold = { 0, "", 0 };
     int rc;
 
     /* Who the host takes the caller for. */
@@ -439,6 +459,8 @@ int main(void)
         CHECK(rc == 200 && motion_calls == 1 && strstr(motion_path, "x=10.000")
               && strstr(motion_path, "y=-5.000") && strstr(motion_path, "feed=2000.000"),
               "a jog inside the bounds: %d %s", rc, motion_path);
+        CHECK(strstr(motion_path, "&id=org.example.jogger") != NULL,
+              "it carries the package's id, the host's word: %s", motion_path);
 
         /* The bounds, each one at its edge and just past it. */
         static const struct { const char *json, *name; int ok; } jogs[] = {
@@ -476,7 +498,7 @@ int main(void)
 
         CHECK(call(&jogger, &hold, "GET /v0/motion/jog HTTP/1.1\r\n\r\n") == 405, "a jog is a POST");
         rc = call(&jogger, &hold, "POST /v0/motion/cancel HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
-        CHECK(rc == 200 && strstr(motion_path, "/motion/cancel"), "a cancel: %d %s", rc, motion_path);
+        CHECK(rc == 200 && !strcmp(motion_path, "/motion/cancel?id=org.example.jogger"), "a cancel: %d %s", rc, motion_path);
         rc = call(&reader, &hold, "POST /v0/motion/cancel HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
         CHECK(rc == 403, "a cancel without the capability: %d", rc);
         world.motion = NULL;
@@ -535,6 +557,56 @@ int main(void)
         CHECK(rc == 502, "with no way to the machine's job route: %d", rc);
         world.job = fake_job;
         #undef JOB
+    }
+
+    /* Keeping the Grbl sender out: the operator's grant, a closed body, the
+     * package's own name, and the word the host keeps. */
+    api_who_t keeper = { .id = "org.openglow.alignment", .version = "0.2.0", .uid = 807,
+                         .caps = { "sender.keep_out", "motion.jog" }, .ncaps = 2 };
+    {
+        char text[400];
+        api_hold_t kh = { 0, "", 0 };
+        #define SENDER(who_, h_, json_) (snprintf(text, sizeof(text), \
+            "POST /v0/sender HTTP/1.1\r\nContent-Type: application/json\r\n" \
+            "Content-Length: %zu\r\n\r\n%s", strlen(json_), json_), call(who_, h_, text))
+        sender_calls = 0;
+        rc = SENDER(&jogger, &kh, "{\"out\": true}");
+        CHECK(rc == 403 && sender_calls == 0 && strstr(error_words(), "did not grant"),
+              "without the grant: %d, the machine asked %d times", rc, sender_calls);
+        rc = SENDER(&keeper, &kh, "{\"out\": true}");
+        CHECK(rc == 200 && sender_calls == 1 && sender_word == 1 && !strcmp(sender_id, "org.openglow.alignment") &&
+              kh.sender_out == 1, "kept out, in the package's name, and the host keeps the word: %d", rc);
+        rc = call(&keeper, &kh, "GET /v0/sender HTTP/1.1\r\n\r\n");
+        CHECK(rc == 200 && sender_word == -1 && kh.sender_out == 1, "how it stands: a GET changes nothing: %d", rc);
+        static const char *const bad[] = { "{}", "{\"out\": 1}", "{\"out\": \"yes\"}", "{\"out\": true, \"x\": 1}",
+                                           "[true]", "{\"out\": true, \"out\": false}" };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            int before = sender_calls;
+            rc = SENDER(&keeper, &kh, bad[i]);
+            CHECK(rc == 400 && sender_calls == before && kh.sender_out == 1, "%s: %d", bad[i], rc);
+        }
+        snprintf(text, sizeof(text), "POST /v0/sender HTTP/1.1\r\nContent-Length: 13\r\n\r\n{\"out\": true}");
+        CHECK(call(&keeper, &kh, text) == 415, "not JSON");
+        api_who_t keeper_hold = keeper;
+        snprintf(keeper_hold.caps[2], sizeof(keeper_hold.caps[2]), "hold");
+        keeper_hold.ncaps = 3;
+        CHECK(post_hold(&keeper_hold, &kh, "{\"raised\": true, \"reason\": \"aligning\"}", "application/json") == 200 &&
+              kh.raised == 1 && kh.sender_out == 1, "a hold of its own leaves the sender's word as it was");
+        kh.raised = 0;
+        rc = SENDER(&keeper, &kh, "{\"out\": false}");
+        CHECK(rc == 200 && sender_word == 0 && kh.sender_out == 0, "let back in, the word goes: %d", rc);
+        sender_status = 409;
+        rc = SENDER(&keeper, &kh, "{\"out\": true}");
+        CHECK(rc == 409 && kh.sender_out == 0 && strstr(error_words(), "not idle"),
+              "refused by the machine, in its words, and the host keeps no word: %d", rc);
+        kh.sender_out = 1;
+        rc = SENDER(&keeper, &kh, "{\"out\": false}");
+        CHECK(rc == 409 && kh.sender_out == 0, "asked back in, the word goes whatever the machine said: %d", rc);
+        sender_status = 200;
+        world.sender = NULL;
+        CHECK(SENDER(&keeper, &kh, "{\"out\": true}") == 502, "with no way to the machine");
+        world.sender = fake_sender;
+        #undef SENDER
     }
 
     /* Everything else. */

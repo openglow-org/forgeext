@@ -115,6 +115,7 @@ typedef struct {
 typedef struct {
     int raised;
     char reason[HOLDKEEP_REASON_MAX];
+    int sender_out;                 /* the machine keeps the Grbl sender out for it (/v0/sender) */
 } api_hold_t;
 
 /* One GET of the machine: the body into out, 0 on a 200. */
@@ -128,6 +129,11 @@ typedef int (*api_motion_fn)(void *ctx, const char *path, char *out, size_t olen
  * handed to the machine's job route. Returns the status. */
 typedef int (*api_job_fn)(void *ctx, const char *id, const char *program, const char *fields,
                           char *out, size_t olen);
+
+/* A package's claim on the Grbl sender: out 1 keeps it out, 0 lets it
+ * back in, -1 asks how the claim stands. The answer's JSON into out;
+ * returns the status. */
+typedef int (*api_sender_fn)(void *ctx, const char *id, int out, char *out_body, size_t olen);
 
 /* A package's own settings (settings.h). patch is NULL to read them, or
  * the request's body to apply. The whole answer, JSON either way, into
@@ -157,6 +163,8 @@ typedef struct {
     void *motion_ctx;
     api_job_fn job;
     void *job_ctx;
+    api_sender_fn sender;
+    void *sender_ctx;
     evfeed_t *feed;
 } api_world_t;
 
@@ -252,7 +260,8 @@ int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t
               api_settings_fn settings, void *settings_ctx,
               api_camera_fn camera, void *camera_ctx,
               api_motion_fn motion, void *motion_ctx,
-              api_job_fn job, void *job_ctx, char *err, size_t elen);
+              api_job_fn job, void *job_ctx,
+              api_sender_fn sender, void *sender_ctx, char *err, size_t elen);
 void api_stop(api_t *a);
 
 /* A service is about to start: its socket exists before it does, and its

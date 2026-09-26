@@ -33,6 +33,8 @@ typedef struct {
     const char *cg_parent;
     const char *run_dir;                        /* status.json */
     const char *holds_dir;                      /* the hold files forgectrl's cooling engine reads */
+    const char *senders_dir;                    /* the claims on the Grbl sender forgectrl reads */
+#define RUN_SENDERS_DIR_DEFAULT "/run/forgefirm/sender-out"
     const char *api_dir;                        /* one API socket per running service */
     const char *call_dir;                       /* one call socket per running service that has a page */
     int landlock_fs_only;                       /* a kernel older than landlock's TCP rules (tests on a host) */

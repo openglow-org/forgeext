@@ -192,6 +192,19 @@ def hold_state():
     return call("GET", "/v0/hold")
 
 
+def sender_out(out):
+    """sender.keep_out (granted): True disconnects the Grbl sender and keeps every sender from the network
+    out, only on an idle machine; False lets it back in. {out, released}; a refusal is an ApiError in the
+    machine's words."""
+    return call("POST", "/v0/sender", {"out": bool(out)})
+
+
+def sender_state():
+    """sender.keep_out (granted): {out, released}. released: the operator let the sender back in on this
+    package's claim, which it then ends with sender_out(False)."""
+    return call("GET", "/v0/sender")
+
+
 def events(since=None, wait=None):
     """events: {next, dropped, connected, events} after `since`, waiting up to `wait` seconds for one."""
     body = {}

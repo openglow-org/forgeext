@@ -157,6 +157,8 @@ FIXTURES = [
     ("a page kept running", with_(runtime="ui", service=None, capabilities=["ui", "ui.background"]), {}),
     ("a page kept running with no page", with_(capabilities=["ui.background"]), {}),
     ("a page kept running with an argument", with_(runtime="ui", service=None, capabilities=["ui", "ui.background:1"]), {}),
+    ("a service that keeps the sender out", with_(capabilities=["sender.keep_out", "motion.jog"]), {}),
+    ("a page that keeps the sender out", with_(runtime="ui", service=None, capabilities=["ui", "sender.keep_out"]), {}),
     ("an entry point that is not there", with_(service={"exec": "bin/other.py"}), {}),
 ]
 

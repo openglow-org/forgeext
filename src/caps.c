@@ -28,6 +28,7 @@ static const cap_def_t defs[] = {
     { "job_time.run",   0, 1, 1, "keep running while a job is armed" },
     { "ui",             0, 0, 1, "show a card of its own on the control panel's Extensions tab" },
     { "ui.background",  0, 1, 1, "keep its page running while the control panel shows another tab" },
+    { "sender.keep_out", 0, 1, 1, "disconnect the Grbl sender while it uses the machine (only when the machine is idle)" },
     { "wizard",         0, 0, 1, "add a check of its own to the Setup page" },
     { "net.outbound",   1, 0, 1, "connect to" },
     { "net.outbound.operator", 0, 0, 1, "connect to the destinations the operator names for it" },

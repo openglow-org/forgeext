@@ -15,6 +15,9 @@
  *   ffx.machine.status() / .cool() / .mode()               (machine.read)
  *   ffx.settings.get() / .set({key: value})               (settings.own)
  *   ffx.camera.frame({camera, resolution, quality, lamp})  -> a Blob (JPEG)
+ *   ffx.camera.stream({camera, fps, lamp}, onFrame, onEnd) the camera's video: onFrame(Blob) about fps times
+ *                                                          a second (1 to 15, 5 by default) until
+ *                                                          ffx.camera.stop(), or onEnd(words)
  *   ffx.motion.jog({x, y, z, feed}) / .cancel()           (motion.jog)
  *   ffx.motion.job({program, lit_within_s, timeout_s})    (motion.job)
  *   ffx.motion.jobState() / .jobAbort()                   (motion.job)
@@ -29,9 +32,18 @@ var ffx = (function () {
   var n = 0,
     waiting = {};
 
+  var streamFrame = null,
+    streamEnd = null;
+
   window.addEventListener('message', function (ev) {
     var m = ev.data;
-    if (ev.source !== window.parent || !m || m.forgefirm !== 1 || !waiting[m.id]) return;
+    if (ev.source !== window.parent || !m || m.forgefirm !== 1) return;
+    if (m.stream === 'camera') {
+      if (m.frame && streamFrame) streamFrame(m.frame);
+      if (m.end && streamEnd) streamEnd(m.error || 'the camera stream ended');
+      return;
+    }
+    if (!waiting[m.id]) return;
     var w = waiting[m.id];
     delete waiting[m.id];
     clearTimeout(w.timer);
@@ -71,7 +83,19 @@ var ffx = (function () {
       set: function (patch) { return call('settings.set', patch); }
     },
     camera: {
-      frame: function (opts) { return call('camera.frame', opts || { camera: 'lid' }, 60000); }
+      frame: function (opts) { return call('camera.frame', opts || { camera: 'lid' }, 60000); },
+      stream: function (opts, onFrame, onEnd) {
+        var o = {};
+        for (var k in opts || {}) o[k] = opts[k];
+        o.on = true;
+        streamFrame = onFrame;
+        streamEnd = onEnd || null;
+        return call('camera.stream', o, 60000);
+      },
+      stop: function () {
+        streamFrame = streamEnd = null;
+        return call('camera.stream', { on: false });
+      }
     },
     motion: {
       jog: function (move) { return call('motion.jog', move, 120000); },

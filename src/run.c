@@ -54,6 +54,7 @@ typedef struct {
     char last_status[8192];
     char unreachable[300];                      /* the last word on a root no account can walk to, said once */
     holdkeep_t holds;
+    holdkeep_t senders;             /* the claims on the Grbl sender, kept as holds are */
     double quota_at;                            /* when the data directories were last measured */
     evfeed_t feed;
     api_t api;
@@ -101,6 +102,7 @@ void run_cfg_defaults(run_cfg_t *cfg)
     cfg->cg_parent = CG_PARENT_DEFAULT;
     cfg->run_dir = RUN_DIR_DEFAULT;
     cfg->holds_dir = HOLDKEEP_DIR_DEFAULT;
+    cfg->senders_dir = RUN_SENDERS_DIR_DEFAULT;
     cfg->api_dir = API_DIR_DEFAULT;
     cfg->call_dir = CALL_DIR_DEFAULT;
 }
@@ -517,7 +519,7 @@ static int job_call(void *ctx, const char *id, const char *program, const char *
                             json_pack("{s:s}", "error", "that program is not a file of this package's data"));
         fflog(LOG_NOTICE, "%s: it asked to run %s", id, program);
         char with_name[240];
-        snprintf(with_name, sizeof(with_name), "%s&name=%.32s", fields ? fields : "", id);
+        snprintf(with_name, sizeof(with_name), "%s&name=%.63s", fields ? fields : "", id);
         rc = machine_post_program(&cfg->machine, "/job", prog_fd, with_name, answer, sizeof(answer));
         close(prog_fd);
     }
@@ -532,6 +534,56 @@ static int job_call(void *ctx, const char *id, const char *program, const char *
         if ((unsigned char)*q < 0x20 || (unsigned char)*q == 0x7f)
             *q = ' ';
     return say_json(out, olen, status, json_pack("{s:s}", "error", words));
+}
+
+/* A package's claim on the Grbl sender, carried to forgectrl with the
+ * host's own credential and in the package's name; what the machine says
+ * is what the package is told. */
+static int sender_call(void *ctx, const char *id, int out, char *body, size_t olen)
+{
+    const run_cfg_t *cfg = ctx;
+    char path[200], answer[1024] = "";
+    if (out < 0)
+        snprintf(path, sizeof(path), "/motion/sender?id=%.63s", id);
+    else
+        snprintf(path, sizeof(path), "/motion/sender?id=%.63s&out=%d", id, out ? 1 : 0);
+    int rc = machine_request(&cfg->machine, out < 0 ? "GET" : "POST", path, answer, sizeof(answer));
+    if (rc == 0) {
+        snprintf(body, olen, "%s", answer[0] ? answer : "{}");
+        return 200;
+    }
+    int status = rc < -1 ? -rc : 502;
+    char words[240];
+    snprintf(words, sizeof(words), "%s", answer[0] ? answer : "the machine did not answer");
+    for (char *q = words; *q; q++)
+        if ((unsigned char)*q < 0x20 || (unsigned char)*q == 0x7f)
+            *q = ' ';
+    return say_json(body, olen, status, json_pack("{s:s}", "error", words));
+}
+
+/* The claims the machine granted, kept fresh for forgectrl while each
+ * service runs and still keeps the sender out: one that stops, is turned
+ * off, or whose host goes lets it go stale, and forgectrl lets the sender
+ * back in. The files are the holds' own form (raised is the claim). */
+static void senders_turn(run_t *r, const super_t *sv, const super_inputs_t *in)
+{
+    static hold_entry_t e[HOLDKEEP_MAX];
+    int n = 0;
+    for (int i = 0; in->enabled && i < sv->n && n < HOLDKEEP_MAX; i++) {
+        const svc_t *s = &sv->svc[i];
+        if (!s->present || !s->pkg_enabled || s->state != SVC_RUNNING)
+            continue;
+        api_hold_t said;
+        api_hold_said(&r->api, s->id, &said);
+        if (!said.sender_out)
+            continue;
+        memset(&e[n], 0, sizeof(e[n]));
+        snprintf(e[n].id, sizeof(e[n].id), "%s", s->id);
+        e[n].raised = 1;
+        snprintf(e[n].reason, sizeof(e[n].reason), "keeps the Grbl sender out");
+        n++;
+    }
+    holdkeep_set(&r->senders, e, n);
 }
 
 /* ---- the cameras --------------------------------------------------------------- */
@@ -849,18 +901,35 @@ int run_daemon(const run_cfg_t *cfg)
         close(lfd);
         return 1;
     }
-    if (evfeed_start(&r.feed, &cfg->machine, err, sizeof(err)) != 0) {
+    /* The claims sit beside the holds: a host whose holds were put
+     * elsewhere (a test's) puts its claims there too. */
+    char senders_dir[300];
+    snprintf(senders_dir, sizeof(senders_dir), "%s", cfg->senders_dir);
+    if (!strcmp(cfg->senders_dir, RUN_SENDERS_DIR_DEFAULT) && strcmp(cfg->holds_dir, HOLDKEEP_DIR_DEFAULT)) {
+        const char *slash = strrchr(cfg->holds_dir, '/');
+        if (slash && slash > cfg->holds_dir)
+            snprintf(senders_dir, sizeof(senders_dir), "%.*s/sender-out", (int)(slash - cfg->holds_dir), cfg->holds_dir);
+    }
+    if (holdkeep_start(&r.senders, senders_dir, HOLDKEEP_MAIN_S, err, sizeof(err)) != 0) {
         fflog(LOG_ERR, "not starting: %s", err);
         holdkeep_stop(&r.holds);
         close(lfd);
         return 1;
     }
+    if (evfeed_start(&r.feed, &cfg->machine, err, sizeof(err)) != 0) {
+        fflog(LOG_ERR, "not starting: %s", err);
+        holdkeep_stop(&r.holds);
+        holdkeep_stop(&r.senders);
+        close(lfd);
+        return 1;
+    }
     if (api_start(&r.api, cfg->api_dir, &cfg->machine, &r.feed, settings_call, (void *)cfg,
                   camera_call, (void *)cfg, motion_call, (void *)cfg,
-                  job_call, (void *)cfg, err, sizeof(err)) != 0) {
+                  job_call, (void *)cfg, sender_call, (void *)cfg, err, sizeof(err)) != 0) {
         fflog(LOG_ERR, "not starting: %s", err);
         evfeed_stop(&r.feed);
         holdkeep_stop(&r.holds);
+        holdkeep_stop(&r.senders);
         close(lfd);
         return 1;
     }
@@ -948,6 +1017,7 @@ int run_daemon(const run_cfg_t *cfg)
         r.enabled = mc.enabled;
         quota_turn(&r, &sv, mono());
         holds_turn(&r, &sv, &in);
+        senders_turn(&r, &sv, &in);
         /* The machine's stream is held while somebody reads it and let go
          * when nobody does: forgectrl samples its own state only while a
          * stream is open. */
@@ -963,6 +1033,7 @@ int run_daemon(const run_cfg_t *cfg)
     }
     super_stop_all(&sv, "the extension host is stopping");
     holdkeep_stop(&r.holds);
+    holdkeep_stop(&r.senders);
     api_stop(&r.api);
     evfeed_stop(&r.feed);
     machine_t off;
