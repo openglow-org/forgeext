@@ -63,6 +63,10 @@ int main(void)
     snprintf(a->grants[a->ngrants++], CAP_MAX_LEN, "motion.job");
     snprintf(a->dests[a->ndests++], CAP_MAX_LEN, "plug.lan:80");
     snprintf(a->dests[a->ndests++], CAP_MAX_LEN, "[2001:db8::7]:1883");
+    CHECK(state_new_stamp(a->stamp) == 0 && strlen(a->stamp) == STATE_STAMP_LEN
+          && strspn(a->stamp, "0123456789abcdef") == STATE_STAMP_LEN, "a stamp: \"%s\"", a->stamp);
+    char other[STATE_STAMP_LEN + 1];
+    CHECK(state_new_stamp(other) == 0 && strcmp(other, a->stamp) != 0, "two stamps alike: %s", other);
     state_pkg_t *b = state_add(&s, "org.example.theme");
     snprintf(b->version, sizeof(b->version), "0.1.0");
     b->tier = TIER_UNVERIFIED;
@@ -80,6 +84,7 @@ int main(void)
               "the service package's fields");
         CHECK(la->ndests == 2 && strcmp(la->dests[0], "plug.lan:80") == 0 && strcmp(la->dests[1], "[2001:db8::7]:1883") == 0,
               "the operator's destinations, in order: %d", la->ndests);
+        CHECK(strcmp(la->stamp, a->stamp) == 0 && !lb->stamp[0], "the stamps came back: \"%s\" \"%s\"", la->stamp, lb->stamp);
         CHECK(lb->tier == TIER_UNVERIFIED && !lb->key_id[0] && lb->slot == -1 && !lb->enabled && lb->quarantined
               && lb->ngrants == 0 && lb->ndests == 0, "the data package's fields");
     }
@@ -127,6 +132,12 @@ int main(void)
              "' > %s/state.json", root);
     CHECK(system(cmd) == 0 && state_load(root, &s, err, sizeof(err)) == 0 && s.n == 1 && s.pkgs[0].ndests == 0,
           "a state with no destinations key: %s", err);
+    /* ... and one written before installs were stamped has no stamp. */
+    CHECK(s.n == 1 && !s.pkgs[0].stamp[0], "a state with no stamp key: \"%s\"", s.n ? s.pkgs[0].stamp : "");
+    CHECK(refused_with(PKG(GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":0,\"grants\":[],\"stamp\":\"0123\""),
+                       "does not read"), "a stamp cut short -> %s", err);
+    CHECK(refused_with(PKG(GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":0,\"grants\":[],\"stamp\":\"0123456789ABCDEF\""),
+                       "does not read"), "a stamp in capitals -> %s", err);
 
     snprintf(cmd, sizeof(cmd), "rm -rf %s", root);
     if (system(cmd) != 0)

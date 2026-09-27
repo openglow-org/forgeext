@@ -289,7 +289,7 @@ void super_tick(super_t *sv, const super_inputs_t *in, double now)
         if (s->state != SVC_RUNNING)
             continue;
         if (!window && s->conf_started != s->conf_wanted) {
-            stop(sv, s, "started again: its version or its destinations changed");
+            stop(sv, s, "started again: it was installed again, or its destinations changed");
             continue;
         }
         if (!s->healthy && now - s->started >= SUPER_HEALTHY_S) {

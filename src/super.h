@@ -72,8 +72,9 @@ typedef struct {
     pid_t pid;
     int frozen, job_limited, healthy;
     int posture_tries;                  /* turns spent trying to take the open window's posture */
-    /* What it runs with, as a digest: its version and the destinations
-     * the operator named. The sync sets the one wanted; a start records
+    /* What it runs with, as a digest: its install (its version, and the
+     * stamp every install writes anew) and the destinations the operator
+     * named. The sync sets the one wanted; a start records
      * it; a running service whose two differ is stopped and started again
      * outside an armed window, and that is no crash. */
     unsigned long long conf_wanted, conf_started;

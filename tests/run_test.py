@@ -21,7 +21,9 @@ programs to run: the file that is really in its data directory gets as far as
 the machine, and a symbolic link out of the directory and a name with a
 directory in it are refused in words before anything does. A killed service
 comes back. The one that keeps ending is quarantined, and state.json
-remembers it. A fifth package asks for destinations of the operator's: it
+remembers it. A package removed and installed again while the host is not
+looking is started again from the new install, never left running from the
+old one. A fifth package asks for destinations of the operator's: it
 reaches nothing until the operator names the peer, is started again with
 it, reaches it, and loses it again when the operator takes it away. A sixth,
 holding events and no grant, reads the host's ext.shutdown before safe mode
@@ -538,6 +540,24 @@ def main():
         check(logged("ext org.example.crash: about to end"), "its last words are in the log")
         check(not os.path.isdir(CG_PARENT + "/org.example.crash"), "and its group is gone")
 
+        print("removed and installed again inside one turn of the host: started again from the new install")
+        old = svc("org.example.beat")["pid"]
+        os.kill(daemon.pid, signal.SIGSTOP)             # the host sees neither step alone, only where the two end
+        try:
+            r1 = fx("remove", "org.example.beat")
+            r2 = fx("install", os.path.join(top, "org.example.beat.ffx"), "--consent-unverified", "--grant", "hold")
+        finally:
+            os.kill(daemon.pid, signal.SIGCONT)
+        check(r1.get("ok") is True and r2.get("ok") is True, "removed and installed again: %s %s",
+              r1.get("error", ""), r2.get("error", ""))
+        check(wait_for(lambda: logged("org.example.beat: stopping (started again: it was installed again, or its "
+                                      "destinations changed)"), 10),
+              "the host stops the service still running from the install that was removed")
+        check(wait_for(lambda: not os.path.exists("/proc/%d" % old), 10), "and it is gone: pid %d", old)
+        check(wait_for(lambda: svc("org.example.beat").get("state") == "running"
+                       and svc("org.example.beat")["pid"] not in (0, old), 20),
+              "the heartbeat runs again, from the new install")
+
         print("destinations the operator names")
         oid, where = "org.example.opdial", "%s:%d" % (PEER_ADDR, pport)
 
@@ -574,7 +594,7 @@ def main():
         check(wait_for(lambda: since(at, "ext %s: opdial dial ok" % oid), 10), "and it reaches the peer")
         s = svc(oid)
         check(s.get("state") == "running" and s.get("pid") != first
-              and since(at, "%s: stopping (started again: its version or its destinations changed)" % oid),
+              and since(at, "%s: stopping (started again: it was installed again, or its destinations changed)" % oid),
               "a new process, said in the log, and no crash: %s", s)
         at = mark()
         r = fx("dest", oid, "remove", where)

@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -79,6 +80,23 @@ int state_granted(const state_pkg_t *p, const char *cap)
     return 0;
 }
 
+int state_new_stamp(char out[STATE_STAMP_LEN + 1])
+{
+    unsigned char raw[STATE_STAMP_LEN / 2];
+    size_t got = 0;
+    while (got < sizeof(raw)) {
+        ssize_t n = getrandom(raw + got, sizeof(raw) - got, 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        got += (size_t)n;
+    }
+    for (size_t i = 0; i < sizeof(raw); i++)
+        snprintf(out + 2 * i, 3, "%02x", raw[i]);
+    return 0;
+}
+
 static const char *text_of(json_t *obj, const char *key)
 {
     const char *s = json_string_value(json_object_get(obj, key));
@@ -141,6 +159,11 @@ static int pkg_from_json(const char *id, json_t *j, state_pkg_t *p)
             return -1;
         snprintf(p->dests[p->ndests++], sizeof(p->dests[0]), "%s", d);
     }
+    /* Absent in a state written before installs were stamped. */
+    const char *stamp = text_of(j, "stamp");
+    if (stamp[0] && (strlen(stamp) != STATE_STAMP_LEN || strspn(stamp, "0123456789abcdef") != STATE_STAMP_LEN))
+        return -1;
+    snprintf(p->stamp, sizeof(p->stamp), "%s", stamp);
     return 0;
 }
 
@@ -208,6 +231,7 @@ int state_save(const char *root, const state_t *s, char *err, size_t elen)
         for (int k = 0; k < p->ndests; k++)
             json_array_append_new(dests, json_string(p->dests[k]));
         json_object_set_new(j, "destinations", dests);
+        json_object_set_new(j, "stamp", json_string(p->stamp));
         json_object_set_new(pkgs, p->id, j);
     }
     char *text = json_dumps(top, JSON_INDENT(1) | JSON_SORT_KEYS);

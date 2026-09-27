@@ -23,6 +23,7 @@
 #define STATE_POOL_SIZE  32         /* ffx0 to ffx31: the image's account pool */
 #define STATE_POOL_UID   800        /* ffx<n> is uid and gid 800 + n */
 #define STATE_MAX_DESTS  8          /* the destinations the operator may name for one package */
+#define STATE_STAMP_LEN  16         /* an install's stamp, in hex digits */
 
 typedef struct {
     char id[64];
@@ -40,6 +41,10 @@ typedef struct {
      * net.outbound.operator, as "host:port" in net.outbound's form. */
     char dests[STATE_MAX_DESTS][CAP_MAX_LEN];
     int ndests;
+    /* Written anew by every install, so that a service started from an
+     * earlier install of the same version is told from this one: 16 hex
+     * digits, "" in a state written before it was kept. */
+    char stamp[STATE_STAMP_LEN + 1];
 } state_pkg_t;
 
 typedef struct {
@@ -59,5 +64,9 @@ void state_remove(state_t *s, const char *id);
 int state_slot_free(const state_t *s);
 
 int state_granted(const state_pkg_t *p, const char *cap);
+
+/* A new install's stamp, from the kernel's random source: 0, or -1 when
+ * none could be read. */
+int state_new_stamp(char out[STATE_STAMP_LEN + 1]);
 
 #endif

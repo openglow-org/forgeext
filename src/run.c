@@ -721,14 +721,17 @@ static void holds_turn(run_t *r, const super_t *sv, const super_inputs_t *in)
 _Static_assert(EXT_DESTS_MAX <= NET_MAX_DESTS && EXT_DESTS_MAX <= SANDBOX_MAX_PORTS - 1 && API_MAX_DESTS >= NET_MAX_DESTS,
                "a service's destinations fit the rule table, the sandbox's ports (the resolver's besides), and its answer");
 
-/* What a service runs with, as the supervisor compares it: its version
- * and the operator's destinations, in order (FNV-1a). */
+/* What a service runs with, as the supervisor compares it: its install
+ * (the version, and the stamp every install writes anew, so a package
+ * removed and installed again between two turns is not taken for the one
+ * still running) and the operator's destinations, in order (FNV-1a). */
 static unsigned long long conf_digest(const state_pkg_t *p)
 {
     unsigned long long h = 1469598103934665603ULL;
-    const char *parts[1 + STATE_MAX_DESTS];
+    const char *parts[2 + STATE_MAX_DESTS];
     int n = 0;
     parts[n++] = p->version;
+    parts[n++] = p->stamp;
     for (int i = 0; i < p->ndests; i++)
         parts[n++] = p->dests[i];
     for (int i = 0; i < n; i++)

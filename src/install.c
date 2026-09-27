@@ -554,6 +554,14 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
             goto out;
         }
 
+    /* A stamp of this install's own: a service still running from one
+     * before it, of the same version, is told from it and started again. */
+    char stamp[STATE_STAMP_LEN + 1];
+    if (state_new_stamp(stamp) != 0) {
+        fail(err, elen, "no random bytes for the install's stamp: %s", strerror(errno));
+        goto out;
+    }
+
     /* Commit: the tree and its list move into place, `current` turns to
      * them, and the state is written last. A version older than the one
      * being replaced's own predecessor goes now; the predecessor stays
@@ -587,6 +595,7 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
         p->enabled = 1;
     }
     snprintf(p->version, sizeof(p->version), "%s", m->version);
+    snprintf(p->stamp, sizeof(p->stamp), "%s", stamp);
     p->tier = res->info.tier;
     snprintf(p->key_id, sizeof(p->key_id), "%s", res->info.key_id);
     if (manifest_has_service(m) && p->slot < 0)
