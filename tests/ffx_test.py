@@ -9,12 +9,13 @@ Every fixture is a package directory. `ffx lint` judges it, and the same
 directory, packed unsigned by tools/mkffx.sh, is judged by the built
 `forgeext inspect`: the two must agree on every verdict, and where the host
 refuses a manifest the words must be the host's. Then `ffx pack` builds an
-archive the host takes, the same bytes twice over; `ffx new` makes a package
+archive the host takes, the same bytes twice over a second apart, signed or
+not; `ffx new` makes a package
 for each runtime that lints as its template says; `ffx keygen` refuses to
 overwrite a key; `ffx index record` writes a listed version's record only
 for an archive its signer's key verifies; `ffx index build` makes an index
-of a catalog directory that the host keeps, the same bytes twice over,
-and refuses a catalog out of form; and ffx's index form is the host's,
+of a catalog directory that the host keeps, the same bytes twice over a
+second apart, and refuses a catalog out of form; and ffx's index form is the host's,
 document by document.
 
 Needs fwup (FWUP) and the built forgeext (FORGEEXT). Exits 77 without them.
@@ -28,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(HERE, "..", "tools")
@@ -434,6 +436,8 @@ def main():
         d = build(top, "a packed one", with_(), {"lib/extra.py": "x = 1\n"})
         a1, a2 = os.path.join(top, "a1.ffx"), os.path.join(top, "a2.ffx")
         for out in (a1, a2):
+            if out == a2:
+                time.sleep(1.1)                         # a second apart: the clock is no part of the archive
             rc = ffx.main(["pack", d, "--out", out])
             check(rc == 0 and os.path.isfile(out), "packed %s: %s", os.path.basename(out), rc)
         check(open(a1, "rb").read() == open(a2, "rb").read(), "two packs of one directory are one archive")
@@ -445,6 +449,10 @@ def main():
         check(ffx.main(["keygen", key]) == 1, "and a second keygen over it refused")
         signed = os.path.join(top, "signed.ffx")
         check(ffx.main(["pack", d, "--key", key + ".priv", "--out", signed]) == 0, "packed and signed")
+        time.sleep(1.1)
+        again = os.path.join(top, "signed-again.ffx")
+        check(ffx.main(["pack", d, "--key", key + ".priv", "--out", again]) == 0
+              and open(signed, "rb").read() == open(again, "rb").read(), "signed twice a second apart: one archive")
         v = subprocess.run([FWUP, "-V", "-i", signed, "-p", key + ".pub"], capture_output=True)
         check(v.returncode == 0, "the signature checks under fwup: %s", v.stderr[-200:])
         os.makedirs(os.path.join(root, "keys"), exist_ok=True)
@@ -610,6 +618,8 @@ def main():
 
         i1, i2 = os.path.join(top, "i1.ffi"), os.path.join(top, "i2.ffi")
         for o in (i1, i2):
+            if o == i2:
+                time.sleep(1.1)                         # a second apart: the clock is no part of the index
             rc, said = index_build(o, ogkey)
             check(rc == 0 and "2 packages, 2 versions" in said, "built and signed: %s", said)
         check(open(i1, "rb").read() == open(i2, "rb").read(), "two builds of one catalog are one index")

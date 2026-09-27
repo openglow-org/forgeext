@@ -18,7 +18,8 @@ words, and stops where it would: the manifest, the capabilities, the page,
 the service's entry point, the payload's limits, and a Python package's
 imports against the release image's module list. `pack` lints, then builds
 the archive with fwup (the same one a machine verifies with), signs it when
-given a key, and checks the signature before it says so. `install` logs in
+given a key, and checks the signature before it says so; the archive is the
+same bytes for the same files and key, whenever it is built. `install` logs in
 to a machine over HTTPS, uploads, shows what the machine says the package is
 and asks for, and installs with the consent its tier takes. `logs` reads the
 extension host's log, a package's lines alone with --id. `index record` and
@@ -718,6 +719,17 @@ def fwup_bin():
     return b
 
 
+# fwup dates an archive's meta.conf by the clock unless SOURCE_DATE_EPOCH names a time, and two builds of the
+# same input would then differ by the second each ran in. With this, meta.conf carries the zip epoch
+# (1980-01-01) as every other entry of the archive already does, whatever the caller's environment says.
+ARCHIVE_EPOCH = "315532800"
+
+
+def fwup_env():
+    """The environment fwup makes or signs an archive in: the same bytes for the same input, on any day."""
+    return dict(os.environ, SOURCE_DATE_EPOCH=ARCHIVE_EPOCH)
+
+
 def payload(d, m, files, out):
     """A gzip-compressed tar of the package, the same bytes every time: sorted names, owner 0, time 0, and
     each file 0644 or 0755 (0755 for the service's entry point and for what is executable here)."""
@@ -758,14 +770,14 @@ def cmd_pack(a):
                     'file-resource payload.tar.gz {\n    host-path = "%s"\n}\n'
                     % (PRODUCT, m["id"], m["version"], pl.replace("\\", "/")))
         raw = os.path.join(work, "unsigned.ffx")
-        subprocess.run([fwup, "-c", "-f", conf, "-o", raw], check=True, capture_output=True)
+        subprocess.run([fwup, "-c", "-f", conf, "-o", raw], check=True, capture_output=True, env=fwup_env())
         if a.key:
             pub = a.key[:-5] + ".pub" if a.key.endswith(".priv") else None
             if not pub or not os.path.isfile(pub):
                 raise Refused("the key's public half (%s) is not beside it: a signature that cannot be checked is "
                               "not made" % (pub or a.key + ".pub"))
             signed = os.path.join(work, "signed.ffx")
-            subprocess.run([fwup, "-S", "-s", a.key, "-i", raw, "-o", signed], check=True, capture_output=True)
+            subprocess.run([fwup, "-S", "-s", a.key, "-i", raw, "-o", signed], check=True, capture_output=True, env=fwup_env())
             v = subprocess.run([fwup, "-V", "-i", signed, "-p", pub], capture_output=True)
             if v.returncode != 0:
                 raise Refused("the signature does not check against %s" % pub)
@@ -1140,10 +1152,11 @@ def cmd_index_build(a):
                     'meta-platform = "forgefirm-ext"\nfile-resource payload.tar.gz {\n    host-path = "%s"\n}\n'
                     % (INDEX_PRODUCT, a.version, pl.replace("\\", "/")))
         unsigned = os.path.join(work, "index.ffi")
-        subprocess.run([fwup, "-c", "-f", conf, "-o", unsigned], check=True, capture_output=True)
+        subprocess.run([fwup, "-c", "-f", conf, "-o", unsigned], check=True, capture_output=True, env=fwup_env())
         if a.key:
             signed = os.path.join(work, "signed.ffi")
-            subprocess.run([fwup, "-S", "-s", a.key, "-i", unsigned, "-o", signed], check=True, capture_output=True)
+            subprocess.run([fwup, "-S", "-s", a.key, "-i", unsigned, "-o", signed], check=True, capture_output=True,
+                           env=fwup_env())
             shutil.copyfile(signed, a.out)
         else:
             shutil.copyfile(unsigned, a.out)
