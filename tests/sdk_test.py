@@ -20,8 +20,8 @@ The Python and the C package also have a page, so their services answer the
 page's calls (ffx.serve(), ffx_serve_one()): the test makes those calls the
 way the panel relays them, with `forgeext call`, and holds the command to
 its closed form, the refusals to their words, a frozen service to its own
-answer until it thaws, and the socket to being the host's and gone with the
-service.
+answer until it thaws, a disabled package to the host's refusal until it is
+enabled again, and the socket to being the host's and gone with the service.
 
 In network and mount namespaces of its own, with the image's deny rules
 loaded and a stand-in for forgectrl's read-only routes on loopback.
@@ -450,7 +450,7 @@ def main():
         check(r.get("ok") is True and r.get("status") == 404 and r.get("body") == {"error": "there is no such thing"},
               "and refuses in its own words: %s", r)
 
-        print("a frozen service, and a stopped one")
+        print("a frozen service")
         facts["armed"] = True               # the freeze itself is run_test.py's
         wait_for(lambda: cg_frozen(py), 15)
         r = call(py, "GET", "/echo")
@@ -459,6 +459,18 @@ def main():
         wait_for(lambda: not cg_frozen(py), 15)
         r = call(py, "GET", "/echo")
         check(r.get("ok") is True and r.get("status") == 200, "thawed, it answers again: %s", r)
+
+        print("a disabled package, and enabled again")
+        r = fx("disable", py)
+        check(r.get("ok") is True and wait_for(lambda: not os.path.exists(os.path.join(call_dir, py + ".sock")), 15),
+              "disabled: its socket's name is gone: %s", r.get("error", ""))
+        r = call(py, "GET", "/echo")
+        check(r.get("ok") is False and r.get("error") == "this package is disabled: its service is not running", "a call to it: %s", r)
+        check(fx("enable", py).get("ok") is True, "enabled again")
+        r = wait_for(lambda: (lambda a: a.get("status") == 200 and a)(call(py, "GET", "/echo")), 60) or call(py, "GET", "/echo")
+        check(r.get("ok") is True and r.get("status") == 200, "the same call answers again: %s", r)
+
+        print("a stopped one")
         daemon.send_signal(signal.SIGTERM)
         daemon.wait(20)
         check(not os.path.exists(os.path.join(call_dir, py + ".sock")), "the host stopped: the socket's name is gone")

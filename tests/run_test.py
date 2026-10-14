@@ -10,6 +10,9 @@ peer namespace on a veth pair, a stand-in for forgectrl's read-only routes on
 loopback whose answers the test changes, and four real packages installed
 through the command line: a heartbeat, a dialer that declares one destination
 by name, one that ends at once, and one the operator let run through a job.
+The host's machine token is a file of the test's (FORGEEXT_HOST_TOKEN_FILE),
+and the stand-in takes a claim on the Grbl sender only with that token and
+serves the host's event stream.
 
 Nothing starts while extensions are off or the machine is not ready. Then
 services start one at a time, each as its pool account in its own cgroup, with
@@ -21,7 +24,12 @@ programs to run: the file that is really in its data directory gets as far as
 the machine, and a symbolic link out of the directory and a name with a
 directory in it are refused in words before anything does. A killed service
 comes back. The one that keeps ending is quarantined, and state.json
-remembers it. A package removed and installed again while the host is not
+remembers it. A package granted sender.keep_out that asks to keep the Grbl
+sender out has its claim kept fresh beside the holds, until it is disabled.
+A package that holds events has the host hold one stream from forgectrl: a
+poll at the head comes back empty at its deadline, a waiting one as soon as
+the stream carries an event, and with the package disabled the stream is let
+go. A package removed and installed again while the host is not
 looking is started again from the new install, never left running from the
 old one. A fifth package asks for destinations of the operator's: it
 reaches nothing until the operator names the peer, is started again with
@@ -39,6 +47,7 @@ forgeext (FORGEEXT), and the rule file (FFX_RULES). Exits 77 without them.
 import http.server
 import json
 import os
+import select
 import shutil
 import signal
 import socket
@@ -193,9 +202,52 @@ while True:
     place = (ans or {}).get("next", place)
 '''
 
+# One that keeps the Grbl sender out as it starts.
+KEEPOUT = API_CLIENT + r'''
+import time
+code, ans = api("POST", "/v0/sender", {"out": True})
+print("keepout %d %s" % (code, ans), flush=True)
+while True:
+    time.sleep(1)
+'''
+
+# One that polls the host's events when the test says so, and writes down what it was told and when.
+EVPOLL = API_CLIENT + r'''
+import json, os, time
+d = os.environ["FFX_DATA"]
+def put(name, v):
+    with open(os.path.join(d, name + ".new"), "w") as f:
+        json.dump(v, f)
+    os.rename(os.path.join(d, name + ".new"), os.path.join(d, name))
+def after(name):
+    while not os.path.exists(os.path.join(d, name)):
+        time.sleep(0.1)
+after("go1")
+head = api("POST", "/v0/events", {})[1].get("next")
+t0 = time.monotonic()
+code, ans = api("POST", "/v0/events", {"since": head, "wait": 1})
+put("poll1.json", {"code": code, "head": head, "next": ans.get("next"), "events": ans.get("events"),
+                   "took": time.monotonic() - t0})
+after("go2")
+head = api("POST", "/v0/events", {})[1].get("next")
+put("polling", {})
+code, ans = api("POST", "/v0/events", {"since": head, "wait": 4})
+put("poll2.json", {"code": code, "events": ans.get("events"), "at": time.monotonic()})
+while True:
+    time.sleep(1)
+'''
+
+TOKEN = "0123456789abcdef0123456789abcdef"
 failures = []
 facts = {"armed": False, "controller": "running", "motion": "unverified", "mode": "grbl", "diag": False, "updating": False,
-         "down": False}
+         "down": False, "sender": []}
+streams = []                                    # each /events stream the stand-in holds: the events it has yet to write
+streams_mu = threading.Lock()
+
+
+def open_streams():
+    with streams_mu:
+        return len(streams)
 
 
 def check(ok, what, *args):
@@ -207,6 +259,8 @@ def check(ok, what, *args):
 
 class Forgectrl(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/events" and not facts["down"] and self.headers.get("X-ForgeFIRM-Client") == "extension-host":
+            return self.stream()
         body = {"/cool/status": {"armed": facts["armed"]},
                 "/mode": {"mode": facts["mode"], "controller": facts["controller"], "motion": facts["motion"]},
                 "/status": {"diag": facts["diag"]},
@@ -216,6 +270,46 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
             return
         data = json.dumps(body).encode()
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def stream(self):
+        """The host's slot in forgectrl's event stream: a greeting, then what the test writes, until the host lets go."""
+        q = []
+        with streams_mu:
+            streams.append(q)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b"event: hello\ndata: {}\n\n")
+            self.wfile.flush()
+            while True:
+                with streams_mu:
+                    out, q[:] = q[:], []
+                for name, data in out:
+                    self.wfile.write(("event: %s\ndata: %s\n\n" % (name, json.dumps(data))).encode())
+                    self.wfile.flush()
+                if select.select([self.connection], [], [], 0.1)[0] and not self.connection.recv(1):
+                    return
+        except OSError:
+            return
+        finally:
+            with streams_mu:
+                streams.remove(q)
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if self.path.split("?")[0] == "/motion/sender" and not facts["down"]:
+            ok = self.headers.get("X-ForgeFIRM-Token") == TOKEN
+            facts["sender"].append((self.path, ok))
+            body, code = ({}, 200) if ok else ({"error": "not the extension host's token"}, 403)
+        else:
+            body, code = {"error": "the stand-in has no such route"}, 404
+        data = json.dumps(body).encode()
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -323,10 +417,11 @@ def main():
     check(listed == {"org.example.beat": "advisory", "org.example.dial": None, "org.example.jobtime": "advisory",
                      "org.example.crash": "required"}, "the list says which hold is which: %s", listed)
 
-    def held(id_):
-        """The hold file of a package: None, or its fields with the age of its timestamp."""
+    def held(id_, where=holds_dir):
+        """The hold file of a package (or its claim on the sender, in that directory): None, or its fields with the age
+        of its timestamp."""
         try:
-            with open(os.path.join(holds_dir, id_ + ".json")) as f:
+            with open(os.path.join(where, id_ + ".json")) as f:
                 h = json.load(f)
         except (OSError, ValueError):
             return None
@@ -339,13 +434,18 @@ def main():
         f.write("ext_enabled=0\n")
     log_path = os.path.join(top, "daemon.log")
     log = open(log_path, "w")
+    token_file = os.path.join(top, "host.token")
+    with open(token_file, "w") as f:
+        f.write(TOKEN + "\n")
+    os.chmod(token_file, 0o600)
 
     def start_daemon():
         return subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "run", "--conf", conf, "--safe-file", safe,
                                  "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir,
                                  "--holds-dir", holds_dir, "--api-dir", api_dir]
                                 + (["--landlock-fs-only"] if abi < 4 else []),
-                                stderr=log, stdout=log, env=dict(os.environ, FFLOG_STDERR="1", FFLOG_SOCK="/nonexistent"))
+                                stderr=log, stdout=log, env=dict(os.environ, FFLOG_STDERR="1", FFLOG_SOCK="/nonexistent",
+                                                                 FORGEEXT_HOST_TOKEN_FILE=token_file))
 
     daemon = start_daemon()
 
@@ -528,6 +628,56 @@ def main():
               "forgectrl stops answering: frozen, the window unknown")
         facts["down"] = False
         check(wait_for(lambda: not svc("org.example.beat").get("frozen"), 8), "and thawed when it answers again")
+
+        print("a package keeps the Grbl sender out, by the operator's grant")
+        kid, senders_dir = "org.example.keepout", os.path.join(top, "sender-out")     # beside the holds directory
+        package(kid, "python", KEEPOUT, caps=["sender.keep_out"], grants=["sender.keep_out"])
+        k = wait_for(lambda: (held(kid, senders_dir) or {}).get("raised") and held(kid, senders_dir), 40)
+        time.sleep(1.0)
+        k2 = held(kid, senders_dir)
+        check(k and k["reason"] == "keeps the Grbl sender out" and k["age"] < 1.5 and k2 and k2["raised"] and k2["age"] < 1.5,
+              "its claim is kept beside the holds, raised, in the host's words, and fresh a second later: %s %s "
+              "(the stand-in was asked %s)", k, k2, facts["sender"])
+        r = fx("disable", kid)
+        check(r.get("ok") is True and wait_for(lambda: held(kid, senders_dir) is None, 5),
+              "disabled, its claim is gone: %s %s", r.get("error", ""), os.listdir(senders_dir))
+        check(fx("remove", kid).get("ok") is True, "and it goes")
+
+        print("the machine's events: one stream from forgectrl, held while a package wants it")
+        eid = "org.example.events"
+        edata = os.path.join(root, "data", eid)
+
+        def jload(name):
+            try:
+                with open(os.path.join(edata, name)) as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                return None
+        package(eid, "python", EVPOLL, caps=["events"])
+        check(wait_for(lambda: (status().get("events") or {}).get("connected") is True
+                       and status()["events"].get("wanted", 0) >= 1 and open_streams() == 1, 40),
+              "a package wants events: the host holds the stream (%s), and the stand-in has %d open",
+              status().get("events"), open_streams())
+        open(os.path.join(edata, "go1"), "w").close()
+        p1 = wait_for(lambda: jload("poll1.json"), 10) or {}
+        check(p1.get("code") == 200 and p1.get("events") == [] and p1.get("next") == p1.get("head")
+              and 1.0 <= p1.get("took", 0) < 3, "a poll at the head with wait 1: nothing, and not before that second: %s", p1)
+        open(os.path.join(edata, "go2"), "w").close()
+        check(wait_for(lambda: jload("polling") is not None, 10), "the package asks again, with a longer wait")
+        time.sleep(0.5)
+        with streams_mu:
+            for q in streams:
+                q.append(("lid", {"open": True}))
+        wrote = time.monotonic()
+        p2 = wait_for(lambda: jload("poll2.json"), 10) or {}
+        check(p2.get("code") == 200 and [e.get("event") for e in p2.get("events") or []] == ["lid"]
+              and p2.get("at", wrote + 99) - wrote < 1.0,
+              "a poll with wait 4 is answered %.2f s after the stand-in writes one event: %s", p2.get("at", wrote) - wrote, p2)
+        r = fx("disable", eid)
+        check(r.get("ok") is True and wait_for(lambda: status().get("events") == {"connected": False, "wanted": 0}
+                                               and open_streams() == 0, 10),
+              "disabled, nobody wants events: %s, and the stand-in has %d open", status().get("events"), open_streams())
+        check(fx("remove", eid).get("ok") is True, "and it goes")
 
         print("a killed service comes back; one that keeps ending is quarantined")
         old = svc("org.example.beat")["pid"]

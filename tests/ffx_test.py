@@ -70,7 +70,8 @@ def with_(**kw):
     return m
 
 
-# (name, manifest (dict, or raw bytes), extra files {path: text}); a ui package gets its page, a service its entry
+# (name, manifest (dict, or raw bytes), extra files {path: text}); a ui package gets its page, a service its entry;
+# "__words__" in the extra files is the refusal both must give in those words
 FIXTURES = [
     ("a python service", with_(), {}),
     ("a ui package", with_(runtime="ui", service=None, capabilities=["ui", "machine.read", "camera.head"]), {}),
@@ -102,6 +103,8 @@ FIXTURES = [
     ("a conflict with itself", with_(conflicts=["org.example.fixture"]), {}),
     ("a number default out of bounds", with_(settings={"a": {"type": "number", "default": 9, "max": 5}}), {}),
     ("a ui package without its page", with_(runtime="ui", service=None, capabilities=["ui"]), {"__no_page__": ""}),
+    ("a page that does not ask for ui", with_(), {"ui/index.html": "<!doctype html><p>page</p>",
+                                                  "__words__": "this package has a ui/index.html and does not ask for ui"}),
     ("an entry point that is not there", with_(service={"exec": "bin/other.py"}), {}),
 ]
 
@@ -362,6 +365,11 @@ def main():
                 check(mine is not None, "%s: packing fails, and lint refuses it too (%s)", name, mine)
                 continue
             theirs = inspect(out)
+            want = extra.get("__words__")
+            if want:
+                check(mine == want and want in (theirs.get("error") or ""), "%s: lint and the host refuse it in these words "
+                      "(%s / %s)", name, mine, theirs.get("error"))
+                continue
             host_ok = theirs.get("ok") is True
             if host_ok or mine is None:
                 check(host_ok == (mine is None), "%s: the host says %s, lint says %s", name,

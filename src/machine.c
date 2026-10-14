@@ -231,7 +231,8 @@ done:
 
 void machine_host_token(char *out, size_t olen)
 {
-    FILE *f = fopen(MACHINE_HOST_TOKEN_FILE, "re");
+    const char *path = getenv("FORGEEXT_HOST_TOKEN_FILE");
+    FILE *f = fopen(path && *path ? path : MACHINE_HOST_TOKEN_FILE, "re");
     out[0] = '\0';
     if (!f)
         return;

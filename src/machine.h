@@ -69,7 +69,8 @@ int machine_get_blob(const machine_cfg_t *cfg, const char *path, unsigned char *
  * run and left in a file only root can read. It holds only what the host
  * may relay, and forgectrl takes it from a loopback peer alone. "" when
  * there is none, which is a machine whose forgectrl has not started or
- * is older than this file. */
+ * is older than this file. FORGEEXT_HOST_TOKEN_FILE, set and not empty,
+ * names the file instead (a host test's own). */
 #define MACHINE_HOST_TOKEN_FILE "/run/forgefirm/ext-host.token"
 
 void machine_host_token(char *out, size_t olen);
