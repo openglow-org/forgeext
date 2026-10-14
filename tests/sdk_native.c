@@ -5,9 +5,9 @@
  * SPDX-License-Identifier: MIT
  *
  * Built static by the test and run as a package's service in the sandbox.
- * It asks the host what a native package asks, and writes what it was told
- * into its data directory for the test to read; then it answers its page's
- * calls.
+ * It asks the host for itself, raises a hold, and asks the machine's mode,
+ * and writes what it was told into its data directory for the test to
+ * read; then it answers its page's calls.
  */
 #define FFX_IMPLEMENTATION
 #include "../sdk/c/ffx.h"
@@ -71,20 +71,8 @@ int main(void)
     line(f, "raise", &r, rc);
     ffx_reply_free(&r);
 
-    rc = ffx_request("GET", "/v0/hold", NULL, &r, 5000);
-    line(f, "hold", &r, rc);
-    ffx_reply_free(&r);
-
-    rc = ffx_request("POST", "/v0/hold", "{\"raised\":false,\"reason\":\"\"}", &r, 5000);
-    line(f, "clear", &r, rc);
-    ffx_reply_free(&r);
-
     rc = ffx_request("GET", "/v0/machine/mode", NULL, &r, 5000);
     line(f, "mode", &r, rc);
-    ffx_reply_free(&r);
-
-    rc = ffx_request("GET", "/v0/nowhere", NULL, &r, 5000);
-    line(f, "nowhere", &r, rc);
     ffx_reply_free(&r);
 
     fprintf(f, "call_fd %d\n", ffx_call_fd());

@@ -26,8 +26,10 @@ looking is started again from the new install, never left running from the
 old one. A fifth package asks for destinations of the operator's: it
 reaches nothing until the operator names the peer, is started again with
 it, reaches it, and loses it again when the operator takes it away. A sixth,
-holding events and no grant, reads the host's ext.shutdown before safe mode
-stops it, unfrozen through that last second.
+holding events and the job_time.run grant, reads the host's ext.will_freeze
+as the armed window opens, running on, and ext.thawed as it closes. A
+seventh, holding events and no grant, reads the host's ext.shutdown before
+safe mode stops it, unfrozen through that last second.
 Safe mode stops everything and leaves no group and no chain. SIGTERM does the
 same and the daemon exits 0.
 
@@ -605,6 +607,24 @@ def main():
         st = json.load(open(os.path.join(root, "state.json")))["packages"][oid]
         check(st.get("destinations") == [] and not st.get("quarantined"), "state.json: %s", st)
         check(fx("remove", oid).get("ok") is True and wait_for(lambda: oid not in running(), 10), "and it goes")
+
+        print("the host's own word on the armed window, to a service with the grant")
+        wid = "org.example.watch"
+        package(wid, "python", LIFE, caps=["events", "job_time.run"], grants=["job_time.run"])
+        check(wait_for(lambda: svc(wid).get("state") == "running" and os.path.exists(os.path.join(root, "data", wid, "ready")),
+                       40), "it runs and follows its feed: %s", svc(wid))
+
+        def read(id_):
+            try:
+                return [e.get("event") for e in json.load(open(os.path.join(root, "data", id_, "host.json")))]
+            except (OSError, ValueError):
+                return []
+        facts["armed"] = True
+        check(wait_for(lambda: read(wid) == ["ext.will_freeze"], 10) and svc(wid).get("job_limited") and not svc(wid).get("frozen"),
+              "the window opens: it runs on under the grant and reads ext.will_freeze at once: %s %s", read(wid), svc(wid))
+        facts["armed"] = False
+        check(wait_for(lambda: read(wid) == ["ext.will_freeze", "ext.thawed"], 10), "the window closes: ext.thawed: %s", read(wid))
+        check(fx("remove", wid).get("ok") is True and wait_for(lambda: wid not in running(), 10), "and it goes")
 
         print("the host's own word before it stops a service")
         lid_ = "org.example.life"

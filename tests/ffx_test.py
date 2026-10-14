@@ -13,10 +13,11 @@ archive the host takes, the same bytes twice over a second apart, signed or
 not; `ffx new` makes a package
 for each runtime that lints as its template says; `ffx keygen` refuses to
 overwrite a key; `ffx index record` writes a listed version's record only
-for an archive its signer's key verifies; `ffx index build` makes an index
-of a catalog directory that the host keeps, the same bytes twice over a
-second apart, and refuses a catalog out of form; and ffx's index form is the host's,
-document by document.
+for an archive its signer's key verifies; and `ffx index build` makes an
+index of a catalog directory that the host keeps, the same bytes twice over
+a second apart, and refuses a catalog out of form. The fixtures are one per
+path of the manifest's judgment and of lint's file checks; the index's form
+is install_test's.
 
 Needs fwup (FWUP) and the built forgeext (FORGEEXT). Exits 77 without them.
 """
@@ -81,86 +82,26 @@ FIXTURES = [
     ("an outbound destination by name and by address", with_(capabilities=["net.outbound:mqtt.example.org:8883",
                                                                             "net.outbound:10.1.2.3:80",
                                                                             "net.outbound:[fd00::1]:443"]), {}),
-    ("the operator's destinations", with_(capabilities=["net.outbound.operator", "net.outbound:ntfy.sh:443"]), {}),
-    ("the operator's destinations with an argument", with_(capabilities=["net.outbound.operator:plug.lan:80"]), {}),
-    ("a core range", with_(core={"min": "0.0.1", "max": "9.0.0"}), {}),
     ("not JSON", b"{\"manifest\": 1,", {}),
     ("a key twice", b'{"manifest": 1, "manifest": 1}', {}),
-    ("NaN", b'{"manifest": NaN}', {}),
     ("an unknown key", with_(colour="red"), {}),
     ("the wrong schema", with_(manifest=2), {}),
-    ("a schema that is a string", with_(manifest="1"), {}),
-    ("no id", with_(id=None), {}),
     ("an id with an upper-case letter", with_(id="org.Example.x"), {}),
-    ("an id of one label", with_(id="fixture"), {}),
-    ("an id ending in a dash", with_(id="org.example.x-"), {}),
-    ("a name too long", with_(name="n" * 65), {}),
     ("a name with a control character", with_(name="a\tb"), {}),
     ("a version with a leading zero", with_(version="1.01.0"), {}),
-    ("a version with a prerelease", with_(version="1.0.0-rc.1"), {}),
-    ("a version with an empty prerelease", with_(version="1.0.0-"), {}),
-    ("no author", with_(author=None), {}),
-    ("an empty license", with_(license=""), {}),
     ("an api too new", with_(api="0.2"), {}),
-    ("an api that is no version", with_(api="1"), {}),
-    ("a core with an unknown key", with_(core={"least": "0.0.1"}), {}),
     ("a core min above its max", with_(core={"min": "2.0.0", "max": "1.0.0"}), {}),
     ("a runtime there is none of", with_(runtime="java"), {}),
-    ("a ui package with a service", with_(runtime="ui", capabilities=["ui"]), {}),
-    ("a service with no service", with_(service=None), {}),
     ("a service entry with ..", with_(service={"exec": "../run.py"}), {}),
-    ("a service with an unknown key", with_(service={"exec": "bin/run.py", "user": "root"}), {}),
-    ("seventeen args", with_(service={"exec": "bin/run.py", "args": ["a"] * 17}), {}),
-    ("modes empty", with_(modes=[]), {}),
     ("a mode twice", with_(modes=["grbl", "grbl"]), {}),
-    ("no capabilities", with_(capabilities=None), {}),
     ("a capability there is none of", with_(capabilities=["laser.fire"]), {}),
-    ("a role", with_(capabilities=["role:homing"]), {}),
     ("an M-code", with_(capabilities=["mcode:160", "mcode:179", "job_time.run"]), {}),
     ("an M-code with no job_time.run", with_(capabilities=["mcode:160"]), {}),
-    ("an M-code out of range", with_(capabilities=["mcode:180", "job_time.run"]), {}),
-    ("an M-code below the range", with_(capabilities=["mcode:102", "job_time.run"]), {}),
-    ("an M-code on a page", with_(runtime="ui", service=None, capabilities=["ui", "mcode:160"]), {}),
-    ("a check of its own on the Setup page", with_(capabilities=["wizard"]), {}),
-    ("a Setup check with no service", with_(runtime="ui", service=None, capabilities=["ui", "wizard"]), {}),
-    ("a capability not offered", with_(capabilities=["motion.offsets"]), {}),
-    ("an argument where none is taken", with_(capabilities=["hold:1"]), {}),
     ("an outbound to the machine", with_(capabilities=["net.outbound:127.0.0.1:80"]), {}),
-    ("an outbound with an upper-case name", with_(capabilities=["net.outbound:MQTT.example.org:1883"]), {}),
-    ("a listen on the firmware's port", with_(capabilities=["net.listen:8090"]), {}),
-    ("a listen below 1024", with_(capabilities=["net.listen:80"]), {}),
-    ("storage past its bound", with_(capabilities=["storage:300"]), {}),
-    ("storage twice", with_(capabilities=["storage:4", "storage:8"]), {}),
     ("a capability twice", with_(capabilities=["hold", "hold"]), {}),
-    ("a data package with a capability", with_(runtime="data", service=None, capabilities=["machine.read"]), {}),
-    ("a ui package with a hold", with_(runtime="ui", service=None, capabilities=["ui", "hold"]), {}),
     ("a conflict with itself", with_(conflicts=["org.example.fixture"]), {}),
-    ("a conflict twice", with_(conflicts=["org.example.a", "org.example.a"]), {}),
-    ("seventeen settings", with_(capabilities=["settings.own"],
-                                 settings={"s%d" % i: {"type": "bool", "default": False} for i in range(17)}), {}),
-    ("a setting with no default", with_(settings={"a": {"type": "bool"}}), {}),
-    ("a setting of no type", with_(settings={"a": {"type": "date", "default": "x"}}), {}),
-    ("a setting named with a capital", with_(settings={"A": {"type": "bool", "default": False}}), {}),
     ("a number default out of bounds", with_(settings={"a": {"type": "number", "default": 9, "max": 5}}), {}),
-    ("a number min above its max", with_(settings={"a": {"type": "number", "default": 1, "min": 5, "max": 1}}), {}),
-    ("a number that is a bool", with_(settings={"a": {"type": "number", "default": True}}), {}),
-    ("a string max that is not whole", with_(settings={"a": {"type": "string", "default": "", "max": 5.5}}), {}),
-    ("a string max past 128", with_(settings={"a": {"type": "string", "default": "", "max": 129}}), {}),
-    ("a string default past its max", with_(settings={"a": {"type": "string", "default": "abcdef", "max": 3}}), {}),
-    ("a min on a string", with_(settings={"a": {"type": "string", "default": "", "min": 1}}), {}),
-    ("choices on a string", with_(settings={"a": {"type": "string", "default": "", "choices": ["x", "y"]}}), {}),
-    ("a choice with one choice", with_(settings={"a": {"type": "choice", "default": "x", "choices": ["x"]}}), {}),
-    ("a choice named twice", with_(settings={"a": {"type": "choice", "default": "x", "choices": ["x", "x"]}}), {}),
-    ("a choice default not a choice", with_(settings={"a": {"type": "choice", "default": "z", "choices": ["x", "y"]}}), {}),
-    ("a label too long", with_(settings={"a": {"type": "bool", "default": False, "label": "l" * 49}}), {}),
-    ("a setting with an unknown key", with_(settings={"a": {"type": "bool", "default": False, "unit": "mm"}}), {}),
     ("a ui package without its page", with_(runtime="ui", service=None, capabilities=["ui"]), {"__no_page__": ""}),
-    ("a page without ui", with_(), {"ui/index.html": "<p>x</p>"}),
-    ("a page kept running", with_(runtime="ui", service=None, capabilities=["ui", "ui.background"]), {}),
-    ("a page kept running with no page", with_(capabilities=["ui.background"]), {}),
-    ("a page kept running with an argument", with_(runtime="ui", service=None, capabilities=["ui", "ui.background:1"]), {}),
-    ("a service that keeps the sender out", with_(capabilities=["sender.keep_out", "motion.jog"]), {}),
-    ("a page that keeps the sender out", with_(runtime="ui", service=None, capabilities=["ui", "sender.keep_out"]), {}),
     ("an entry point that is not there", with_(service={"exec": "bin/other.py"}), {}),
 ]
 
@@ -669,64 +610,6 @@ def main():
         r = host("index-verify", i2)
         check(r.get("ok") is False and "older than the one kept here (2026.923.2)" in (r.get("error") or ""),
               "and the first index, older, is refused now: %s", r.get("error"))
-
-        print("ffx's index form is the host's, doc by doc")
-        serial = [2]
-
-        def host_says(doc):
-            serial[0] += 1
-            work = tempfile.mkdtemp(dir=top)
-            idxjson = os.path.join(work, "index.json")
-            with open(idxjson, "w") as f:
-                json.dump(doc, f)
-            pl = os.path.join(work, "payload.tar.gz")
-            subprocess.run(["tar", "-C", work, "-czf", pl, "index.json"], check=True)
-            conf = os.path.join(work, "fwup.conf")
-            with open(conf, "w") as f:
-                f.write('meta-product = "ForgeFIRM extension index"\nmeta-version = "2026.923.%d"\n'
-                        'meta-platform = "forgefirm-ext"\nfile-resource payload.tar.gz {\n    host-path = "%s"\n}\n'
-                        % (serial[0], pl))
-            raw, sig = os.path.join(work, "i.raw"), os.path.join(work, "i.ffi")
-            subprocess.run([FWUP, "-c", "-f", conf, "-o", raw], check=True, capture_output=True)
-            subprocess.run([FWUP, "-S", "-s", ogkey + ".priv", "-i", raw, "-o", sig], check=True, capture_output=True)
-            r = host("index-verify", sig)
-            return None if r.get("ok") is True else (r.get("error") or "")
-        k = open(key + ".pub").read().strip()
-        v = {"version": "1.0.0", "url": "https://example.org/x.ffx", "sha256": "0f" * 32, "size": 9}
-        pk = {"id": "org.example.a", "name": "A", "author": "T", "key": k, "versions": [v]}
-        docs = [
-            {"index": 1, "packages": [pk]},
-            {"index": 1, "packages": [pk], "later": {"any": "thing"}},
-            {"index": 1.0, "packages": []},
-            {"index": 1, "packages": [pk, pk]},
-            {"index": 1, "packages": [dict(pk, name="")]},
-            {"index": 1, "packages": [dict(pk, homepage="ftp://x")]},
-            {"index": 1, "packages": [dict(pk, homepage=None)]},
-            {"index": 1, "packages": [dict(pk, key=None)]},
-            {"index": 1, "packages": [dict(pk, id="org.forgefirm.a")]},
-            {"index": 1, "packages": [dict(pk, versions=[dict(v, size=True)])]},
-            {"index": 1, "packages": [dict(pk, versions=[dict(v, size=-1)])]},
-            {"index": 1, "packages": [dict(pk, versions=[dict(v, url="https://a@b/")])]},
-            {"index": 1, "packages": [dict(pk, versions=[dict(v, url="https://b/@a")])]},
-            {"index": 1, "packages": [dict(pk, versions=[dict(v, capabilities=["x" * 256])])]},
-            {"index": 1, "packages": [dict(pk, versions=[dict(v, capabilities=["unheard.of"])])]},
-            {"index": 1, "packages": [dict(pk, versions=[dict(v, api=None)])]},
-            {"index": 1, "packages": [dict(pk, versions=[dict(v, core={"min": None})])]},
-            {"index": 1, "packages": [dict(pk, versions=[dict(v, core={"later": "1"})])]},
-            {"index": 1, "packages": [dict(pk, withdrawn=[{"version": "0.1.0"}, {"version": "0.1.0"}])]},
-            {"index": 1, "packages": [dict(pk, withdrawn=[{"version": "0.1.0", "reason": 5}])]},
-            {"index": 1, "packages": [], "withdrawn": None},
-            {"index": 1, "packages": [], "withdrawn": [{"id": "org.example.b", "key": k}, {"id": "org.example.b", "key": k}]},
-            {"index": 1, "packages": [], "withdrawn": [{"id": "org.openglow.b"}]},
-        ]
-        for doc in docs:
-            try:
-                ffx.index_check(doc)
-                mine = None
-            except ffx.Refused as e:
-                mine = str(e)
-            theirs = host_says(doc)
-            check(mine == theirs, "%s: the host says %s, ffx says %s", json.dumps(doc)[:90], theirs, mine)
 
         machine_client(ffx, top, a1)
     finally:

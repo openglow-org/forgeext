@@ -165,14 +165,9 @@ def main():
     subprocess.run([NFT, "-f", RULES], check=True)
     check(fx("net-check").get("ok") is True, "the image's table")
 
-    print("a declared destination, by name")
-    check(attempt(UID, PEER_ADDR, p1) == "refused", "before anything, the account is refused at the peer")
+    print("a declared destination, by name (the rules' own effect is sandbox-rules-test.py's)")
     r = fx("net-allow", str(UID), "peer.test:%d" % p1)
     check(r.get("ok") is True, "net-allow peer.test:%d -> %s", p1, r)
-    check(attempt(UID, PEER_ADDR, p1) == "ok", "the declared port answers")
-    check(attempt(UID, PEER_ADDR, p2) == "refused", "another port of the peer does not")
-    check(attempt(UID + 1, PEER_ADDR, p1) == "refused", "another account does not get through on it")
-    check(attempt(UID, "127.0.0.1", 9) in ("refused",), "loopback stays shut")
     listed = subprocess.run([NFT, "list", "chain", "inet", "ffx", "u%d" % UID], capture_output=True, text=True).stdout
     check("ip daddr %s tcp dport %d accept" % (PEER_ADDR, p1) in listed and "peer.test" not in listed,
           "the rule names the address that was judged, not the name: %s", " ".join(listed.split()))

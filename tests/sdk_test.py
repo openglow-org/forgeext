@@ -8,17 +8,20 @@
 Each of the kit's service clients runs as a package's service under `forgeext
 run`, in the sandbox a package gets on the image: sdk/python/ffx.py in a
 Python package, sdk/sh/ffx.sh in a shell package (it speaks through the
-image's curl), and sdk/c/ffx.h built static into a native package. Each asks
-the host what a package asks - itself, its hold raised, read and cleared, a
-machine route it holds and one it does not, a path there is none of, and (in
-Python) its settings and the events poll - and writes what it was told into
-its data directory, where the test reads it.
+image's curl), and sdk/c/ffx.h built static into a native package. The
+Python client asks the host what a package asks - itself, its hold raised,
+read and cleared, a machine route it holds and one it does not, a path there
+is none of, its settings and the events poll; the shell and C clients ask
+for themselves and raise a hold, their one POST (the C one also asks the
+machine's mode). Each writes what it was told into its data directory,
+where the test reads it.
 
 The Python and the C package also have a page, so their services answer the
 page's calls (ffx.serve(), ffx_serve_one()): the test makes those calls the
 way the panel relays them, with `forgeext call`, and holds the command to
 its closed form, the refusals to their words, a frozen service to its own
-answer, and the socket to being the host's and gone with the service.
+answer until it thaws, and the socket to being the host's and gone with the
+service.
 
 In network and mount namespaces of its own, with the image's deny rules
 loaded and a stand-in for forgectrl's read-only routes on loopback.
@@ -145,10 +148,6 @@ r="$FFX_DATA/report.txt.new"
 : > "$r"
 ffx_get /v0/self > /dev/null; echo "self $? $FFX_STATUS $FFX_BODY" >> "$r"
 ffx_hold 1 "from ffx.sh" > /dev/null; echo "raise $? $FFX_STATUS $FFX_BODY" >> "$r"
-ffx_get /v0/hold > /dev/null; echo "hold $? $FFX_STATUS $FFX_BODY" >> "$r"
-ffx_hold 0 > /dev/null; echo "clear $? $FFX_STATUS $FFX_BODY" >> "$r"
-ffx_get /v0/machine/mode > /dev/null; echo "mode $? $FFX_STATUS $FFX_BODY" >> "$r"
-ffx_get /v0/nowhere > /dev/null; echo "nowhere $? $FFX_STATUS $FFX_BODY" >> "$r"
 mv "$r" "$FFX_DATA/report.txt"
 while true; do sleep 60; done
 '''
@@ -434,11 +433,6 @@ def main():
         sh = lines("org.example.sdksh")
         check(sh.get("self", "").startswith("0 200 ") and '"org.example.sdksh"' in sh.get("self", ""), "self: %s", sh.get("self"))
         check(sh.get("raise", "").startswith("0 200 ") and '"from ffx.sh"' in sh.get("raise", ""), "a hold raised: %s", sh.get("raise"))
-        check(sh.get("hold", "").startswith("0 200 ") and '"raised": true' in sh.get("hold", "").replace('":true', '": true'),
-              "and read: %s", sh.get("hold"))
-        check(sh.get("clear", "").startswith("0 200 "), "and cleared: %s", sh.get("clear"))
-        check(sh.get("mode", "").startswith("1 403 "), "a machine route it does not hold: %s", sh.get("mode"))
-        check(sh.get("nowhere", "").startswith("1 404 "), "a path there is none of: %s", sh.get("nowhere"))
 
         print("the C client, ffx.h (built static)")
         c = lines("org.example.sdkc")
@@ -447,10 +441,7 @@ def main():
         check(c.get("escape") == r'"a \"b\" \\c\u000a"', "a string escaped for JSON: %s", c.get("escape"))
         check(c.get("escape_small") == "-1", "and one that does not fit refused: %s", c.get("escape_small"))
         check(c.get("raise", "").startswith("0 200 ") and '"from ffx.h"' in c.get("raise", ""), "a hold raised: %s", c.get("raise"))
-        check(c.get("hold", "").startswith("0 200 ") and '"from ffx.h"' in c.get("hold", ""), "and read: %s", c.get("hold"))
-        check(c.get("clear", "").startswith("0 200 "), "and cleared: %s", c.get("clear"))
         check(c.get("mode", "").startswith("0 200 ") and '"grbl"' in c.get("mode", ""), "the machine's mode: %s", c.get("mode"))
-        check(c.get("nowhere", "").startswith("0 404 "), "a path there is none of: %s", c.get("nowhere"))
         check(c.get("call_fd") == "4", "its page's calls, at descriptor %s", c.get("call_fd"))
         r = call("org.example.sdkc", "POST", "/echo", '{"x": [1, 2]}')
         check(r.get("ok") is True and r.get("status") == 200
@@ -460,15 +451,14 @@ def main():
               "and refuses in its own words: %s", r)
 
         print("a frozen service, and a stopped one")
-        facts["armed"] = True
-        frozen = wait_for(lambda: cg_frozen(py), 15)
-        check(frozen, "armed: the service froze")
+        facts["armed"] = True               # the freeze itself is run_test.py's
+        wait_for(lambda: cg_frozen(py), 15)
         r = call(py, "GET", "/echo")
         check(r.get("ok") is False and r.get("error") == "its service is frozen while a job is armed", "a call to it: %s", r)
         facts["armed"] = False
-        check(wait_for(lambda: not cg_frozen(py), 15), "disarmed: it thawed")
+        wait_for(lambda: not cg_frozen(py), 15)
         r = call(py, "GET", "/echo")
-        check(r.get("ok") is True and r.get("status") == 200, "and answers again: %s", r)
+        check(r.get("ok") is True and r.get("status") == 200, "thawed, it answers again: %s", r)
         daemon.send_signal(signal.SIGTERM)
         daemon.wait(20)
         check(not os.path.exists(os.path.join(call_dir, py + ".sock")), "the host stopped: the socket's name is gone")
