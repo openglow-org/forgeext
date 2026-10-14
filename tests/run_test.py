@@ -24,8 +24,11 @@ programs to run: the file that is really in its data directory gets as far as
 the machine, and a symbolic link out of the directory and a name with a
 directory in it are refused in words before anything does. A killed service
 comes back. The one that keeps ending is quarantined, and state.json
-remembers it. A package granted sender.keep_out that asks to keep the Grbl
-sender out has its claim kept fresh beside the holds, until it is disabled.
+remembers it. One that holds more than its storage capability asks for is
+set aside, in words that say what it may hold, and runs again once its data
+is cleared and the operator enables it. A package granted sender.keep_out
+that asks to keep the Grbl sender out has its claim kept fresh beside the
+holds, until it is disabled.
 A package that holds events has the host hold one stream from forgectrl: a
 poll at the head comes back empty at its deadline, a waiting one as soon as
 the stream carries an event, and with the package disabled the stream is let
@@ -520,8 +523,10 @@ def main():
         check(wait_for(lambda: logged("ext org.example.beat: beat"), 10), "the heartbeat's output is in the log under its name")
         check(wait_for(lambda: logged("ext org.example.dial: dial peer ok, machine errno"), 15),
               "the dialer reaches its declared destination and not the machine")
-        check(cg("org.example.beat", "cpu.max").split() == ["25000", "100000"] and cg("org.example.beat", "pids.max").strip() == "32",
-              "its limits: cpu.max %s pids.max %s", cg("org.example.beat", "cpu.max").strip(), cg("org.example.beat", "pids.max").strip())
+        check(cg("org.example.beat", "cpu.max").split() == ["25000", "100000"] and cg("org.example.beat", "pids.max").strip() == "32"
+              and cg("org.example.beat", "memory.max").strip() == str(48 << 20),
+              "its limits: cpu.max %s pids.max %s memory.max %s", cg("org.example.beat", "cpu.max").strip(),
+              cg("org.example.beat", "pids.max").strip(), cg("org.example.beat", "memory.max").strip())
 
         print("the API socket: a package's one way to the machine, and the broker behind it")
         jid = "ext org.example.jobtime: "
@@ -691,6 +696,23 @@ def main():
               "state.json remembers it")
         check(logged("ext org.example.crash: about to end"), "its last words are in the log")
         check(not os.path.isdir(CG_PARENT + "/org.example.crash"), "and its group is gone")
+
+        print("over its storage quota: set aside, and back once its data is cleared and it is enabled")
+        sid = "org.example.store"
+        package(sid, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["storage:1"])
+        check(wait_for(lambda: svc(sid).get("state") == "running", 40), "it runs: %s", svc(sid))
+        spid = svc(sid).get("pid", 0)
+        big = os.path.join(root, "data", sid, "toobig")
+        with open(big, "wb") as f:
+            f.write(b"x" * (2 << 20))
+        q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)  # the host measures every 30 s
+        check(q and "may hold" in q.get("reason", "") and not os.path.exists("/proc/%d" % spid),
+              "2 MiB where it declares storage:1: stopped and set aside, in words that say what it may hold: %s", q or svc(sid))
+        os.unlink(big)
+        r = fx("enable", sid)
+        check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running" and svc(sid)["pid"] != spid, 20),
+              "its data cleared and enabled again, it runs again: %s %s", r.get("error", ""), svc(sid))
+        check(fx("remove", sid).get("ok") is True, "and it goes")
 
         print("removed and installed again inside one turn of the host: started again from the new install")
         old = svc("org.example.beat")["pid"]
