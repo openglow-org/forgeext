@@ -11,7 +11,9 @@ the three tiers and what each needs from the operator, the product gate
 in both of its directions, a firmware key on an extension, a payload that
 is not the one the signed metadata names, payloads that try to leave the
 package, the namespace, key pinning across an update, the capability diff,
-conflicts, the budget, the integrity check, removal, the wipe a change of
+conflicts, the budget, the integrity check, the page a package serves
+(as it shipped, and none when it is not installed or disabled), removal,
+the wipe a change of
 owner takes (every package, everything under data/, every key the owner
 added), and the signed index (kept only under the OpenGlow extension key,
 held to its form, never older than the one kept, endorsing its author key
@@ -300,6 +302,28 @@ def background_page(t):
           "not asked for, it does not: %s" % pk.get("org.example.fg"))
     for id_ in ("org.example.bg", "org.example.fg"):
         check(t.run("remove", id_).get("ok") is True, "%s goes" % id_)
+
+
+def the_page(t):
+    """forgeext ui: the page an installed package shipped, byte for byte, and none for a package that is
+    not installed or that the operator disabled."""
+    P = "org.example.page"
+    tree = t.tree(manifest(P, runtime="ui", caps=["ui"]),
+                  {"ui/index.html": ("<!doctype html>\n<p class=\"a\">été \\ 'q'\t</p>\n<script>x = \"</p>\";</script>\n",
+                                     0o644)})
+    with open(os.path.join(tree, "ui", "index.html"), "rb") as f:
+        shipped = f.read()
+    check(t.run("install", t.pack(tree, "official")).get("ok") is True, "a package with a page installs")
+    r = t.run("ui", P)
+    check(r.get("ok") is True and (r.get("html") or "").encode() == shipped and r.get("bytes") == len(shipped),
+          "its page, as it shipped (%d bytes): %s" % (len(shipped), {k: r.get(k) for k in ("ok", "bytes", "error")}))
+    r = t.run("ui", "org.example.nothere")
+    check(r.get("ok") is False and r.get("error") == "that package is not installed", "a package not installed -> %s" % r.get("error"))
+    check(t.run("disable", P).get("ok") is True, "the operator disables it")
+    r = t.run("ui", P)
+    check(r.get("ok") is False and r.get("error") == "this package is disabled: its interface is not served" and "html" not in r,
+          "disabled -> %s" % r.get("error"))
+    check(t.run("remove", P).get("ok") is True, "the package goes")
 
 
 def the_index(t):
@@ -894,6 +918,9 @@ def run_all(w, top):
 
     print("a page kept running off its tab")
     background_page(w)
+
+    print("a package's page, served as it shipped")
+    the_page(w)
 
     print("the signed index")
     the_index(w)
