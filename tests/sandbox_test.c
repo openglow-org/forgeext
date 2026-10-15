@@ -14,8 +14,12 @@
  * the package's cgroup, no descriptor but stdio, the limits.
  * From inside: the system's read-only parts and its own package read, its
  * data written, and everything else gone: /proc, /tmp, /home, its package
- * for writing, and a world-readable file beside its package that only
- * landlock can be keeping from it; a netlink socket refused by the filter
+ * for writing, a world-readable file beside its package that only
+ * landlock can be keeping from it, and the machine's own files - the pulse
+ * device, the settings file, the setup record - each refused (EACCES; a
+ * file that is not there, ENOENT, is no pass: one the host lacks is made
+ * for the run, root's and readable by every account, and removed after,
+ * while one that is there is left as it is); a netlink socket refused by the filter
  * while a Unix and an IPv4 socket open; and, where the kernel has
  * landlock's TCP rules, a connect to an undeclared port refused while the
  * declared one goes through. On a machine whose image has the deny rules
@@ -79,6 +83,9 @@ static const char PROBE[] =
     "attempt('list /sys', lambda: os.listdir('/sys'))\n"
     "attempt('list /', lambda: os.listdir('/'))\n"
     "attempt('write /dev/null', lambda: open('/dev/null', 'w').write('x'))\n"
+    "attempt('open the pulse device', lambda: open('/dev/glowforge', 'rb').close())\n"
+    "attempt('open the settings file', lambda: open('/data/forgefirm/forgefirm.conf').close())\n"
+    "attempt('open the setup record', lambda: open('/data/forgefirm/setup.json').close())\n"
     "attempt('unix socket', lambda: socket.socket(socket.AF_UNIX))\n"
     "attempt('inet socket', lambda: socket.socket(socket.AF_INET))\n"
     "attempt('netlink socket', lambda: socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0))\n"
@@ -99,6 +106,41 @@ static void put_file(const char *path, const char *text, mode_t mode)
     fputs(text, f);
     fclose(f);
     chmod(path, mode);
+}
+
+/* The machine's own files a package must never open, with the probe's
+ * name for each. One the host lacks is made for the run (its directories
+ * too) and removed after; one that is there is left as it is. */
+static const char *const machine_files[][2] = {
+    { "/dev/glowforge", "open the pulse device" },
+    { "/data/forgefirm/forgefirm.conf", "open the settings file" },
+    { "/data/forgefirm/setup.json", "open the setup record" },
+};
+#define N_MACHINE_FILES (sizeof(machine_files) / sizeof(machine_files[0]))
+static int made_file[N_MACHINE_FILES], made_data, made_forgefirm;
+
+static void make_machine_files(void)
+{
+    if (access("/data", F_OK) != 0)
+        made_data = mkdir("/data", 0755) == 0;
+    if (access("/data/forgefirm", F_OK) != 0)
+        made_forgefirm = mkdir("/data/forgefirm", 0755) == 0;
+    for (size_t i = 0; i < N_MACHINE_FILES; i++)
+        if (access(machine_files[i][0], F_OK) != 0) {
+            put_file(machine_files[i][0], "", 0644);
+            made_file[i] = 1;
+        }
+}
+
+static void remove_machine_files(void)
+{
+    for (size_t i = 0; i < N_MACHINE_FILES; i++)
+        if (made_file[i])
+            unlink(machine_files[i][0]);
+    if (made_forgefirm)
+        rmdir("/data/forgefirm");
+    if (made_data)
+        rmdir("/data");
 }
 
 static int listener(int *port)
@@ -225,6 +267,7 @@ int main(void)
 
     if (pipe(pfd) != 0)
         return 2;
+    make_machine_files();
     int abi = sandbox_landlock_abi();
     printf("landlock ABI here: %d\n", abi);
     sandbox_cfg_t cfg = {
@@ -295,6 +338,12 @@ int main(void)
                                               "list /home", "list /sys", "list /" };
         for (size_t i = 0; i < sizeof(denied) / sizeof(denied[0]); i++)
             CHECK(atoi(field(line, denied[i])) == EACCES, "%s -> %s, expected EACCES", denied[i], field(line, denied[i]));
+        for (size_t i = 0; i < N_MACHINE_FILES; i++) {
+            const char *got = field(line, machine_files[i][1]);
+            printf("the machine's file %s (%s for the run), from inside: %s -> %s, expected EACCES (%d)\n",
+                   machine_files[i][0], made_file[i] ? "made" : "already there", machine_files[i][1], got, EACCES);
+            CHECK(atoi(got) == EACCES, "%s (%s) -> %s, expected EACCES", machine_files[i][1], machine_files[i][0], got);
+        }
         CHECK(atoi(field(line, "netlink socket")) == EPERM, "netlink socket -> %s, expected EPERM from the filter",
               field(line, "netlink socket"));
         if (abi >= 4)
@@ -340,6 +389,7 @@ int main(void)
     CHECK(cg_destroy(CG_TEST_PARENT, "org.example.bad") == 0, "destroy the second group");
     CHECK(cg_destroy(CG_TEST_PARENT, "org.example.never-made") == 0, "destroying a group that is not there is not an error");
     rmdir(CG_TEST_PARENT);
+    remove_machine_files();
 
     snprintf(line, sizeof(line), "rm -rf %s", top);
     if (system(line) != 0)
