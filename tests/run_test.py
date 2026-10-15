@@ -43,6 +43,11 @@ seventh, holding events and no grant, reads the host's ext.shutdown before
 safe mode stops it, unfrozen through that last second.
 Safe mode stops everything and leaves no group and no chain. SIGTERM does the
 same and the daemon exits 0.
+Last, the host runs under the init script's own wrapper (init/forgeext.init,
+lifted from the script and expanded as the script expands it): a SIGKILL of
+the host takes its services with it at once, and the wrapper starts the host
+again, which starts the service again under a new pid. This needs Landlock's
+network rules (ABI 4 or newer), which the host is not told to do without.
 
 Needs root, cgroup v2, nft, ip, nsenter, unshare, fwup (FWUP), the built
 forgeext (FORGEEXT), and the rule file (FFX_RULES). Exits 77 without them.
@@ -50,7 +55,9 @@ forgeext (FORGEEXT), and the rule file (FFX_RULES). Exits 77 without them.
 import http.server
 import json
 import os
+import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -451,6 +458,7 @@ def main():
                                                                  FORGEEXT_HOST_TOKEN_FILE=token_file))
 
     daemon = start_daemon()
+    wrapper = None
 
     def status():
         try:
@@ -896,10 +904,57 @@ def main():
         r = fx("remove", "org.example.crash")
         check(r.get("ok") is True and not os.listdir(marks), "removing the package takes its name out of the required holds: %s",
               os.listdir(marks))
+
+        print("under the init script's wrapper: a killed host takes its services with it, and the wrapper starts it again")
+        # The wrapper's own text, from the init script: the -c body, expanded with this run's daemon, fifo and pool the way
+        # the script's double quotes expand it. The daemon is a launcher that execs forgeext with this run's options and
+        # the wrapper's own "run"; the host is told nothing about Landlock, as on the machine.
+        with open(os.path.join(HERE, "..", "init", "forgeext.init")) as f:
+            body = re.search(r'-x /bin/sh -- -c "((?:[^"\\]|\\.)*)"', f.read(), re.S)
+        check(body, "the init script carries its wrapper")
+        launcher, fifo, script = (os.path.join(top, n) for n in ("forgeext-run", "forgeext.stderr", "wrapper.sh"))
+        with open(launcher, "w") as f:
+            f.write("#!/bin/sh\nexec env FFLOG_STDERR=1 FFLOG_SOCK=/nonexistent FORGEEXT_HOST_TOKEN_FILE=%s %s --root %s "
+                    "--fwup %s --nft %s \"$@\" --conf %s --safe-file %s --forgectrl 127.0.0.1:%d --cg-parent %s "
+                    "--run-dir %s --holds-dir %s --api-dir %s\n"
+                    % (shlex.quote(token_file), shlex.quote(FORGEEXT), shlex.quote(root), shlex.quote(FWUP),
+                       shlex.quote(NFT), shlex.quote(conf), shlex.quote(safe), fport, shlex.quote(CG_PARENT),
+                       shlex.quote(run_dir), shlex.quote(holds_dir), shlex.quote(api_dir)))
+        os.chmod(launcher, 0o755)
+        os.mkfifo(fifo, 0o600)
+        with open(script, "w") as f:
+            f.write("DAEMON=%s\nFIFO=%s\nPOOL=%s\nexec /bin/sh -c \"%s\"\n"
+                    % (shlex.quote(launcher), shlex.quote(fifo), shlex.quote(CG_PARENT), body.group(1) if body else ""))
+        wrapper = subprocess.Popen(["/bin/sh", script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        beat = "org.example.beat"
+        check(wait_for(lambda: svc(beat).get("state") == "running" and os.path.exists("/proc/%d" % status().get("pid", 0)), 40),
+              "the host under the wrapper runs the heartbeat: %s", svc(beat))
+        host1, beat1 = status().get("pid", 0), svc(beat).get("pid", 0)
+        os.kill(host1, signal.SIGKILL)
+        check(beat1 > 0 and wait_for(lambda: not os.path.exists("/proc/%d" % beat1), 2, poll=0.05),
+              "the host killed (pid %d), its service (pid %d) is gone at once", host1, beat1)
+        check(wait_for(lambda: status().get("pid") not in (None, host1) and os.path.exists("/proc/%d" % status()["pid"]), 20),
+              "the wrapper starts the host again: pid %s, was %d", status().get("pid"), host1)
+        check(wait_for(lambda: svc(beat).get("state") == "running" and svc(beat).get("pid") not in (None, beat1), 40),
+              "and the heartbeat runs again under a new pid: %s, was %d", svc(beat).get("pid"), beat1)
+        host2 = status().get("pid", 0)
+        wrapper.send_signal(signal.SIGTERM)
+        wrapper.wait(timeout=10)
+        check(wait_for(lambda: not os.path.exists("/proc/%d" % host2), 30)
+              and wait_for(lambda: not [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))], 10),
+              "stopping the wrapper stops the host (pid %d) and its services: groups %s", host2,
+              [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))])
         check(time.time() - t0 < 400, "the whole run took %.0f s", time.time() - t0)
     finally:
         if daemon.poll() is None:
             daemon.kill()
+        if wrapper is not None and wrapper.poll() is None:
+            wrapper.send_signal(signal.SIGTERM)
+            try:
+                wrapper.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                wrapper.kill()
         log.close()
         if failures:
             print("---- the daemon's log, its end ----")
