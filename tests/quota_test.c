@@ -6,8 +6,11 @@
  *
  * quota_of() over a manifest's capabilities, and quota_dir_bytes() over a
  * real tree: nested directories counted, a symbolic link out of the tree
- * counted as a link and never followed, and a sparse file counted by what
- * the filesystem gave it rather than by how large it claims to be.
+ * counted as a link and never followed, a sparse file counted by what
+ * the filesystem gave it rather than by how large it claims to be, and a
+ * measurement that did not complete (a tree deeper than the host
+ * measures, a directory it cannot read) read as -1 with the reason, never
+ * as nothing.
  */
 #include "../src/quota.h"
 
@@ -44,7 +47,7 @@ static void fill(const char *path, size_t bytes)
 
 int main(void)
 {
-    char root[128], p[256];
+    char root[128], p[256], why[300];
     manifest_t m;
 
     /* ---- what a package may hold ---- */
@@ -64,27 +67,29 @@ int main(void)
 
     /* ---- what it holds ---- */
     snprintf(root, sizeof(root), "/tmp/ffx-quota-test.%d", (int)getpid());
-    CHECK(quota_dir_bytes(root) == -1, "a directory that is not there reads as -1");
+    why[0] = '\0';
+    CHECK(quota_dir_bytes(root, why, sizeof(why)) == -1 && strstr(why, "cannot read"),
+          "a directory that is not there reads as -1, with the reason: %s", why);
     mkdir(root, 0700);
-    long long empty = quota_dir_bytes(root);
+    long long empty = quota_dir_bytes(root, why, sizeof(why));
     CHECK(empty == 0, "an empty directory holds nothing: %lld", empty);
 
     snprintf(p, sizeof(p), "%s/a", root);
     fill(p, 40 * 1024);
-    long long one = quota_dir_bytes(root);
+    long long one = quota_dir_bytes(root, why, sizeof(why));
     CHECK(one >= 40 * 1024 && one < 200 * 1024, "40 KiB of file reads as %lld bytes", one);
 
     snprintf(p, sizeof(p), "%s/sub", root);
     mkdir(p, 0700);
     snprintf(p, sizeof(p), "%s/sub/b", root);
     fill(p, 40 * 1024);
-    long long two = quota_dir_bytes(root);
+    long long two = quota_dir_bytes(root, why, sizeof(why));
     CHECK(two >= one + 40 * 1024, "a file in a subdirectory is counted too: %lld then %lld", one, two);
 
     /* A link out of the tree is a link, not what it points at. */
     snprintf(p, sizeof(p), "%s/link", root);
     if (symlink("/usr", p) == 0) {
-        long long three = quota_dir_bytes(root);
+        long long three = quota_dir_bytes(root, why, sizeof(why));
         CHECK(three < two + 64 * 1024, "a symbolic link to /usr was followed: %lld then %lld", two, three);
     } else {
         printf("(no symbolic link made: that case is not checked)\n");
@@ -98,10 +103,55 @@ int main(void)
             if (fseek(f, 64 * 1024 * 1024, SEEK_SET) == 0)
                 fputc('x', f);
             fclose(f);
-            long long four = quota_dir_bytes(root);
+            long long four = quota_dir_bytes(root, why, sizeof(why));
             CHECK(four < 8 * 1024 * 1024,
                   "a 64 MiB sparse file was counted by what it claims: %lld bytes", four);
         }
+    }
+
+    /* ---- what cannot be measured ---- */
+    /* A tree deeper than the host measures is not measured, and what is
+     * not measured is not nothing: -1, in words that say so. */
+    long long before = quota_dir_bytes(root, why, sizeof(why));
+    {
+        char chain[256];
+        snprintf(chain, sizeof(chain), "%s/deep", root);
+        mkdir(chain, 0700);
+        for (int i = 0; i < QUOTA_MAX_DEPTH + 1; i++) {
+            size_t k = strlen(chain);
+            snprintf(chain + k, sizeof(chain) - k, "/d");
+            mkdir(chain, 0700);
+        }
+        why[0] = '\0';
+        long long deep = quota_dir_bytes(root, why, sizeof(why));
+        CHECK(deep == -1 && strstr(why, "deeper"),
+              "a chain of %d directories reads as %lld, not -1 in words that say it is too deep: %s",
+              QUOTA_MAX_DEPTH + 2, deep, why);
+        char cmd[300];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s/deep", root);
+        if (system(cmd)) { }
+        long long again = quota_dir_bytes(root, why, sizeof(why));
+        CHECK(again == before, "the chain removed, the tree measures as before: %lld then %lld", before, again);
+    }
+    /* A directory the host cannot read is a measurement that did not
+     * complete, never a directory that holds nothing. Root reads every
+     * directory, so the case needs an unprivileged run. */
+    if (geteuid() != 0) {
+        snprintf(p, sizeof(p), "%s/shut", root);
+        mkdir(p, 0700);
+        snprintf(p, sizeof(p), "%s/shut/c", root);
+        fill(p, 40 * 1024);
+        snprintf(p, sizeof(p), "%s/shut", root);
+        chmod(p, 0);
+        why[0] = '\0';
+        long long shut = quota_dir_bytes(root, why, sizeof(why));
+        CHECK(shut == -1 && strstr(why, "cannot read"),
+              "an unreadable subdirectory reads as %lld, not -1 in words that say it cannot be read: %s", shut, why);
+        chmod(p, 0700);
+        long long readable = quota_dir_bytes(root, why, sizeof(why));
+        CHECK(readable >= before + 40 * 1024, "readable again, its file is counted: %lld then %lld", before, readable);
+    } else {
+        printf("(root: the unreadable directory is not checked)\n");
     }
 
     {

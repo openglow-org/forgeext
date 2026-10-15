@@ -24,11 +24,11 @@ programs to run: the file that is really in its data directory gets as far as
 the machine, and a symbolic link out of the directory and a name with a
 directory in it are refused in words before anything does. A killed service
 comes back. The one that keeps ending is quarantined, and state.json
-remembers it. One that holds more than its storage capability asks for is
-set aside, in words that say what it may hold, and runs again once its data
-is cleared and the operator enables it. A package granted sender.keep_out
-that asks to keep the Grbl sender out has its claim kept fresh beside the
-holds, until it is disabled.
+remembers it. One that holds more than its storage capability asks for, or
+whose data directory the host cannot measure, is set aside, in words that
+say why, and runs again once its data is cleared and the operator enables
+it. A package granted sender.keep_out that asks to keep the Grbl sender out
+has its claim kept fresh beside the holds, until it is disabled.
 A package that holds events has the host hold one stream from forgectrl: a
 poll at the head comes back empty at its deadline, a waiting one as soon as
 the stream carries an event, and with the package disabled the stream is let
@@ -720,6 +720,16 @@ def main():
         r = fx("enable", sid)
         check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running" and svc(sid)["pid"] != spid, 20),
               "its data cleared and enabled again, it runs again: %s %s", r.get("error", ""), svc(sid))
+
+        print("a data directory the host cannot measure is set aside too, and back once it can be")
+        os.makedirs(os.path.join(root, "data", sid, *["d"] * 18))  # deeper than the 16 directories the host walks
+        q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)
+        check(q and "could not be measured" in q.get("reason", ""),
+              "18 directories deep: set aside, in words that say why: %s", q or svc(sid))
+        shutil.rmtree(os.path.join(root, "data", sid, "d"))
+        r = fx("enable", sid)
+        check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running", 20),
+              "measurable again and enabled: it runs: %s %s", r.get("error", ""), svc(sid))
         check(fx("remove", sid).get("ok") is True, "and it goes")
 
         print("removed and installed again inside one turn of the host: started again from the new install")

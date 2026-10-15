@@ -35,15 +35,18 @@
 
 #define QUOTA_DEFAULT_MIB 16        /* a service that asks for no storage */
 #define QUOTA_EVERY_S     30.0
-#define QUOTA_MAX_DEPTH   16        /* deeper than this is not walked, and what is there is not counted */
+#define QUOTA_MAX_DEPTH   16        /* a tree deeper than this is not measured, and what is not measured sets the service aside */
 
 /* What a package may hold, in bytes: its `storage:<MiB>`, or the default. */
 long long quota_of(const manifest_t *m);
 
 /* The bytes a directory's tree holds, by the blocks the filesystem gave
  * it. Symbolic links are counted as links and never followed, so a link
- * out of the directory adds nothing and cannot be walked. -1 when the
- * directory cannot be read at all. */
-long long quota_dir_bytes(const char *path);
+ * out of the directory adds nothing and cannot be walked. -1, with the
+ * reason in err, when the measurement did not complete: the directory or
+ * one under it cannot be read, an entry cannot be examined for a reason
+ * other than its being gone, a path does not fit, or the tree is deeper
+ * than QUOTA_MAX_DEPTH. What is not measured is never taken for nothing. */
+long long quota_dir_bytes(const char *path, char *err, size_t elen);
 
 #endif
