@@ -9,12 +9,14 @@
  * counted as a link and never followed, a sparse file counted by what
  * the filesystem gave it rather than by how large it claims to be, and a
  * measurement that did not complete (a tree deeper than the host
- * measures, a directory it cannot read, a listing that fails part way)
- * read as -1 with the reason, never as nothing. A directory the package
- * removes between the walk's look at it and its open holds nothing now,
- * and the measurement completes without it. A tree whose path is longer
- * than PATH_MAX is measured like any other: the walk goes by descriptors,
- * not by a path it builds.
+ * measures, a directory it cannot read, a listing that fails part way, a
+ * directory swapped for a link between the walk's look at it and its
+ * open, a data directory that is itself a link) read as -1 with the
+ * reason, never as nothing. A directory the package removes between the
+ * walk's look at it and its open holds nothing now, and the measurement
+ * completes without it. A tree whose path is longer than PATH_MAX is
+ * measured like any other: the walk goes by descriptors, not by a path it
+ * builds.
  *
  * The walk's readdir and fstatat are stand-ins defined here, so that a
  * case can fail a listing or move a directory at the moment the walk
@@ -59,8 +61,10 @@ struct dirent *readdir(DIR *d)
 }
 
 /* The entry that the walk's next look moves, once that look has found a
- * directory: the package removes it before the walk opens it. */
+ * directory, before the walk opens it: the package removes it, or, with
+ * swap_to set, renames it away and puts a link to swap_to in its place. */
 static char moving[64];
+static const char *swap_to;
 static int moved;
 
 int fstatat(int fd, const char *restrict path, struct stat *restrict st, int flags)
@@ -70,8 +74,11 @@ int fstatat(int fd, const char *restrict path, struct stat *restrict st, int fla
         *(void **)&real = dlsym(RTLD_NEXT, "fstatat");
     int rc = real(fd, path, st, flags);
     if (rc == 0 && moving[0] && strcmp(path, moving) == 0 && S_ISDIR(st->st_mode)) {
+        char away[80];
         moving[0] = '\0';
-        moved = unlinkat(fd, path, AT_REMOVEDIR) == 0;
+        snprintf(away, sizeof(away), "%.60s.away", path);
+        moved = swap_to ? renameat(fd, path, fd, away) == 0 && symlinkat(swap_to, fd, path) == 0
+                        : unlinkat(fd, path, AT_REMOVEDIR) == 0;
     }
     return rc;
 }
@@ -229,6 +236,7 @@ int main(void)
         snprintf(p, sizeof(p), "%s/vanish", root);
         mkdir(p, 0700);
         snprintf(moving, sizeof(moving), "vanish");
+        swap_to = NULL;
         moved = 0;
         why[0] = '\0';
         long long gone = quota_dir_bytes(root, why, sizeof(why));
@@ -238,10 +246,54 @@ int main(void)
               base, moved, why);
         rmdir(p);
     }
+    /* A directory the package swaps for a link between the walk's look at
+     * it and its open is not followed: the open refuses the link, and the
+     * measurement did not complete. The link points at a directory of the
+     * test's own, outside the tree, with 40 KiB in it. */
+    char elsewhere[160];
+    snprintf(elsewhere, sizeof(elsewhere), "%s-elsewhere", root);
+    {
+        mkdir(elsewhere, 0700);
+        snprintf(p, sizeof(p), "%s/out", elsewhere);
+        fill(p, 40 * 1024);
+        snprintf(p, sizeof(p), "%s/swap", root);
+        mkdir(p, 0700);
+        snprintf(moving, sizeof(moving), "swap");
+        swap_to = elsewhere;
+        moved = 0;
+        why[0] = '\0';
+        long long swapped = quota_dir_bytes(root, why, sizeof(why));
+        moving[0] = '\0';
+        CHECK(moved && swapped == -1 && strstr(why, "changed while it was measured"),
+              "a directory swapped for a link between its look and its open reads as %lld (swapped: %d), not -1 in "
+              "words that say it changed: %s", swapped, moved, why);
+        unlink(p);
+        snprintf(p, sizeof(p), "%s/swap.away", root);
+        rmdir(p);
+    }
+    /* A data directory that is itself a link is not measured: the walk
+     * does not follow it to the tree behind it. */
+    {
+        char link[160];
+        snprintf(link, sizeof(link), "%s-link", root);
+        if (symlink(root, link) == 0) {
+            why[0] = '\0';
+            long long linked = quota_dir_bytes(link, why, sizeof(why));
+            CHECK(linked == -1 && strstr(why, "cannot read"),
+                  "a data directory that is a link reads as %lld, not -1 in words that say it cannot be read: %s",
+                  linked, why);
+            unlink(link);
+        } else {
+            CHECK(0, "no link to the tree was made");
+        }
+    }
 
     /* A path longer than the walk could hold is no reason not to measure
      * it: 16 directories of 255-byte names, made relative to a descriptor
-     * since their path is past PATH_MAX, with 40 KiB at the bottom. */
+     * since their path is past PATH_MAX, with 40 KiB at the bottom. The
+     * chain's own directories take blocks too, so the file is judged
+     * against the tree measured with the chain and without the file: only
+     * the file at the bottom can make up the 40 KiB. */
     {
         long long prior = quota_dir_bytes(root, why, sizeof(why));
         char name[256];
@@ -254,28 +306,33 @@ int main(void)
             dfd = next;
             made += next >= 0;
         }
+        long long chain = quota_dir_bytes(root, why, sizeof(why));
         int ffd = dfd >= 0 ? openat(dfd, "f", O_WRONLY | O_CREAT, 0600) : -1;
+        long long wrote = 0;
         if (ffd >= 0) {
             char block[4096];
             memset(block, 'x', sizeof(block));
-            for (int i = 0; i < 10; i++)
+            for (int i = 0; i < 10; i++) {
                 if (write(ffd, block, sizeof(block)) != (ssize_t)sizeof(block))
                     break;
+                wrote += (long long)sizeof(block);
+            }
             close(ffd);
         }
         if (dfd >= 0)
             close(dfd);
         why[0] = '\0';
         long long far = quota_dir_bytes(root, why, sizeof(why));
-        CHECK(made == QUOTA_MAX_DEPTH && ffd >= 0, "the long chain was made: %d directories, file %s", made,
-              ffd >= 0 ? "made" : "not made");
-        CHECK(far >= prior + 40 * 1024,
-              "40 KiB under 16 directories of 255-byte names reads as %lld after %lld: %s", far, prior, why);
+        CHECK(made == QUOTA_MAX_DEPTH && ffd >= 0 && wrote == 40 * 1024,
+              "the long chain was made: %d directories, %lld bytes written at the bottom", made, wrote);
+        CHECK(chain >= prior && far >= chain + 40 * 1024,
+              "40 KiB under 16 directories of 255-byte names reads as %lld after %lld (%lld before the chain): %s", far,
+              chain, prior, why);
     }
 
     {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "rm -rf %s", root);
+        char cmd[400];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s %s", root, elsewhere);
         if (system(cmd)) { }
     }
     printf("%s: quota_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
