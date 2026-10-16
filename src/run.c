@@ -887,6 +887,30 @@ static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
     free(text);
 }
 
+/* Every environment variable this program reads, in one place: the
+ * host's start notice names the ones that are set (names only), and
+ * run_test.py holds this list to the sources. They exist for the host
+ * tests and the harnesses; nothing on a machine sets one. */
+static const char *const ENV_OVERRIDES[] = {
+    "FFLOG_CONF", "FFLOG_LEVEL", "FFLOG_SOCK", "FFLOG_STDERR", "FORGEEXT_HOST_TOKEN_FILE",
+};
+
+static void say_env_overrides(void)
+{
+    char line[256];
+    size_t off = 0;
+    for (size_t i = 0; i < sizeof(ENV_OVERRIDES) / sizeof(*ENV_OVERRIDES); i++) {
+        if (!getenv(ENV_OVERRIDES[i]))
+            continue;
+        int n = snprintf(line + off, sizeof(line) - off, "%s%s", off ? " " : "", ENV_OVERRIDES[i]);
+        if (n < 0 || (size_t)n >= sizeof(line) - off)
+            break;
+        off += (size_t)n;
+    }
+    if (off)
+        fflog(LOG_NOTICE, "environment overrides in force: %s", line);
+}
+
 int run_daemon(const run_cfg_t *cfg)
 {
     static run_t r;
@@ -983,6 +1007,7 @@ int run_daemon(const run_cfg_t *cfg)
     }
     super_init(&sv, &OPS, &r);
     fflog(LOG_NOTICE, "started: extension root %s, groups under %s", cfg->ext.root, cfg->cg_parent);
+    say_env_overrides();
 
     int stopping = 0, turns = 0;
     double next = mono();

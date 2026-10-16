@@ -12,7 +12,9 @@ through the command line: a heartbeat, a dialer that declares one destination
 by name, one that ends at once, and one the operator let run through a job.
 The host's machine token is a file of the test's (FORGEEXT_HOST_TOKEN_FILE),
 and the stand-in takes a claim on the Grbl sender only with that token and
-serves the host's event stream.
+serves the host's event stream. As it starts, the host names that file's
+variable and the FFLOG_* ones set, in one notice, names only, and its list
+of them is held to the sources.
 
 Nothing starts while extensions are off or the machine is not ready. Then
 services start one at a time, each as its pool account in its own cgroup, with
@@ -342,6 +344,26 @@ def wait_for(cond, seconds, poll=0.25):
 
 
 def main():
+    # Before the namespace and the root gate, so that it runs anywhere: the
+    # host's list of environment variables, held to every getenv in the sources.
+    print("the start notice's list of environment variables, held to the sources")
+    src = os.path.join(HERE, "..", "src")
+    names, indirect = set(), set()
+    for name in sorted(os.listdir(src)):
+        if name.endswith((".c", ".h")):
+            text = open(os.path.join(src, name)).read()
+            names.update(re.findall(r'\bgetenv\(\s*"([A-Z][A-Z0-9_]*)"\s*\)', text))
+            indirect.update(re.findall(r'\bgetenv\(\s*(?!"|ENV_OVERRIDES\[)[^)]*\)', text))
+    table = re.search(r'ENV_OVERRIDES\[\] = \{(.*?)\};', open(os.path.join(src, "run.c")).read(), re.S)
+    env_vars = re.findall(r'"([A-Z][A-Z0-9_]*)"', table.group(1)) if table else []
+    check(table is not None, "run.c carries the list")
+    check(sorted(env_vars) == sorted(names) and len(env_vars) == len(set(env_vars)),
+          "the list is the sources' reads: %s", sorted(names))
+    check(not indirect, "every getenv names its variable: %s", sorted(indirect))
+    if failures:
+        print("FAIL: run_test, the list is not the sources'")
+        return 1
+
     if os.environ.get("FFX_RUN_NS") != "1":
         missing = [t for t in ("unshare", "nsenter", "ip", "mount") if not shutil.which(t)]
         need = {"forgeext": os.path.isfile(FORGEEXT), "fwup": bool(FWUP), "nft": os.path.isfile(NFT), "rules": os.path.isfile(RULES),
@@ -451,13 +473,14 @@ def main():
         f.write(TOKEN + "\n")
     os.chmod(token_file, 0o600)
 
+    daemon_env = dict(os.environ, FFLOG_STDERR="1", FFLOG_SOCK="/nonexistent", FORGEEXT_HOST_TOKEN_FILE=token_file)
+
     def start_daemon():
         return subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "run", "--conf", conf, "--safe-file", safe,
                                  "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir,
                                  "--holds-dir", holds_dir, "--api-dir", api_dir]
                                 + (["--landlock-fs-only"] if abi < 4 else []),
-                                stderr=log, stdout=log, env=dict(os.environ, FFLOG_STDERR="1", FFLOG_SOCK="/nonexistent",
-                                                                 FORGEEXT_HOST_TOKEN_FILE=token_file))
+                                stderr=log, stdout=log, env=daemon_env)
 
     daemon = start_daemon()
     wrapper = None
@@ -488,6 +511,12 @@ def main():
     try:
         print("off, then not ready")
         check(wait_for(lambda: status().get("pid") == daemon.pid, 10), "the status file names the host that wrote it")
+        want = sorted(n for n in env_vars if n in daemon_env)
+        check(wait_for(lambda: logged("environment overrides in force: "), 10), "the host names its overrides as it starts")
+        line = next((l for l in open(log_path).read().splitlines() if "environment overrides in force: " in l), "")
+        named = line.split("environment overrides in force: ", 1)[1].split() if line else []
+        check(sorted(named) == want and all(re.fullmatch(r"[A-Z][A-Z0-9_]*", n) for n in named),
+              "names only, the ones set and no other: %s", named)
         check(wait_for(lambda: status().get("off_reason"), 10) and not running(), "off: %s", status().get("off_reason"))
         check(sorted(os.listdir(root)) == ["data", "keys", "lock", "pkg", "required-holds", "settings",
                                            "state.json", "tmp"],
