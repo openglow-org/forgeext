@@ -391,10 +391,12 @@ def main():
     for name in sorted(os.listdir(src)):
         if name.endswith((".c", ".h")):
             text = open(os.path.join(src, name)).read()
-            names.update(re.findall(r'\bgetenv\(\s*"([A-Z][A-Z0-9_]*)"\s*\)', text))
-            indirect.update(re.findall(r'\bgetenv\(\s*(?!"|ENV_OVERRIDES\[)[^)]*\)', text))
+            # Every read, in every spelling C takes: secure_getenv too, a space before the parenthesis, a name in
+            # any case.
+            names.update(re.findall(r'\b(?:secure_)?getenv\s*\(\s*"([^"]+)"\s*\)', text))
+            indirect.update(re.findall(r'\b(?:secure_)?getenv\s*\(\s*(?!"|ENV_OVERRIDES\[)[^)]*\)', text))
     table = re.search(r'ENV_OVERRIDES\[\] = \{(.*?)\};', open(os.path.join(src, "run.c")).read(), re.S)
-    env_vars = re.findall(r'"([A-Z][A-Z0-9_]*)"', table.group(1)) if table else []
+    env_vars = re.findall(r'"([^"]+)"', table.group(1)) if table else []
     check(table is not None, "run.c carries the list")
     check(sorted(env_vars) == sorted(names) and len(env_vars) == len(set(env_vars)),
           "the list is the sources' reads: %s", sorted(names))
