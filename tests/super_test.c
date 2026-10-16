@@ -22,7 +22,12 @@
  * service aside instead of leaving it running, job-time limits that will
  * not take fall back to the freeze the grant lifted (and it is thawed
  * when the window closes), neither taking sets the service aside, and a
- * thaw that fails is tried again.
+ * thaw that fails is tried again. A quarantine whose write fails, for a
+ * freeze that will not take or for the fifth early end, holds the service
+ * out though every sync says it is wanted: the write is asked for again
+ * each tick and said once when it lands; the operator's lift (a new
+ * install or an enable, as the sync reads it or as the write finds it)
+ * lets the service out, and a destination the operator names does not.
  */
 #include "../src/super.h"
 
@@ -35,6 +40,7 @@ static int fails;
 static struct {
     int starts, stops, freezes, thaws, limits_on, limits_off, quarantines, healthies;
     int fail_start, fail_freeze, fail_limits;
+    int write_rc, rewrites;             /* what the quarantine's write answers, and how often it was asked again */
     pid_t next_pid;
     char last_started[64], last_quarantined[64], last_why[160];
 } w;
@@ -75,12 +81,17 @@ static int op_limits(void *ctx, svc_t *s, int on)
         w.limits_off++;
     return 0;
 }
-static void op_quarantine(void *ctx, svc_t *s, const char *why)
+static int op_quarantine(void *ctx, svc_t *s, const char *why, int again)
 {
     (void)ctx;
+    if (again) {
+        w.rewrites++;
+        return w.write_rc;
+    }
     w.quarantines++;
     snprintf(w.last_quarantined, sizeof(w.last_quarantined), "%s", s->id);
     snprintf(w.last_why, sizeof(w.last_why), "%s", why ? why : "");
+    return w.write_rc;
 }
 static void op_healthy(void *ctx, svc_t *s) { (void)ctx; (void)s; w.healthies++; }
 static void op_log(void *ctx, int prio, const char *text) { (void)ctx; (void)prio; (void)text; }
@@ -104,6 +115,18 @@ static void fresh(void)
     memset(&w, 0, sizeof(w));
     w.next_pid = 100;
     super_init(&sv, &ops, NULL);
+}
+
+/* One sync of the one service in the table, as run.c makes it: present,
+ * wanted as the state says, its lifts, and what it runs with. */
+static void sync_one(svc_t *s, int wanted, unsigned long long lifts, unsigned long long conf)
+{
+    super_sync_begin(&sv);
+    s->present = 1;
+    s->wanted = wanted;
+    s->lifts = lifts;
+    s->conf_wanted = conf;
+    super_sync_end(&sv);
 }
 
 int main(void)
@@ -361,6 +384,82 @@ int main(void)
           "%d starts, %d crashes", super_state_name(a->state), w.stops, w.starts, a->ncrashes);
     super_tick(&sv, &READY, 120);
     CHECK(a->state == SVC_RUNNING && w.stops == 1, "a service with nothing changed was stopped");
+
+    /* a quarantine whose write fails holds: the freeze's quarantine, and
+     * then every sync says the service is wanted, since the state does not
+     * say quarantined; it stays out, and the write is asked again each tick */
+    fresh();
+    a = add("org.example.a", 0);
+    a->lifts = 7;
+    w.write_rc = -1;
+    super_tick(&sv, &READY, 100);
+    w.fail_freeze = 1;
+    for (int i = 0; i < SUPER_POSTURE_TRIES; i++)
+        super_tick(&sv, &ARMED, 110 + i);
+    w.fail_freeze = 0;
+    CHECK(a->state == SVC_QUARANTINED && a->unwritten && w.quarantines == 1, "the freeze's quarantine, unwritten: %s %d",
+          super_state_name(a->state), a->unwritten);
+    for (int i = 0; i < 4; i++) {
+        sync_one(a, 1, 7, 0);
+        super_tick(&sv, &READY, 200 + i * SUPER_STAGGER_S);
+    }
+    CHECK(a->state == SVC_QUARANTINED && w.starts == 1 && w.rewrites == 4,
+          "an unwritten quarantine let the service out, or was not asked again each tick: %s, %d starts, %d asks",
+          super_state_name(a->state), w.starts, w.rewrites);
+    /* a destination the operator names lifts nothing */
+    sync_one(a, 1, 7, 2);
+    super_tick(&sv, &READY, 230);
+    CHECK(a->state == SVC_QUARANTINED && a->unwritten && w.starts == 1, "a destination lifted the quarantine: %s, %d starts",
+          super_state_name(a->state), w.starts);
+    /* the write lands: it stays quarantined, and it is not asked for again */
+    w.write_rc = 0;
+    sync_one(a, 1, 7, 2);
+    super_tick(&sv, &READY, 240);
+    sync_one(a, 0, 7, 2);                               /* the state says quarantined now */
+    super_tick(&sv, &READY, 250);
+    CHECK(a->state == SVC_QUARANTINED && !a->unwritten && w.rewrites == 6 && w.starts == 1,
+          "the write landed and it did not stay quarantined, or was asked again: %s, %d asks, %d starts",
+          super_state_name(a->state), w.rewrites, w.starts);
+
+    /* the fifth early end, unwritten, holds the same way; the operator's
+     * lift, a new install or an enable as the sync reads it, lets it out */
+    fresh();
+    a = add("org.example.a", 0);
+    a->lifts = 7;
+    w.write_rc = -1;
+    w.fail_start = 1;
+    now = 100;
+    for (int i = 0; i < SUPER_QUARANTINE_CRASHES; i++) {
+        super_tick(&sv, &READY, now);
+        now = (a->next_start > now ? a->next_start : now) + SUPER_STAGGER_S;
+    }
+    w.fail_start = 0;
+    CHECK(a->state == SVC_QUARANTINED && a->unwritten, "the crashes' quarantine, unwritten: %s %d",
+          super_state_name(a->state), a->unwritten);
+    sync_one(a, 1, 7, 0);
+    super_tick(&sv, &READY, now + 100);
+    CHECK(a->state == SVC_QUARANTINED && w.starts == 0, "an unwritten quarantine for ending let the service out: %s",
+          super_state_name(a->state));
+    sync_one(a, 1, 8, 0);                               /* installed again, or enabled: the lifts moved */
+    super_tick(&sv, &READY, now + 200);
+    CHECK(a->state == SVC_RUNNING && !a->unwritten && w.starts == 1, "the operator's lift did not let it out: %s",
+          super_state_name(a->state));
+
+    /* the operator's lift that the write finds, newer than the sync's
+     * read, lets it out too */
+    fresh();
+    a = add("org.example.a", 0);
+    a->lifts = 7;
+    w.write_rc = -1;
+    super_tick(&sv, &READY, 100);
+    super_quarantine(&sv, "org.example.a", "its data directory holds 2 MiB and it may hold 1");
+    CHECK(a->state == SVC_QUARANTINED && a->unwritten, "the measurement's quarantine, unwritten: %s %d",
+          super_state_name(a->state), a->unwritten);
+    w.write_rc = 1;
+    sync_one(a, 1, 7, 0);
+    super_tick(&sv, &READY, 200);
+    CHECK(a->state == SVC_RUNNING && !a->unwritten && w.starts == 2, "a lift the write found did not let it out: %s",
+          super_state_name(a->state));
 
     printf("%s: super_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

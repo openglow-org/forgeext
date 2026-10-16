@@ -141,11 +141,16 @@ int ext_check(const ext_env_t *env, const state_pkg_t *p, char *err, size_t elen
 int ext_lock(const ext_env_t *env, char *err, size_t elen);
 void ext_unlock(int lock);
 
-/* The daemon's two writes, each under the lock. A package that has run
+/* The daemon's writes, each under the lock. A package that has run
  * healthy once gives up the version it replaced; a package the supervisor
- * gave up on is remembered as quarantined (and let out by quarantined=0). */
+ * gave up on is remembered as quarantined (and let out by quarantined=0).
+ * ext_quarantine_if remembers it only while `still` accepts the package's
+ * record as it reads under the lock: 1, with nothing written, when `still`
+ * refuses it or the package is not installed. */
 int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen);
 int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
+int ext_quarantine_if(const ext_env_t *env, const char *id, int (*still)(const state_pkg_t *p, void *arg), void *arg,
+                      char *err, size_t elen);
 
 /* The owner's keys: the trust anchor the owner may replace. A key file
  * under <root>/keys is what makes a package community rather than
@@ -167,7 +172,7 @@ json_t *ext_keys_json(const ext_env_t *env);
  * its files, its data, its grants, and its account; its service is
  * stopped and its hold, of either kind, is gone: that is the operator's
  * exit. Enabling it again also lets it out of quarantine, because the
- * operator has looked at it. */
+ * operator has looked at it, and counts the enable (state_pkg_t enables). */
 int ext_set_enabled(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
 
 /* Mark a package's hold required or advisory. Only a package that has the

@@ -8,7 +8,8 @@
  * place. It holds what no package can say about itself: which key signed
  * it (an update must verify under the same one), which account of the
  * pool it runs as, what the operator granted it, the destinations the
- * operator named for it, and whether it is enabled or quarantined.
+ * operator named for it, whether it is enabled or quarantined, and how
+ * many times the operator has enabled it.
  */
 #ifndef FORGEEXT_STATE_H
 #define FORGEEXT_STATE_H
@@ -34,6 +35,11 @@ typedef struct {
     int slot;                       /* the pool account, or -1 for a package with no service */
     int enabled;
     int quarantined;
+    /* How many times the operator has enabled it: an enable lifts a
+     * quarantine, and the count is how the host tells an enable that came
+     * after a quarantine it could not write. 0 in a state written before
+     * it was kept. */
+    unsigned enables;
     int hold_required;              /* the operator marked its hold required: it fails closed (holdkeep.h) */
     char grants[MANIFEST_MAX_CAPS][CAP_MAX_LEN];
     int ngrants;

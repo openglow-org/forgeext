@@ -30,13 +30,15 @@ remembers it. One that holds more than its storage capability asks for, or
 whose data directory the host cannot measure, is set aside, in words that
 say why, and runs again once its data is cleared and the operator enables
 it; a quarantine the host could not write holds all the same, and is
-written as soon as it can be. One whose manifest cannot be read is set
-aside too, with the way out that fits it: remove the package and install
-it again. A package the operator removes inside the turn that measures
-it, after the host has read the state and before it measures, is not set
-aside by the measurement its removal breaks. A package granted
-sender.keep_out that asks to keep the Grbl sender out has its claim kept
-fresh beside the holds, until it is disabled.
+written as soon as it can be. A destination the operator names in the
+meantime does not lift it. The operator's enable lifts it, and the host
+does not write the quarantine over that enable. One whose manifest cannot
+be read is set aside too, with the way out that fits it: remove the
+package and install it again. A package the operator removes inside the
+turn that measures it, after the host has read the state and before it
+measures, is not set aside by the measurement its removal breaks. A
+package granted sender.keep_out that asks to keep the Grbl sender out has
+its claim kept fresh beside the holds, until it is disabled.
 A package that holds events has the host hold one stream from forgectrl: a
 poll at the head comes back empty at its deadline, a waiting one as soon as
 the stream carries an event, and with the package disabled the stream is let
@@ -61,6 +63,7 @@ Needs root, cgroup v2, nft, ip, nsenter, unshare, fwup (FWUP), the built
 forgeext (FORGEEXT), and the rule file (FFX_RULES). Exits 77 without them.
 """
 import ctypes
+import fcntl
 import http.server
 import json
 import os
@@ -780,9 +783,26 @@ def main():
             log.flush()
             return len(open(log_path).read())
 
+        def pause_clear_of_lock():
+            """SIGSTOP the host at a moment it does not hold the root's lock, which it takes every turn to write a
+            quarantine it could not write before: the command line can then take the lock while the host is stopped."""
+            for _ in range(100):
+                os.kill(daemon.pid, signal.SIGSTOP)
+                wait_for(lambda: open("/proc/%d/stat" % daemon.pid).read().rsplit(")", 1)[1].split()[0] == "T", 2, poll=0.01)
+                with open(os.path.join(root, "lock"), "a") as lf:
+                    try:
+                        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(lf, fcntl.LOCK_UN)
+                        return True
+                    except OSError:
+                        pass
+                os.kill(daemon.pid, signal.SIGCONT)
+                time.sleep(0.05)
+            return False
+
         print("over its storage quota: set aside, and back once its data is cleared and it is enabled")
         sid = "org.example.store"
-        package(sid, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["storage:1"])
+        package(sid, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["storage:1", "net.outbound.operator"])
         check(wait_for(lambda: svc(sid).get("state") == "running", 40), "it runs: %s", svc(sid))
         spid = svc(sid).get("pid", 0)
         blocker = os.path.join(root, "state.json.new")
@@ -803,23 +823,46 @@ def main():
         check(wait_for(lambda: svc(sid).get("state") != "quarantined" or svc(sid).get("pid"), 12, poll=0.5) is None
               and not remembered(), "unwritten for 12 s: still set aside with no process, and state.json does not say so: %s",
               svc(sid))
-        os.rmdir(blocker)
-        check(wait_for(remembered, 5) and logged("its quarantine is written now"),
-              "the way clear, the write lands at the next turn and the host says so")
+        # The way clears, and the operator names a destination for it before the host's next turn: a destination
+        # lifts no quarantine, so the host's write lands all the same.
+        at = mark()
+        paused = pause_clear_of_lock()
+        try:
+            os.rmdir(blocker)
+            r = fx("dest", sid, "add", "%s:41741" % PEER_ADDR) if paused else {"error": "the host held the lock"}
+        finally:
+            os.kill(daemon.pid, signal.SIGCONT)
+        check(r.get("ok") is True and wait_for(remembered, 5) and since(at, "its quarantine is written now")
+              and not since(at, "%s: started as" % sid),
+              "the way clear and a destination named, the write lands at the next turn and the host says so: %s",
+              r.get("error", ""))
         os.unlink(big)
         r = fx("enable", sid)
         check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running" and svc(sid)["pid"] != spid, 20),
               "its data cleared and enabled again, it runs again: %s %s", r.get("error", ""), svc(sid))
 
         print("a data directory the host cannot measure is set aside too, and back once it can be")
+        at = mark()
+        os.mkdir(blocker)
         os.makedirs(os.path.join(root, "data", sid, *["d"] * 18))  # deeper than the 16 directories the host walks
         q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)
-        check(q and "could not be measured" in q.get("reason", ""),
-              "18 directories deep: set aside, in words that say why: %s", q or svc(sid))
-        shutil.rmtree(os.path.join(root, "data", sid, "d"))
-        r = fx("enable", sid)
-        check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running", 20),
-              "measurable again and enabled: it runs: %s %s", r.get("error", ""), svc(sid))
+        check(q and "could not be measured" in q.get("reason", "") and wait_for(lambda: since(at, "could not be written"), 5),
+              "18 directories deep: set aside, in words that say why, and unwritten: %s", q or svc(sid))
+        # The operator clears it, then enables it, before the host's next turn: the enable lifts the quarantine the
+        # host has not written, and the host does not write it over the enable.
+        at = mark()
+        paused = pause_clear_of_lock()
+        try:
+            os.rmdir(blocker)
+            shutil.rmtree(os.path.join(root, "data", sid, "d"))
+            r = fx("enable", sid) if paused else {"error": "the host held the lock"}
+        finally:
+            os.kill(daemon.pid, signal.SIGCONT)
+        looks = []
+        ran = wait_for(lambda: looks.append(remembered()) or svc(sid).get("state") == "running", 20, poll=0.2)
+        check(r.get("ok") is True and ran and not any(looks) and not since(at, "its quarantine is written now"),
+              "cleared and enabled before the host's turn: it runs, and state.json never said quarantined: %s %s %s",
+              r.get("error", ""), svc(sid), looks.count(True))
 
         print("a manifest the host cannot read is set aside too, with the way out that fits it")
         walks = opens_of(os.path.join(root, "data", "org.example.beat"))   # the host's measurements, from here on

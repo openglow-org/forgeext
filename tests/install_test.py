@@ -306,7 +306,8 @@ def background_page(t):
 
 def the_page(t):
     """forgeext ui: the page an installed package shipped, byte for byte, and none for a package that is
-    not installed or that the operator disabled."""
+    not installed or that the operator disabled. And the operator's enable, counted in state.json, which is
+    how the host tells an enable that came after a quarantine it could not write."""
     P = "org.example.page"
     tree = t.tree(manifest(P, runtime="ui", caps=["ui"]),
                   {"ui/index.html": ("<!doctype html>\n<p class=\"a\">été \\ 'q'\t</p>\n<script>x = \"</p>\";</script>\n",
@@ -323,6 +324,14 @@ def the_page(t):
     r = t.run("ui", P)
     check(r.get("ok") is False and r.get("error") == "this package is disabled: its interface is not served" and "html" not in r,
           "disabled -> %s" % r.get("error"))
+
+    def record():
+        with open(os.path.join(t.root, "state.json")) as f:
+            return json.load(f)["packages"][P]
+    before = record().get("enables")
+    check(t.run("enable", P).get("ok") is True and before == 0 and record().get("enables") == 1
+          and t.run("enable", P).get("ok") is True and record().get("enables") == 2,
+          "every enable is counted: %s, then %s" % (before, record()))
     check(t.run("remove", P).get("ok") is True, "the package goes")
 
 

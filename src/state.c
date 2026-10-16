@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <jansson.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -137,6 +138,12 @@ static int pkg_from_json(const char *id, json_t *j, state_pkg_t *p)
     p->slot = (int)json_integer_value(slot);
     p->enabled = json_is_true(json_object_get(j, "enabled"));
     p->quarantined = json_is_true(json_object_get(j, "quarantined"));
+    /* Absent in a state written before the count was kept. */
+    json_t *enables = json_object_get(j, "enables");
+    if (enables && (!json_is_integer(enables) || json_integer_value(enables) < 0
+                    || json_integer_value(enables) > (json_int_t)UINT_MAX))
+        return -1;
+    p->enables = enables ? (unsigned)json_integer_value(enables) : 0;
     p->hold_required = json_is_true(json_object_get(j, "hold_required"));
     json_t *grants = json_object_get(j, "grants");
     if (!json_is_array(grants) || json_array_size(grants) > MANIFEST_MAX_CAPS)
@@ -223,6 +230,7 @@ int state_save(const char *root, const state_t *s, char *err, size_t elen)
         json_object_set_new(j, "slot", json_integer(p->slot));
         json_object_set_new(j, "enabled", json_boolean(p->enabled));
         json_object_set_new(j, "quarantined", json_boolean(p->quarantined));
+        json_object_set_new(j, "enables", json_integer((json_int_t)p->enables));
         json_object_set_new(j, "hold_required", json_boolean(p->hold_required));
         for (int k = 0; k < p->ngrants; k++)
             json_array_append_new(grants, json_string(p->grants[k]));

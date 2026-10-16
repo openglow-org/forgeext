@@ -90,6 +90,35 @@ static void why(svc_t *s, const char *fmt, ...)
     va_end(ap);
 }
 
+/* Writes a quarantine where it outlives a restart. One whose write fails
+ * is held here (hold()). It was set aside under the lifts of the last
+ * sync, or under the newer ones the operation read where it writes. */
+static void remember(super_t *sv, svc_t *s)
+{
+    s->aside_lifts = s->lifts;
+    s->unwritten = sv->ops->quarantine && sv->ops->quarantine(sv->ctx, s, s->reason, 0) < 0;
+}
+
+/* A quarantine whose write failed keeps the service quarantined, whatever
+ * the state says of it: the write is asked for again each tick, until it
+ * lands or until the operator lifts the quarantine first, with a new
+ * install or an enable. */
+static void hold(super_t *sv, svc_t *s)
+{
+    int r = s->lifts != s->aside_lifts ? 1 : sv->ops->quarantine(sv->ctx, s, s->reason, 1);
+    if (r < 0) {
+        s->wanted = 0;
+        return;
+    }
+    s->unwritten = 0;
+    if (r == 0) {
+        s->wanted = 0;                                  /* until a sync reads what was written */
+        say(sv, LOG_NOTICE, "%s: its quarantine is written now", s->id);
+    } else {
+        say(sv, LOG_NOTICE, "%s: the operator lifted its quarantine before it could be written", s->id);
+    }
+}
+
 /* A deliberate stop: not a crash, and no backoff. */
 static void stop(super_t *sv, svc_t *s, const char *reason)
 {
@@ -116,8 +145,7 @@ int super_quarantine(super_t *sv, const char *id, const char *reason)
         s->wanted = 0;                                  /* until a sync finds the operator has let it out */
         snprintf(s->reason, sizeof(s->reason), "%s", reason);
         say(sv, LOG_ERR, "%s: %s", s->id, s->reason);
-        if (sv->ops->quarantine)
-            sv->ops->quarantine(sv->ctx, s, s->reason);
+        remember(sv, s);
         return 1;
     }
     return 0;
@@ -147,8 +175,7 @@ static void crashed(super_t *sv, svc_t *s, double now, const char *how)
         why(s, "quarantined: it ended %d times in %d minutes (%s)", SUPER_QUARANTINE_CRASHES,
             (int)(SUPER_QUARANTINE_WINDOW_S / 60), how);
         say(sv, LOG_ERR, "%s: %s", s->id, s->reason);
-        if (sv->ops->quarantine)
-            sv->ops->quarantine(sv->ctx, s, s->reason);
+        remember(sv, s);
         return;
     }
     s->backoff_s = s->backoff_s < SUPER_BACKOFF_MIN_S ? SUPER_BACKOFF_MIN_S : s->backoff_s * 2;
@@ -264,6 +291,9 @@ static int mode_fits(const svc_t *s, const super_inputs_t *in)
 
 void super_tick(super_t *sv, const super_inputs_t *in, double now)
 {
+    for (int i = 0; i < sv->n; i++)
+        if (sv->svc[i].unwritten)
+            hold(sv, &sv->svc[i]);
     if (!in->enabled) {
         super_stop_all(sv, in->off_reason ? in->off_reason : "extensions are off");
         return;

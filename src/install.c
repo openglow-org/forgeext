@@ -791,7 +791,11 @@ int ext_required_holds_sync(const ext_env_t *env, const state_t *st)
     return bad ? -1 : 0;
 }
 
-static int change(const ext_env_t *env, const char *id, int drop_previous, int quarantined, char *err, size_t elen)
+/* With `still`, the change is made only to a record that `still` accepts
+ * as it reads under the lock, and 1 is returned, with nothing written,
+ * for one it refuses or for a package that is not installed. */
+static int change(const ext_env_t *env, const char *id, int drop_previous, int quarantined,
+                  int (*still)(const state_pkg_t *p, void *arg), void *arg, char *err, size_t elen)
 {
     char pkgdir[340];
     state_t *st = calloc(1, sizeof(*st));
@@ -802,6 +806,10 @@ static int change(const ext_env_t *env, const char *id, int drop_previous, int q
         state_pkg_t *p = state_find(st, id);
         if (!p) {
             fail(err, elen, "%s is not installed", id);
+            if (still)
+                rc = 1;
+        } else if (still && !still(p, arg)) {
+            rc = 1;
         } else {
             if (drop_previous && p->previous[0]) {
                 snprintf(pkgdir, sizeof(pkgdir), "%.255s/pkg/%.63s", env->root, id);
@@ -820,12 +828,18 @@ static int change(const ext_env_t *env, const char *id, int drop_previous, int q
 
 int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen)
 {
-    return change(env, id, 1, -1, err, elen);
+    return change(env, id, 1, -1, NULL, NULL, err, elen);
 }
 
 int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen)
 {
-    return change(env, id, 0, on ? 1 : 0, err, elen);
+    return change(env, id, 0, on ? 1 : 0, NULL, NULL, err, elen);
+}
+
+int ext_quarantine_if(const ext_env_t *env, const char *id, int (*still)(const state_pkg_t *p, void *arg), void *arg,
+                      char *err, size_t elen)
+{
+    return change(env, id, 0, 1, still, arg, err, elen);
 }
 
 /* A key's name: what may be a file name under the keys directory, and
@@ -912,8 +926,10 @@ int ext_set_enabled(const ext_env_t *env, const char *id, int on, char *err, siz
             fail(err, elen, "%s is not installed", id);
         } else {
             p->enabled = on ? 1 : 0;
-            if (on)
+            if (on) {
                 p->quarantined = 0;
+                p->enables++;                           /* how the host tells this enable from what came before it */
+            }
             rc = state_save(env->root, st, err, elen);
             if (rc == 0 && ext_required_holds_sync(env, st) != 0)
                 rc = fail(err, elen, "the required holds under %s could not be made to match", env->root);

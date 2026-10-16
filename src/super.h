@@ -29,6 +29,16 @@
  *     SUPER_QUARANTINE_CRASHES times inside SUPER_QUARANTINE_WINDOW_S
  *     without getting that far is quarantined, and stays so until the
  *     operator says otherwise. A start that fails is a crash.
+ *   A quarantine, whatever set it, is written where it outlives a restart.
+ *     One whose write fails holds all the same: the service stays
+ *     quarantined and the write is asked for again each tick, until it
+ *     lands or until the operator lifts the quarantine first, with a new
+ *     install or an enable. A destination the operator names lifts
+ *     nothing. A host that ends before the write lands forgets it, and the
+ *     service runs again until its cause sets it aside again: the next
+ *     measurement for its storage, SUPER_QUARANTINE_CRASHES more early
+ *     ends for a crash, and SUPER_POSTURE_TRIES turns of the next armed
+ *     window for a freeze.
  *   A service that should not run (disabled, removed, quarantined, the
  *     wrong controller mode, extensions off) is stopped; its end is not a
  *     crash.
@@ -78,6 +88,13 @@ typedef struct {
      * it; a running service whose two differ is stopped and started again
      * outside an armed window, and that is no crash. */
     unsigned long long conf_wanted, conf_started;
+    /* The operator's lifts of a quarantine, as a digest the sync sets: the
+     * install (its version, and its stamp) and the count of the operator's
+     * enables. A quarantine whose write failed (unwritten) holds until it
+     * is written, or until lifts moves from aside_lifts, its value when the
+     * service was set aside. */
+    unsigned long long lifts, aside_lifts;
+    int unwritten;
     double started, next_start, backoff_s;
     double crashes[SUPER_QUARANTINE_CRASHES];
     int ncrashes;
@@ -97,7 +114,13 @@ typedef struct {
     void (*stop)(void *ctx, svc_t *s);                              /* kill, and take its group and its rules away */
     int (*freeze)(void *ctx, svc_t *s, int on);
     int (*job_limits)(void *ctx, svc_t *s, int on);
-    void (*quarantine)(void *ctx, svc_t *s, const char *why);       /* remember it across restarts */
+    /* Writes the quarantine where it outlives a restart. 0: written. -1:
+     * not written, and the policy holds the service and asks again each
+     * tick (again set). 1: nothing to write, because the package is not
+     * installed or, asked again, the operator lifted the quarantine since
+     * aside_lifts. The first ask may set aside_lifts to the lifts it reads
+     * where it writes. */
+    int (*quarantine)(void *ctx, svc_t *s, const char *why, int again);
     void (*healthy)(void *ctx, svc_t *s);
     void (*log)(void *ctx, int prio, const char *text);
 } super_ops_t;
@@ -114,7 +137,7 @@ void super_init(super_t *sv, const super_ops_t *ops, void *ctx);
 
 /* The service for a package, made when new. NULL when the table is full.
  * A sync clears `present` everywhere, sets each installed package's facts
- * (present, slot, job_time, modes, wanted), and then forgets: a package
+ * (present, slot, job_time, modes, wanted, lifts), and then forgets: a package
  * that is gone is unwanted at once, and leaves the table when it has
  * stopped. */
 svc_t *super_service(super_t *sv, const char *id);
@@ -127,8 +150,9 @@ void super_stop_all(super_t *sv, const char *why);
 
 /* Set one service aside for a reason of the caller's, as the supervisor
  * sets aside one that keeps ending: it is stopped, it is remembered as
- * quarantined across restarts, and the operator's enable is what lets it
- * out. 0 when there is no such running service. */
+ * quarantined across restarts (or held, while that write fails), and the
+ * operator's enable is what lets it out. 0 when there is no such running
+ * service. */
 int super_quarantine(super_t *sv, const char *id, const char *why);
 
 int super_running(const super_t *sv);

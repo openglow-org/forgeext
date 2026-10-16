@@ -62,12 +62,6 @@ typedef struct {
     int ndropped;
     int window, enabled;                        /* at the last turn: the armed window, and extensions on */
     double grace_until;                         /* services stop after this: ext.shutdown's second to be read */
-    /* A quarantine the host could not write, per pool slot: its reason,
-     * and the install (conf_wanted) it was set on. */
-    struct {
-        char reason[160];
-        unsigned long long conf;
-    } aside_unwritten[STATE_POOL_SIZE];
 } run_t;
 
 #define SHUTDOWN_GRACE_S 1.0
@@ -383,27 +377,41 @@ static int op_job_limits(void *ctx, svc_t *s, int on)
     return cg_limits(r->cfg->cg_parent, s->id, on ? &JOB_LIMITS : &LIMITS, NULL, 0);
 }
 
-/* The quarantine is remembered in state.json. One that cannot be
- * written there (a full /data) holds here all the same: the reason and
- * the install it was set on are kept per pool slot, and the sync keeps
- * the service unwanted and writes it again every turn until it lands. A
- * host that ends before then forgets it, and the next measurement sets
- * the service aside again. */
-static void op_quarantine(void *ctx, svc_t *s, const char *why)
+static unsigned long long lifts_digest(const state_pkg_t *p);
+
+/* What the quarantine's write checks under the lock. The first ask
+ * checks nothing and keeps the lifts it reads, as those the service was
+ * set aside under; asked again, the record's lifts must still be those. */
+typedef struct {
+    svc_t *s;
+    int again;
+} aside_t;
+
+static int still_aside(const state_pkg_t *p, void *arg)
+{
+    aside_t *a = arg;
+    if (a->again)
+        return lifts_digest(p) == a->s->aside_lifts;
+    a->s->aside_lifts = lifts_digest(p);
+    return 1;
+}
+
+/* The quarantine is remembered in state.json. A write that fails (a full
+ * /data) is the policy's to hold (super.c), and it asks again each turn.
+ * Asked again, the write lands only on the record the service was set
+ * aside under, so an install or an enable that came after it is never
+ * written over. */
+static int op_quarantine(void *ctx, svc_t *s, const char *why, int again)
 {
     run_t *r = ctx;
     char err[200];
-    int slot = s->slot >= 0 && s->slot < STATE_POOL_SIZE ? s->slot : -1;
-    if (ext_set_quarantined(&r->cfg->ext, s->id, 1, err, sizeof(err)) == 0) {
-        if (slot >= 0)
-            r->aside_unwritten[slot].reason[0] = '\0';
-        return;
-    }
-    fflog(LOG_ERR, "%s: the quarantine could not be written (%s): it stays in force until it is", s->id, err);
-    if (slot >= 0) {
-        snprintf(r->aside_unwritten[slot].reason, sizeof(r->aside_unwritten[slot].reason), "%s", why);
-        r->aside_unwritten[slot].conf = s->conf_wanted;
-    }
+    aside_t a = { s, again };
+    (void)why;                                          /* the policy keeps it, in s->reason */
+    int rc = ext_quarantine_if(&r->cfg->ext, s->id, still_aside, &a, err, sizeof(err));
+    if (rc < 0 && !again)
+        fflog(LOG_ERR, "%s: the quarantine could not be written (%s): it stays in force until it is, or until the "
+              "operator lifts it", s->id, err);
+    return rc;
 }
 
 static void op_healthy(void *ctx, svc_t *s)
@@ -771,19 +779,10 @@ static void holds_turn(run_t *r, const super_t *sv, const super_inputs_t *in)
 _Static_assert(EXT_DESTS_MAX <= NET_MAX_DESTS && EXT_DESTS_MAX <= SANDBOX_MAX_PORTS - 1 && API_MAX_DESTS >= NET_MAX_DESTS,
                "a service's destinations fit the rule table, the sandbox's ports (the resolver's besides), and its answer");
 
-/* What a service runs with, as the supervisor compares it: its install
- * (the version, and the stamp every install writes anew, so a package
- * removed and installed again between two turns is not taken for the one
- * still running) and the operator's destinations, in order (FNV-1a). */
-static unsigned long long conf_digest(const state_pkg_t *p)
+/* FNV-1a over the parts in order. */
+static unsigned long long digest(const char *const *parts, int n)
 {
     unsigned long long h = 1469598103934665603ULL;
-    const char *parts[2 + STATE_MAX_DESTS];
-    int n = 0;
-    parts[n++] = p->version;
-    parts[n++] = p->stamp;
-    for (int i = 0; i < p->ndests; i++)
-        parts[n++] = p->dests[i];
     for (int i = 0; i < n; i++)
         for (const unsigned char *c = (const unsigned char *)parts[i];; c++) {
             h = (h ^ *c) * 1099511628211ULL;            /* the NUL too: it keeps "ab","c" from "a","bc" */
@@ -791,6 +790,32 @@ static unsigned long long conf_digest(const state_pkg_t *p)
                 break;
         }
     return h;
+}
+
+/* What a service runs with, as the supervisor compares it: its install
+ * (the version, and the stamp every install writes anew, so a package
+ * removed and installed again between two turns is not taken for the one
+ * still running) and the operator's destinations, in order. */
+static unsigned long long conf_digest(const state_pkg_t *p)
+{
+    const char *parts[2 + STATE_MAX_DESTS];
+    int n = 0;
+    parts[n++] = p->version;
+    parts[n++] = p->stamp;
+    for (int i = 0; i < p->ndests; i++)
+        parts[n++] = p->dests[i];
+    return digest(parts, n);
+}
+
+/* The operator's lifts of a quarantine, as the supervisor compares them:
+ * the install, and the count of the operator's enables. A destination the
+ * operator names lifts nothing. */
+static unsigned long long lifts_digest(const state_pkg_t *p)
+{
+    char enables[16];
+    snprintf(enables, sizeof(enables), "%u", p->enables);
+    const char *const parts[] = { p->version, p->stamp, enables };
+    return digest(parts, 3);
 }
 
 /* What is installed, into the policy's table. */
@@ -818,30 +843,13 @@ static void sync_installed(run_t *r, super_t *sv)
         s->hold_required = s->hold && p->hold_required;
         s->pkg_enabled = p->enabled;
         s->conf_wanted = conf_digest(p);
+        s->lifts = lifts_digest(p);
         if (s->state != SVC_RUNNING && ext_manifest_of(&r->cfg->ext, p->id, &m, err, sizeof(err)) == 0) {
             s->mode_grbl = m.mode_grbl;
             s->mode_cloud = m.mode_cloud;
             s->mcodes = mcodes_of(&m);
         }
         s->wanted = p->enabled && !p->quarantined;
-        /* A quarantine the host could not write holds until it is
-         * written: one attempt a turn, said once when it lands, and
-         * dropped for an install that is not the one it was set on. */
-        if (s->slot < STATE_POOL_SIZE && r->aside_unwritten[s->slot].reason[0]) {
-            char *held = r->aside_unwritten[s->slot].reason;
-            if (r->aside_unwritten[s->slot].conf != s->conf_wanted) {
-                held[0] = '\0';
-            } else {
-                s->wanted = 0;
-                if (ext_set_quarantined(&r->cfg->ext, p->id, 1, err, sizeof(err)) == 0) {
-                    held[0] = '\0';
-                    fflog(LOG_NOTICE, "%s: its quarantine is written now", p->id);
-                } else if (s->state != SVC_RUNNING && s->state != SVC_QUARANTINED) {
-                    s->state = SVC_QUARANTINED;
-                    snprintf(s->reason, sizeof(s->reason), "%s", held);
-                }
-            }
-        }
         if (p->quarantined && s->state != SVC_RUNNING && s->state != SVC_QUARANTINED) {
             s->state = SVC_QUARANTINED;
             if (!s->reason[0])

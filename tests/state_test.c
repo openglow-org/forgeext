@@ -5,12 +5,14 @@
  * SPDX-License-Identifier: MIT
  *
  * Cases: a root with no file is an empty state; what is saved is what
- * loads, field for field; the pool hands out the lowest free account and
- * none past the thirty-second; removal frees the account; and a file this
- * daemon did not write is refused whole: another schema, an id that is
- * not one, a tier that does not exist, a key on an unverified package or
- * none on a signed one, an account outside the pool, two packages on one
- * account, a grant for a capability that needs none.
+ * loads, field for field, the count of the operator's enables included
+ * (none in a state written before it was kept); the pool hands out the
+ * lowest free account and none past the thirty-second; removal frees the
+ * account; and a file this daemon did not write is refused whole: another
+ * schema, an id that is not one, a tier that does not exist, a key on an
+ * unverified package or none on a signed one, an account outside the
+ * pool, two packages on one account, a grant for a capability that needs
+ * none, a count of enables that is not a count.
  */
 #include "../src/state.h"
 
@@ -59,6 +61,7 @@ int main(void)
     snprintf(a->key_id, sizeof(a->key_id), KEY64);
     a->slot = state_slot_free(&s);
     a->enabled = 1;
+    a->enables = 3;
     snprintf(a->grants[a->ngrants++], CAP_MAX_LEN, "hold");
     snprintf(a->grants[a->ngrants++], CAP_MAX_LEN, "motion.job");
     snprintf(a->dests[a->ndests++], CAP_MAX_LEN, "plug.lan:80");
@@ -85,6 +88,7 @@ int main(void)
         CHECK(la->ndests == 2 && strcmp(la->dests[0], "plug.lan:80") == 0 && strcmp(la->dests[1], "[2001:db8::7]:1883") == 0,
               "the operator's destinations, in order: %d", la->ndests);
         CHECK(strcmp(la->stamp, a->stamp) == 0 && !lb->stamp[0], "the stamps came back: \"%s\" \"%s\"", la->stamp, lb->stamp);
+        CHECK(la->enables == 3 && lb->enables == 0, "the counts of enables came back: %u %u", la->enables, lb->enables);
         CHECK(lb->tier == TIER_UNVERIFIED && !lb->key_id[0] && lb->slot == -1 && !lb->enabled && lb->quarantined
               && lb->ngrants == 0 && lb->ndests == 0, "the data package's fields");
     }
@@ -132,8 +136,14 @@ int main(void)
              "' > %s/state.json", root);
     CHECK(system(cmd) == 0 && state_load(root, &s, err, sizeof(err)) == 0 && s.n == 1 && s.pkgs[0].ndests == 0,
           "a state with no destinations key: %s", err);
-    /* ... and one written before installs were stamped has no stamp. */
+    /* ... and one written before installs were stamped has no stamp, and
+     * one written before the enables were counted counts none. */
     CHECK(s.n == 1 && !s.pkgs[0].stamp[0], "a state with no stamp key: \"%s\"", s.n ? s.pkgs[0].stamp : "");
+    CHECK(s.n == 1 && s.pkgs[0].enables == 0, "a state with no enables key: %u", s.n ? s.pkgs[0].enables : 99);
+    CHECK(refused_with(PKG(GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":0,\"grants\":[],\"enables\":-1"),
+                       "does not read"), "a count of enables below zero -> %s", err);
+    CHECK(refused_with(PKG(GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":0,\"grants\":[],\"enables\":\"2\""),
+                       "does not read"), "a count of enables that is no number -> %s", err);
     CHECK(refused_with(PKG(GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":0,\"grants\":[],\"stamp\":\"0123\""),
                        "does not read"), "a stamp cut short -> %s", err);
     CHECK(refused_with(PKG(GOOD "\"tier\":\"unverified\",\"key\":\"\",\"slot\":0,\"grants\":[],\"stamp\":\"0123456789ABCDEF\""),
