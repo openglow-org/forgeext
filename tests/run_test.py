@@ -27,8 +27,10 @@ comes back. The one that keeps ending is quarantined, and state.json
 remembers it. One that holds more than its storage capability asks for, or
 whose data directory the host cannot measure, is set aside, in words that
 say why, and runs again once its data is cleared and the operator enables
-it. A package granted sender.keep_out that asks to keep the Grbl sender out
-has its claim kept fresh beside the holds, until it is disabled.
+it; a quarantine the host could not write holds all the same, and is
+written as soon as it can be. A package granted sender.keep_out that asks
+to keep the Grbl sender out has its claim kept fresh beside the holds,
+until it is disabled.
 A package that holds events has the host hold one stream from forgectrl: a
 poll at the head comes back empty at its deadline, a waiting one as soon as
 the stream carries an event, and with the package disabled the stream is let
@@ -710,12 +712,27 @@ def main():
         package(sid, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["storage:1"])
         check(wait_for(lambda: svc(sid).get("state") == "running", 40), "it runs: %s", svc(sid))
         spid = svc(sid).get("pid", 0)
+        blocker = os.path.join(root, "state.json.new")
+        os.mkdir(blocker)                               # state.json cannot be written while this is there: a full /data, in effect
         big = os.path.join(root, "data", sid, "toobig")
         with open(big, "wb") as f:
             f.write(b"x" * (2 << 20))
         q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)  # the host measures every 30 s
         check(q and "may hold" in q.get("reason", "") and not os.path.exists("/proc/%d" % spid),
               "2 MiB where it declares storage:1: stopped and set aside, in words that say what it may hold: %s", q or svc(sid))
+
+        print("a quarantine the host could not write stays in force, and is written as soon as it can be")
+
+        def remembered():
+            return json.load(open(os.path.join(root, "state.json")))["packages"][sid]["quarantined"]
+
+        check(wait_for(lambda: logged("the quarantine could not be written"), 5), "the host says the write failed")
+        check(wait_for(lambda: svc(sid).get("state") != "quarantined" or svc(sid).get("pid"), 12, poll=0.5) is None
+              and not remembered(), "unwritten for 12 s: still set aside with no process, and state.json does not say so: %s",
+              svc(sid))
+        os.rmdir(blocker)
+        check(wait_for(remembered, 5) and logged("its quarantine is written now"),
+              "the way clear, the write lands at the next turn and the host says so")
         os.unlink(big)
         r = fx("enable", sid)
         check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running" and svc(sid)["pid"] != spid, 20),

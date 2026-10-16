@@ -62,6 +62,12 @@ typedef struct {
     int ndropped;
     int window, enabled;                        /* at the last turn: the armed window, and extensions on */
     double grace_until;                         /* services stop after this: ext.shutdown's second to be read */
+    /* A quarantine the host could not write, per pool slot: its reason,
+     * and the install (conf_wanted) it was set on. */
+    struct {
+        char reason[160];
+        unsigned long long conf;
+    } aside_unwritten[STATE_POOL_SIZE];
 } run_t;
 
 #define SHUTDOWN_GRACE_S 1.0
@@ -377,13 +383,27 @@ static int op_job_limits(void *ctx, svc_t *s, int on)
     return cg_limits(r->cfg->cg_parent, s->id, on ? &JOB_LIMITS : &LIMITS, NULL, 0);
 }
 
+/* The quarantine is remembered in state.json. One that cannot be
+ * written there (a full /data) holds here all the same: the reason and
+ * the install it was set on are kept per pool slot, and the sync keeps
+ * the service unwanted and writes it again every turn until it lands. A
+ * host that ends before then forgets it, and the next measurement sets
+ * the service aside again. */
 static void op_quarantine(void *ctx, svc_t *s, const char *why)
 {
     run_t *r = ctx;
     char err[200];
-    (void)why;
-    if (ext_set_quarantined(&r->cfg->ext, s->id, 1, err, sizeof(err)) != 0)
-        fflog(LOG_ERR, "%s: the quarantine could not be written: %s", s->id, err);
+    int slot = s->slot >= 0 && s->slot < STATE_POOL_SIZE ? s->slot : -1;
+    if (ext_set_quarantined(&r->cfg->ext, s->id, 1, err, sizeof(err)) == 0) {
+        if (slot >= 0)
+            r->aside_unwritten[slot].reason[0] = '\0';
+        return;
+    }
+    fflog(LOG_ERR, "%s: the quarantine could not be written (%s): it stays in force until it is", s->id, err);
+    if (slot >= 0) {
+        snprintf(r->aside_unwritten[slot].reason, sizeof(r->aside_unwritten[slot].reason), "%s", why);
+        r->aside_unwritten[slot].conf = s->conf_wanted;
+    }
 }
 
 static void op_healthy(void *ctx, svc_t *s)
@@ -781,6 +801,24 @@ static void sync_installed(run_t *r, super_t *sv)
             s->mcodes = mcodes_of(&m);
         }
         s->wanted = p->enabled && !p->quarantined;
+        /* A quarantine the host could not write holds until it is
+         * written: one attempt a turn, said once when it lands, and
+         * dropped for an install that is not the one it was set on. */
+        if (s->slot < STATE_POOL_SIZE && r->aside_unwritten[s->slot].reason[0]) {
+            char *held = r->aside_unwritten[s->slot].reason;
+            if (r->aside_unwritten[s->slot].conf != s->conf_wanted) {
+                held[0] = '\0';
+            } else {
+                s->wanted = 0;
+                if (ext_set_quarantined(&r->cfg->ext, p->id, 1, err, sizeof(err)) == 0) {
+                    held[0] = '\0';
+                    fflog(LOG_NOTICE, "%s: its quarantine is written now", p->id);
+                } else if (s->state != SVC_RUNNING && s->state != SVC_QUARANTINED) {
+                    s->state = SVC_QUARANTINED;
+                    snprintf(s->reason, sizeof(s->reason), "%s", held);
+                }
+            }
+        }
         if (p->quarantined && s->state != SVC_RUNNING && s->state != SVC_QUARANTINED) {
             s->state = SVC_QUARANTINED;
             if (!s->reason[0])
