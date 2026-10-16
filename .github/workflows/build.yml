@@ -79,3 +79,26 @@ jobs:
         run: |
           # 77 is the script's "could not run here": on this runner that is a failure.
           python3 -B tests/install_test.py
+
+  # The hold files this tree's holdkeep.c writes, read by forgectrl's own reader: forgectrl's holds_wire_test,
+  # built from forgectrl's tree with this tree's src/ as its FORGEEXT_SRC, so a change here that breaks the wire
+  # fails here and not only at forgectrl's next push.
+  holds-wire:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout forgectrl (the reader of the hold files, and its holds_wire_test)
+        uses: actions/checkout@v4
+        with:
+          repository: openglow-org/forgectrl
+          path: forgectrl-src
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libjansson-dev
+      - name: Configure (forgectrl's build, with this tree's src/ as FORGEEXT_SRC)
+        run: cmake -S forgectrl-src -B wire -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Werror -DFORGEEXT_SRC="$PWD/src"
+      - name: Build holds_wire_test
+        run: cmake --build wire --target holds_wire_test -j"$(nproc)"
+      - name: "holds_wire_test (this tree's holdkeep.c writing, forgectrl's holds.c reading: the names, the fields and their types, the monotonic stamp, the write period inside the window, stale on a silent host)"
+        run: ./wire/holds_wire_test
