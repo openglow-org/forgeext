@@ -278,8 +278,9 @@ int evfeed_start(evfeed_t *f, const machine_cfg_t *upstream, char *err, size_t e
 {
     memset(f, 0, sizeof(*f));
     pthread_mutex_init(&f->mu, NULL);
-    /* The feeder's wait is a timeout, and timeouts never ride the wall
-     * clock on this RTC-less board: the condvar wakes on CLOCK_MONOTONIC. */
+    /* The feeder's wait is a timeout, and the Clocks rule keeps a timeout
+     * off the wall clock of this board with no RTC: the condvar wakes on
+     * CLOCK_MONOTONIC. */
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
     pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);

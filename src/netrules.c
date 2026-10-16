@@ -43,9 +43,17 @@ static int fail(char *err, size_t elen, const char *fmt, ...)
     return -1;
 }
 
+static double mono(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
 /* Runs nft with argv (argv[0] replaced by the binary), `input` on its
  * stdin when not NULL, its stdout and stderr together into out. The exit
- * status, or -1. No shell. */
+ * status, or -1. No shell. NFT_TIMEOUT_S is a timeout, so it rides
+ * CLOCK_MONOTONIC and no step of the wall clock moves it. */
 static int nft_run(const net_env_t *env, const char *const argv_in[], const char *input, char *out, size_t olen)
 {
     const char *argv[16];
@@ -98,16 +106,16 @@ static int nft_run(const net_env_t *env, const char *const argv_in[], const char
         close(in_pipe[1]);
     }
     size_t got = 0;
-    time_t end = time(NULL) + NFT_TIMEOUT_S;
+    double end = mono() + NFT_TIMEOUT_S;
     int timed_out = 0;
     for (;;) {
         struct pollfd p = { .fd = out_pipe[0], .events = POLLIN };
-        int left = (int)(end - time(NULL));
+        int left = (int)((end - mono()) * 1000);
         if (left <= 0) {
             timed_out = 1;
             break;
         }
-        int r = poll(&p, 1, left * 1000);
+        int r = poll(&p, 1, left);
         if (r < 0 && errno == EINTR)
             continue;
         if (r <= 0) {

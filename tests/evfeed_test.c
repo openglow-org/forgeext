@@ -5,17 +5,63 @@
  * SPDX-License-Identifier: MIT
  *
  * Two pure parts of evfeed.h: the server-sent-events reader, fed the lines
- * forgectrl writes, and the ring every package reads from. The socket and
- * the thread are the bench's; what is here is what the host makes of the
- * bytes and what a reader is told when it falls behind.
+ * forgectrl writes, and the ring every package reads from: what the host
+ * makes of the bytes, and what a reader is told when it falls behind.
+ * Then the feeder's thread, against a listener on loopback that closes
+ * every connection, with the wall clock an hour ahead of where it was, as
+ * NTP steps the clock of a board with no RTC: the feeder's backoff rides
+ * CLOCK_MONOTONIC, so it asks for the stream again two seconds after the
+ * first try. clock_gettime is a stand-in defined here, which the feeder in
+ * forgeext_core calls; it moves CLOCK_REALTIME and nothing else.
  */
+#define _GNU_SOURCE
 #include "../src/evfeed.h"
 
+#include <arpa/inet.h>
+#include <dlfcn.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
+
+/* The wall clock, an hour ahead while a case says so. */
+static int realtime_ahead;
+
+int clock_gettime(clockid_t id, struct timespec *ts)
+{
+    static int (*real)(clockid_t, struct timespec *);
+    if (!real)
+        *(void **)&real = dlsym(RTLD_NEXT, "clock_gettime");
+    int rc = real(id, ts);
+    if (rc == 0 && realtime_ahead && id == CLOCK_REALTIME)
+        ts->tv_sec += 3600;
+    return rc;
+}
+
+/* A forgectrl that takes each connection and closes it at once: every
+ * try for the stream ends, and the feeder backs off. */
+static int refuser;
+static int tries;
+static pthread_mutex_t tries_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void *refuse(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        int c = accept(refuser, NULL, NULL);
+        if (c < 0)
+            return NULL;
+        pthread_mutex_lock(&tries_mu);
+        tries++;
+        pthread_mutex_unlock(&tries_mu);
+        close(c);
+    }
+}
 
 /* A whole stream, as one string with its line ends, through the reader.
  * The events it made into out; the return is the last verdict. */
@@ -143,6 +189,50 @@ int main(void)
           "four lost, and the oldest still held is the first back: dropped %lu, first %lu", dropped, ev[0].seq);
     CHECK(evfeed_since(&f, evfeed_head(&f), ev, 16, &next, &dropped) == 0 && dropped == 0,
           "a reader that is current loses nothing");
+
+    /* ---- the feeder, with the wall clock an hour ahead ---- */
+    {
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+        socklen_t al = sizeof(a);
+        struct timespec start, now, nap = { 0, 100 * 1000 * 1000 };
+        static evfeed_t g;
+        pthread_t th;
+        char err[200] = "";
+        int seen = 0, listening;
+
+        refuser = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        listening = refuser >= 0 && bind(refuser, (struct sockaddr *)&a, sizeof(a)) == 0 && listen(refuser, 16) == 0
+                    && getsockname(refuser, (struct sockaddr *)&a, &al) == 0
+                    && pthread_create(&th, NULL, refuse, NULL) == 0;
+        CHECK(listening, "no listener on loopback");
+        if (listening) {
+            machine_cfg_t up;
+            machine_cfg_defaults(&up);
+            up.host = "127.0.0.1";
+            up.port = ntohs(a.sin_port);
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            realtime_ahead = 1;
+            CHECK(evfeed_start(&g, &up, err, sizeof(err)) == 0, "the feeder did not start: %s", err);
+            evfeed_want(&g, 1);
+            /* The first try at once, the next after the 2 s backoff, the
+             * third 4 s after that: two inside 4.5 s. */
+            do {
+                nanosleep(&nap, NULL);
+                clock_gettime(CLOCK_MONOTONIC, &now);
+            } while ((double)(now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) * 1e-9 < 4.5);
+            pthread_mutex_lock(&tries_mu);
+            seen = tries;
+            pthread_mutex_unlock(&tries_mu);
+            evfeed_stop(&g);
+            realtime_ahead = 0;
+            shutdown(refuser, SHUT_RDWR);
+            pthread_join(th, NULL);
+            CHECK(seen >= 2, "with the wall clock an hour ahead, the feeder asked %d time%s in 4.5 s, not twice: its "
+                  "backoff rode the wall clock", seen, seen == 1 ? "" : "s");
+        }
+        if (refuser >= 0)
+            close(refuser);
+    }
 
     printf("%s: evfeed_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

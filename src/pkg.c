@@ -65,9 +65,18 @@ static void hex(const unsigned char *in, size_t n, char *out)
 
 /* ---- fwup, asked without a shell --------------------------------------- */
 
+static double mono(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
 /* Runs fwup with argv (argv[0] is replaced by the binary), collects its
  * stdout, and returns its exit status, or -1 when it could not be run or
- * outlived FWUP_TIMEOUT_S. */
+ * outlived FWUP_TIMEOUT_S. The bound is a timeout, so it rides
+ * CLOCK_MONOTONIC: NTP steps the wall clock of a board with no RTC, and a
+ * step would end the bound at once or stretch it. */
 static int fwup_run(const char *fwup, const char *const argv_in[], char *out, size_t olen)
 {
     const char *argv[12];
@@ -96,16 +105,16 @@ static int fwup_run(const char *fwup, const char *const argv_in[], char *out, si
     }
     close(pfd[1]);
     size_t got = 0;
-    time_t end = time(NULL) + FWUP_TIMEOUT_S;
+    double end = mono() + FWUP_TIMEOUT_S;
     int timed_out = 0;
     for (;;) {
         struct pollfd p = { .fd = pfd[0], .events = POLLIN };
-        int left = (int)(end - time(NULL));
+        int left = (int)((end - mono()) * 1000);
         if (left <= 0) {
             timed_out = 1;
             break;
         }
-        int r = poll(&p, 1, left * 1000);
+        int r = poll(&p, 1, left);
         if (r < 0 && errno == EINTR)
             continue;
         if (r <= 0) {

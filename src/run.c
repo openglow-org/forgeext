@@ -44,7 +44,7 @@ typedef struct {
     char buf[1024];
     size_t used;
     int lines;                                  /* in this ten-second window */
-    time_t window;
+    double window;                              /* when it began, on CLOCK_MONOTONIC */
     int muted;
 } logpipe_t;
 
@@ -128,9 +128,12 @@ static logpipe_t *log_slot(run_t *r, const char *id)
     return empty;
 }
 
+/* The window rides CLOCK_MONOTONIC. On the wall clock, a backward step
+ * keeps one window from ending, and the service's output past its lines
+ * is muted until the clock catches up. */
 static void log_line(logpipe_t *l, const char *line)
 {
-    time_t now = time(NULL);
+    double now = mono();
     if (now - l->window >= 10) {
         if (l->muted)
             fflog(LOG_WARNING, "ext %s: %d lines of its output were not logged", l->id, l->muted);
