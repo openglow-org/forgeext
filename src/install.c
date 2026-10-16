@@ -587,7 +587,8 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
     }
     state_pkg_t *p = state_find(st, m->id);
     if (p) {
-        drop_version(pkgdir, p->previous);
+        if (strcmp(p->previous, m->version) != 0)
+            drop_version(pkgdir, p->previous);          /* the kept predecessor installed again is the new tree */
         snprintf(p->previous, sizeof(p->previous), "%s", p->version);
         p->quarantined = 0;
     } else {

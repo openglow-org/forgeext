@@ -703,6 +703,16 @@ def run_all(w, top):
         check("signed by the key that signed the installed version" in r.get("error", ""),
               "an update by %s -> %s" % (signer or "nobody", r.get("error")))
     check(w.run("list")["packages"][0]["version"] == "1.2.0" and not w.leftovers(), "the refused updates changed nothing")
+    # The kept predecessor installed again, as a rollback of an update that has not run healthy: current points at
+    # its whole tree, and the version it replaces is kept in its place.
+    r = w.run("install", a2, "--grant", "hold", "--grant", "motion.job")
+    p = w.run("list")["packages"][0]
+    check(r.get("ok") is True and r.get("downgrade") is True and p["version"] == "1.1.0" and p["previous"] == "1.2.0"
+          and os.readlink(os.path.join(pkg, "current")) == "1.1.0"
+          and os.path.isfile(os.path.join(pkg, "1.1.0", "manifest.json")) and os.path.isdir(os.path.join(pkg, "1.2.0")),
+          "the kept predecessor installed again: current is its tree, and the replaced version is kept: %s %s" % (r, p))
+    r = w.run("check", A)
+    check(r.get("ok") is True, "and it checks: %s" % r)
 
     print("the other tiers, and the namespace")
     B, C, D = "org.example.community", "org.example.unsigned", "org.example.stranger"
