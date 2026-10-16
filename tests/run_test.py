@@ -30,9 +30,13 @@ remembers it. One that holds more than its storage capability asks for, or
 whose data directory the host cannot measure, is set aside, in words that
 say why, and runs again once its data is cleared and the operator enables
 it; a quarantine the host could not write holds all the same, and is
-written as soon as it can be. A package granted sender.keep_out that asks
-to keep the Grbl sender out has its claim kept fresh beside the holds,
-until it is disabled.
+written as soon as it can be. One whose manifest cannot be read is set
+aside too, with the way out that fits it: remove the package and install
+it again. A package the operator removes inside the turn that measures
+it, after the host has read the state and before it measures, is not set
+aside by the measurement its removal breaks. A package granted
+sender.keep_out that asks to keep the Grbl sender out has its claim kept
+fresh beside the holds, until it is disabled.
 A package that holds events has the host hold one stream from forgectrl: a
 poll at the head comes back empty at its deadline, a waiting one as soon as
 the stream carries an event, and with the package disabled the stream is let
@@ -56,6 +60,7 @@ network rules (ABI 4 or newer), which the host is not told to do without.
 Needs root, cgroup v2, nft, ip, nsenter, unshare, fwup (FWUP), the built
 forgeext (FORGEEXT), and the rule file (FFX_RULES). Exits 77 without them.
 """
+import ctypes
 import http.server
 import json
 import os
@@ -66,6 +71,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -84,12 +90,17 @@ HERE_ADDR, PEER_ADDR = "10.99.2.1", "10.99.2.2"
 SKIP = 77
 
 PEER = r'''
-import socket, sys
+import socket, sys, threading
 print("pid", flush=True)
 sys.stdin.readline()
 s = socket.socket()
 s.bind(("%s", 0))
 s.listen(128)
+def take():
+    while True:
+        c, _ = s.accept()
+        c.close()
+threading.Thread(target=take, daemon=True).start()
 print(s.getsockname()[1], flush=True)
 sys.stdin.readline()
 ''' % PEER_ADDR
@@ -254,7 +265,7 @@ while True:
 TOKEN = "0123456789abcdef0123456789abcdef"
 failures = []
 facts = {"armed": False, "controller": "running", "motion": "unverified", "mode": "grbl", "diag": False, "updating": False,
-         "down": False, "sender": []}
+         "down": False, "sender": [], "on_mode": None}
 streams = []                                    # each /events stream the stand-in holds: the events it has yet to write
 streams_mu = threading.Lock()
 
@@ -275,6 +286,8 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/events" and not facts["down"] and self.headers.get("X-ForgeFIRM-Client") == "extension-host":
             return self.stream()
+        if self.path == "/mode" and facts["on_mode"]:
+            facts["on_mode"]()                      # the host asks this between its read of the state and its measurement
         body = {"/cool/status": {"armed": facts["armed"]},
                 "/mode": {"mode": facts["mode"], "controller": facts["controller"], "motion": facts["motion"]},
                 "/status": {"diag": facts["diag"]},
@@ -341,6 +354,29 @@ def wait_for(cond, seconds, poll=0.25):
             return v
         time.sleep(poll)
     return None
+
+
+def opens_of(path):
+    """The times (time.monotonic()) at which the directory at path is itself opened, from inotify, kept as they come.
+    The host's measurement opens each running service's data directory once a measuring turn, and nothing else opens
+    the data directory of a service that does not use it, so these are the host's measurements."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(os.O_CLOEXEC)
+    if fd < 0 or libc.inotify_add_watch(fd, os.fsencode(path), 0x20) < 0:     # IN_OPEN
+        return None
+    times = []
+
+    def read():
+        while True:
+            data = os.read(fd, 4096)
+            now, off = time.monotonic(), 0
+            while off + 16 <= len(data):
+                mask, length = struct.unpack_from("iIII", data, off)[1::2]
+                if mask & 0x20 and length == 0:     # the directory itself, not an entry of it
+                    times.append(now)
+                off += 16 + length
+    threading.Thread(target=read, daemon=True).start()
+    return times
 
 
 def main():
@@ -736,6 +772,14 @@ def main():
         check(logged("ext org.example.crash: about to end"), "its last words are in the log")
         check(not os.path.isdir(CG_PARENT + "/org.example.crash"), "and its group is gone")
 
+        def since(mark, text):
+            log.flush()
+            return text in open(log_path).read()[mark:]
+
+        def mark():
+            log.flush()
+            return len(open(log_path).read())
+
         print("over its storage quota: set aside, and back once its data is cleared and it is enabled")
         sid = "org.example.store"
         package(sid, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["storage:1"])
@@ -776,7 +820,46 @@ def main():
         r = fx("enable", sid)
         check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running", 20),
               "measurable again and enabled: it runs: %s %s", r.get("error", ""), svc(sid))
-        check(fx("remove", sid).get("ok") is True, "and it goes")
+
+        print("a manifest the host cannot read is set aside too, with the way out that fits it")
+        walks = opens_of(os.path.join(root, "data", "org.example.beat"))   # the host's measurements, from here on
+        mf, kept = os.path.join(root, "pkg", sid, "current", "manifest.json"), os.path.join(top, "store-manifest.json")
+        os.rename(mf, kept)
+        q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)
+        why = (q or {}).get("reason", "")
+        check("manifest could not be read" in why and "remove the package and install it again" in why
+              and "clear its data" not in why,
+              "its manifest gone: set aside, and told to remove the package and install it again: %s", q or svc(sid))
+        os.rename(kept, mf)
+        r = fx("enable", sid)
+        check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running", 20),
+              "its manifest back and enabled: it runs: %s %s", r.get("error", ""), svc(sid))
+
+        print("removed inside the turn that measures it: not set aside by the measurement its removal breaks")
+        removal, removing = {}, threading.Lock()
+
+        def remove_in_measuring_turn():
+            # The first question about the mode 29.3 s after a measurement is asked in the turn that measures
+            # next, after the host has read the state; the measurement waits for the answer.
+            if not walks or time.monotonic() < walks[-1] + 29.3 or not removing.acquire(blocking=False):
+                return
+            facts["on_mode"] = None
+            removal["result"] = fx("remove", sid)
+            time.sleep(0.5)
+            removal["at"] = time.monotonic()
+
+        at = mark()
+        facts["on_mode"] = remove_in_measuring_turn
+        check(walks is not None and wait_for(lambda: removal.get("at"), 70, poll=0.5),
+              "the operator's removal was made inside the host's question: %s", removal)
+        facts["on_mode"] = None
+        after = wait_for(lambda: next((t for t in walks or [] if t > removal.get("at", 1e18)), None), 5, poll=0.1)
+        check(after and after - removal["at"] < 0.9 and (removal.get("result") or {}).get("ok") is True,
+              "removed (%s), in a turn that measures, before its measurement (%.2f s after the removal)",
+              removal.get("result"), (after or 0) - removal.get("at", 0))
+        check(wait_for(lambda: not svc(sid), 10) and not since(at, "%s: its manifest could not be read" % sid)
+              and not since(at, "%s: its data directory could not be measured" % sid),
+              "it goes, and it was not set aside: %s", svc(sid))
 
         print("removed and installed again inside one turn of the host: started again from the new install")
         old = svc("org.example.beat")["pid"]
@@ -798,15 +881,6 @@ def main():
 
         print("destinations the operator names")
         oid, where = "org.example.opdial", "%s:%d" % (PEER_ADDR, pport)
-
-        def since(mark, text):
-            log.flush()
-            return text in open(log_path).read()[mark:]
-
-        def mark():
-            log.flush()
-            return len(open(log_path).read())
-
         at = mark()
         package(oid, "python", OPDIAL, caps=["net.outbound.operator"], args=[PEER_ADDR, str(pport)])
         check(wait_for(lambda: since(at, "ext %s: opdial self 200 []" % oid), 30),
