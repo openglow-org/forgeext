@@ -9,12 +9,23 @@
  * counted as a link and never followed, a sparse file counted by what
  * the filesystem gave it rather than by how large it claims to be, and a
  * measurement that did not complete (a tree deeper than the host
- * measures, a directory it cannot read) read as -1 with the reason, never
- * as nothing. A tree whose path is longer than PATH_MAX is measured like
- * any other: the walk goes by descriptors, not by a path it builds.
+ * measures, a directory it cannot read, a listing that fails part way)
+ * read as -1 with the reason, never as nothing. A directory the package
+ * removes between the walk's look at it and its open holds nothing now,
+ * and the measurement completes without it. A tree whose path is longer
+ * than PATH_MAX is measured like any other: the walk goes by descriptors,
+ * not by a path it builds.
+ *
+ * The walk's readdir and fstatat are stand-ins defined here, so that a
+ * case can fail a listing or move a directory at the moment the walk
+ * reaches it. Until a case arms one, each goes through to the real call.
  */
+#define _GNU_SOURCE
 #include "../src/quota.h"
 
+#include <dirent.h>
+#include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +36,45 @@
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); \
                               fflush(stdout); } } while (0)
+
+/* The listing that fails, as a fault in a directory block fails it: the
+ * directory, by device and inode, and the calls made on it. The first
+ * call goes through, and every call after it fails with EIO. */
+static dev_t torn_dev;
+static ino_t torn_ino;
+static int torn_calls;
+
+struct dirent *readdir(DIR *d)
+{
+    static struct dirent *(*real)(DIR *);
+    struct stat st;
+    if (!real)
+        *(void **)&real = dlsym(RTLD_NEXT, "readdir");
+    if (torn_ino && fstat(dirfd(d), &st) == 0 && st.st_dev == torn_dev && st.st_ino == torn_ino
+        && torn_calls++ > 0) {
+        errno = EIO;
+        return NULL;
+    }
+    return real(d);
+}
+
+/* The entry that the walk's next look moves, once that look has found a
+ * directory: the package removes it before the walk opens it. */
+static char moving[64];
+static int moved;
+
+int fstatat(int fd, const char *restrict path, struct stat *restrict st, int flags)
+{
+    static int (*real)(int, const char *, struct stat *, int);
+    if (!real)
+        *(void **)&real = dlsym(RTLD_NEXT, "fstatat");
+    int rc = real(fd, path, st, flags);
+    if (rc == 0 && moving[0] && strcmp(path, moving) == 0 && S_ISDIR(st->st_mode)) {
+        moving[0] = '\0';
+        moved = unlinkat(fd, path, AT_REMOVEDIR) == 0;
+    }
+    return rc;
+}
 
 static manifest_t with(const char *cap)
 {
@@ -154,6 +204,39 @@ int main(void)
         CHECK(readable >= before + 40 * 1024, "readable again, its file is counted: %lld then %lld", before, readable);
     } else {
         printf("(root: the unreadable directory is not checked)\n");
+    }
+    /* A listing that fails part way is a directory that cannot be read:
+     * -1, never the part of it that came before the fault. */
+    {
+        struct stat st;
+        long long whole = quota_dir_bytes(root, why, sizeof(why));
+        if (stat(root, &st) == 0) {
+            torn_dev = st.st_dev;
+            torn_ino = st.st_ino;
+            torn_calls = 0;
+        }
+        why[0] = '\0';
+        long long torn = quota_dir_bytes(root, why, sizeof(why));
+        torn_ino = 0;
+        CHECK(torn_calls > 1 && torn == -1 && strstr(why, "cannot read"),
+              "a listing that fails part way reads as %lld after %lld, not -1 in words that say it cannot be read: %s",
+              torn, whole, why);
+    }
+    /* A directory the package removes between the walk's look at it and
+     * its open holds nothing now: the measurement completes without it. */
+    {
+        long long base = quota_dir_bytes(root, why, sizeof(why));
+        snprintf(p, sizeof(p), "%s/vanish", root);
+        mkdir(p, 0700);
+        snprintf(moving, sizeof(moving), "vanish");
+        moved = 0;
+        why[0] = '\0';
+        long long gone = quota_dir_bytes(root, why, sizeof(why));
+        moving[0] = '\0';
+        CHECK(moved && gone >= base && !why[0],
+              "a directory removed between its look and its open reads as %lld after %lld (removed: %d): %s", gone,
+              base, moved, why);
+        rmdir(p);
     }
 
     /* A path longer than the walk could hold is no reason not to measure

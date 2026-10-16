@@ -65,7 +65,7 @@ static long long walk(int fd, int depth, char *err, size_t elen)
         close(fd);
         return fail(err, elen, "cannot read a directory: %s", strerror(saved));
     }
-    while ((e = readdir(d)) != NULL) {
+    while ((errno = 0, e = readdir(d)) != NULL) {
         struct stat st;
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
             continue;
@@ -88,7 +88,7 @@ static long long walk(int fd, int depth, char *err, size_t elen)
         int sub = openat(fd, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
         if (sub < 0) {
             if (errno == ENOENT)
-                continue;
+                continue;                           /* gone between its stat and its open: it holds nothing now */
             total = errno == ELOOP || errno == ENOTDIR
                     ? fail(err, elen, "%s changed while it was measured", e->d_name)
                     : fail(err, elen, "cannot read %s: %s", e->d_name, strerror(errno));
@@ -101,6 +101,12 @@ static long long walk(int fd, int depth, char *err, size_t elen)
         }
         total += under;
     }
+    /* readdir returns NULL at the end of a listing and when the listing
+     * fails, and only errno tells the two apart. A listing that fails part
+     * way is a directory that cannot be read, never one that holds only
+     * what came before the fault. */
+    if (!e && errno != 0)
+        total = fail(err, elen, "cannot read a directory: %s", strerror(errno));
     closedir(d);
     return total;
 }
