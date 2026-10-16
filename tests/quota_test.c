@@ -10,10 +10,12 @@
  * the filesystem gave it rather than by how large it claims to be, and a
  * measurement that did not complete (a tree deeper than the host
  * measures, a directory it cannot read) read as -1 with the reason, never
- * as nothing.
+ * as nothing. A tree whose path is longer than PATH_MAX is measured like
+ * any other: the walk goes by descriptors, not by a path it builds.
  */
 #include "../src/quota.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,6 +154,40 @@ int main(void)
         CHECK(readable >= before + 40 * 1024, "readable again, its file is counted: %lld then %lld", before, readable);
     } else {
         printf("(root: the unreadable directory is not checked)\n");
+    }
+
+    /* A path longer than the walk could hold is no reason not to measure
+     * it: 16 directories of 255-byte names, made relative to a descriptor
+     * since their path is past PATH_MAX, with 40 KiB at the bottom. */
+    {
+        long long prior = quota_dir_bytes(root, why, sizeof(why));
+        char name[256];
+        memset(name, 'x', sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+        int dfd = open(root, O_RDONLY | O_DIRECTORY), made = 0;
+        for (int i = 0; dfd >= 0 && i < QUOTA_MAX_DEPTH; i++) {
+            int next = mkdirat(dfd, name, 0700) == 0 ? openat(dfd, name, O_RDONLY | O_DIRECTORY) : -1;
+            close(dfd);
+            dfd = next;
+            made += next >= 0;
+        }
+        int ffd = dfd >= 0 ? openat(dfd, "f", O_WRONLY | O_CREAT, 0600) : -1;
+        if (ffd >= 0) {
+            char block[4096];
+            memset(block, 'x', sizeof(block));
+            for (int i = 0; i < 10; i++)
+                if (write(ffd, block, sizeof(block)) != (ssize_t)sizeof(block))
+                    break;
+            close(ffd);
+        }
+        if (dfd >= 0)
+            close(dfd);
+        why[0] = '\0';
+        long long far = quota_dir_bytes(root, why, sizeof(why));
+        CHECK(made == QUOTA_MAX_DEPTH && ffd >= 0, "the long chain was made: %d directories, file %s", made,
+              ffd >= 0 ? "made" : "not made");
+        CHECK(far >= prior + 40 * 1024,
+              "40 KiB under 16 directories of 255-byte names reads as %lld after %lld: %s", far, prior, why);
     }
 
     {

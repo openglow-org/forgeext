@@ -11,6 +11,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,46 +44,62 @@ long long quota_of(const manifest_t *m)
     return (long long)QUOTA_DEFAULT_MIB << 20;
 }
 
-/* The tree under path, or -1 with the reason. What the walk cannot
- * measure is not counted as nothing: the measurement fails, and the
- * caller sets the service aside with the reason. */
-static long long walk(const char *path, int depth, char *err, size_t elen)
+/* The tree under the directory fd is open on, or -1 with the reason;
+ * the walk owns fd and closes it. Every entry is examined and opened
+ * relative to the descriptor of the directory it was read from, by its
+ * name and with O_NOFOLLOW: nothing here resolves a path and then opens
+ * it by name a moment later, so a directory the package replaces with a
+ * link while it is measured is not followed, and no path is built that
+ * could fail to fit. What the walk cannot measure is not counted as
+ * nothing: the measurement fails, and the caller sets the service aside
+ * with the reason. */
+static long long walk(int fd, int depth, char *err, size_t elen)
 {
     DIR *d;
     struct dirent *e;
     long long total = 0;
 
-    if (depth > QUOTA_MAX_DEPTH)
-        return fail(err, elen, "%s is deeper than the %d directories the host measures", path, QUOTA_MAX_DEPTH);
-    d = opendir(path);
-    if (!d)
-        return fail(err, elen, "cannot read %s: %s", path, strerror(errno));
+    d = fdopendir(fd);
+    if (!d) {
+        int saved = errno;
+        close(fd);
+        return fail(err, elen, "cannot read a directory: %s", strerror(saved));
+    }
     while ((e = readdir(d)) != NULL) {
-        char p[4096];
         struct stat st;
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
             continue;
-        if ((size_t)snprintf(p, sizeof(p), "%s/%s", path, e->d_name) >= sizeof(p)) {
-            total = fail(err, elen, "a path under %s does not fit", path);
-            break;
-        }
-        if (lstat(p, &st) != 0) {
+        if (fstatat(fd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             if (errno == ENOENT)
                 continue;                           /* gone between readdir and stat: it holds nothing now */
-            total = fail(err, elen, "cannot examine %s: %s", p, strerror(errno));
+            total = fail(err, elen, "cannot examine %s: %s", e->d_name, strerror(errno));
             break;
         }
         /* The blocks, not the size: a sparse file has taken what it has
          * taken, and a small file has taken a whole block. */
         total += (long long)st.st_blocks * 512;
-        if (S_ISDIR(st.st_mode)) {
-            long long sub = walk(p, depth + 1, err, elen);
-            if (sub < 0) {
-                total = -1;
-                break;
-            }
-            total += sub;
+        if (!S_ISDIR(st.st_mode))
+            continue;
+        if (depth + 1 > QUOTA_MAX_DEPTH) {
+            total = fail(err, elen, "%s is deeper than the %d directories the host measures", e->d_name,
+                         QUOTA_MAX_DEPTH);
+            break;
         }
+        int sub = openat(fd, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (sub < 0) {
+            if (errno == ENOENT)
+                continue;
+            total = errno == ELOOP || errno == ENOTDIR
+                    ? fail(err, elen, "%s changed while it was measured", e->d_name)
+                    : fail(err, elen, "cannot read %s: %s", e->d_name, strerror(errno));
+            break;
+        }
+        long long under = walk(sub, depth + 1, err, elen);
+        if (under < 0) {
+            total = -1;
+            break;
+        }
+        total += under;
     }
     closedir(d);
     return total;
@@ -90,5 +107,8 @@ static long long walk(const char *path, int depth, char *err, size_t elen)
 
 long long quota_dir_bytes(const char *path, char *err, size_t elen)
 {
-    return walk(path, 0, err, elen);
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return fail(err, elen, "cannot read %s: %s", path, strerror(errno));
+    return walk(fd, 0, err, elen);
 }

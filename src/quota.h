@@ -42,10 +42,13 @@ long long quota_of(const manifest_t *m);
 
 /* The bytes a directory's tree holds, by the blocks the filesystem gave
  * it. Symbolic links are counted as links and never followed, so a link
- * out of the directory adds nothing and cannot be walked. -1, with the
- * reason in err, when the measurement did not complete: the directory or
- * one under it cannot be read, an entry cannot be examined for a reason
- * other than its being gone, a path does not fit, or the tree is deeper
+ * out of the directory adds nothing and cannot be walked; a directory
+ * that becomes a link while it is measured is not followed either, since
+ * the walk goes by descriptors and never by a path it built. -1, with
+ * the reason in err, when the measurement did not complete: the
+ * directory (or the path given, if it is a link) or one under it cannot
+ * be read, an entry cannot be examined for a reason other than its being
+ * gone, an entry changed while it was measured, or the tree is deeper
  * than QUOTA_MAX_DEPTH. What is not measured is never taken for nothing. */
 long long quota_dir_bytes(const char *path, char *err, size_t elen);
 
