@@ -235,9 +235,12 @@ static void *feeder(void *arg)
 
     for (;;) {
         pthread_mutex_lock(&f->mu);
+        /* A bounded sleep before want, stop and quiet are looked at
+         * again, not an appointment: the deadline rides CLOCK_MONOTONIC,
+         * the clock evfeed_start put the condvar on. */
         while (!f->stop && (f->want <= 0 || mono() < quiet)) {
             struct timespec until;
-            clock_gettime(CLOCK_REALTIME, &until);
+            clock_gettime(CLOCK_MONOTONIC, &until);
             until.tv_sec += 1;
             pthread_cond_timedwait(&f->news, &f->mu, &until);
         }
@@ -275,7 +278,13 @@ int evfeed_start(evfeed_t *f, const machine_cfg_t *upstream, char *err, size_t e
 {
     memset(f, 0, sizeof(*f));
     pthread_mutex_init(&f->mu, NULL);
-    pthread_cond_init(&f->news, NULL);
+    /* The feeder's wait is a timeout, and timeouts never ride the wall
+     * clock on this RTC-less board: the condvar wakes on CLOCK_MONOTONIC. */
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&f->news, &ca);
+    pthread_condattr_destroy(&ca);
     f->upstream = *upstream;
     if (pthread_create(&f->thread, NULL, feeder, f) != 0) {
         snprintf(err, elen, "cannot start the event feed's thread");
