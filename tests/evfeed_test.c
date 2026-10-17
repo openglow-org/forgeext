@@ -1,5 +1,5 @@
 /*
- * evfeed_test.c - host test: the event reader and the ring behind it
+ * evfeed_test.c - host test: the event reader, the ring behind it, and the host's timeouts on a stepped clock
  * Copyright 2026 514 LLC d/b/a OpenGlow
  * Written by Scott Wiederhold
  * SPDX-License-Identifier: MIT
@@ -8,39 +8,142 @@
  * forgectrl writes, and the ring every package reads from: what the host
  * makes of the bytes, and what a reader is told when it falls behind.
  * Then the feeder's thread, against a listener on loopback that closes
- * every connection, with the wall clock an hour ahead of where it was, as
- * NTP steps the clock of a board with no RTC: the feeder's backoff rides
- * CLOCK_MONOTONIC, so it asks for the stream again two seconds after the
- * first try. clock_gettime is a stand-in defined here, which the feeder in
- * forgeext_core calls; it moves CLOCK_REALTIME and nothing else.
+ * every connection, with the wall clock an hour ahead of where it was and
+ * stepped back that hour 1 s in, inside the feeder's first backoff, as
+ * NTP steps the clock of a board with no RTC. The feeder asks for the
+ * stream again two seconds after its first try, and only then, and its
+ * waits sleep: the backoff, the deadline of each wait, and the clock of
+ * the condvar it waits on all ride CLOCK_MONOTONIC. Last, the bounds on
+ * fwup (pkg_open_product, over an archive the test makes) and on nft
+ * (net_sweep): each runs a stand-in that writes its answer in two parts a
+ * second apart, and the wall clock steps ten years ahead between them.
+ * Each answer is read whole, so neither bound rides the wall clock.
+ *
+ * clock_gettime and time are stand-ins defined here, which the host's
+ * code in forgeext_core calls. They move CLOCK_REALTIME and time(), and
+ * nothing else. clock_gettime goes through to the call of the name the
+ * C library's headers give it: a 32-bit build with 64-bit time renames
+ * it.
  */
 #define _GNU_SOURCE
 #include "../src/evfeed.h"
+#include "../src/netrules.h"
+#include "../src/pkg.h"
 
+#include <archive.h>
+#include <archive_entry.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <netinet/in.h>
+#include <sodium.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef __USE_TIME_BITS64
+#define REAL_CLOCK_GETTIME "__clock_gettime64"
+#else
+#define REAL_CLOCK_GETTIME "clock_gettime"
+#endif
 
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
 
-/* The wall clock, an hour ahead while a case says so. */
-static int realtime_ahead;
+/* How far ahead of the real one the wall clock is, in seconds, as a case
+ * sets it. Threads of the host read it, so it is read and written whole. */
+static int wall_ahead;
+
+static void set_wall_ahead(int s)
+{
+    __atomic_store_n(&wall_ahead, s, __ATOMIC_SEQ_CST);
+}
 
 int clock_gettime(clockid_t id, struct timespec *ts)
 {
     static int (*real)(clockid_t, struct timespec *);
     if (!real)
-        *(void **)&real = dlsym(RTLD_NEXT, "clock_gettime");
+        *(void **)&real = dlsym(RTLD_NEXT, REAL_CLOCK_GETTIME);
     int rc = real(id, ts);
-    if (rc == 0 && realtime_ahead && id == CLOCK_REALTIME)
-        ts->tv_sec += 3600;
+    if (rc == 0 && id == CLOCK_REALTIME)
+        ts->tv_sec += (time_t)__atomic_load_n(&wall_ahead, __ATOMIC_SEQ_CST);
     return rc;
+}
+
+time_t time(time_t *t)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);                 /* the stand-in above: the wall clock as the case has it */
+    if (t)
+        *t = ts.tv_sec;
+    return ts.tv_sec;
+}
+
+static double since(const struct timespec *a, const struct timespec *b)
+{
+    return (double)(b->tv_sec - a->tv_sec) + (b->tv_nsec - a->tv_nsec) * 1e-9;
+}
+
+/* The step a bound case is made under: ten years ahead, 0.5 s in, while
+ * the stand-in child is between the two parts of its answer. */
+static void *step_ahead(void *arg)
+{
+    struct timespec half = { 0, 500 * 1000 * 1000 };
+    (void)arg;
+    nanosleep(&half, NULL);
+    set_wall_ahead(10 * 365 * 86400);
+    return NULL;
+}
+
+/* A program of the test's own, a shell script with that text. 0 when it is there. */
+static int script(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return -1;
+    int ok = fputs(text, f) >= 0;
+    ok &= fclose(f) == 0;
+    return ok && chmod(path, 0755) == 0 ? 0 : -1;
+}
+
+/* An extension archive the reader takes, unsigned: its metadata, then the
+ * payload that metadata names by its length and its blake2b-256. 0 when
+ * it is written. */
+static int archive_of(const char *path)
+{
+    static const char payload[] = "payload bytes\n";
+    unsigned char h[32];
+    char hexd[65], meta[512];
+    if (sodium_init() < 0)
+        return -1;
+    crypto_generichash(h, sizeof(h), (const unsigned char *)payload, sizeof(payload) - 1, NULL, 0);
+    for (int i = 0; i < 32; i++)
+        snprintf(hexd + 2 * i, 3, "%02x", h[i]);
+    int n = snprintf(meta, sizeof(meta),
+                     "meta-product=\"%s\"\nmeta-version=\"1.0.0\"\nmeta-platform=\"forgefirm-ext\"\n"
+                     "file-resource \"payload.tar.gz\" {\n  length=%zu\n  blake2b-256=\"%s\"\n}\n",
+                     PKG_PRODUCT, sizeof(payload) - 1, hexd);
+    const char *names[] = { "meta.conf", "data/payload.tar.gz" }, *data[] = { meta, payload };
+    size_t lens[] = { (size_t)n, sizeof(payload) - 1 };
+    struct archive *a = archive_write_new();
+    int ok = a && archive_write_set_format_zip(a) == ARCHIVE_OK && archive_write_open_filename(a, path) == ARCHIVE_OK;
+    for (int i = 0; ok && i < 2; i++) {
+        struct archive_entry *e = archive_entry_new();
+        archive_entry_set_pathname(e, names[i]);
+        archive_entry_set_filetype(e, AE_IFREG);
+        archive_entry_set_perm(e, 0644);
+        archive_entry_set_size(e, (la_int64_t)lens[i]);
+        ok = archive_write_header(a, e) == ARCHIVE_OK && archive_write_data(a, data[i], lens[i]) == (la_ssize_t)lens[i];
+        archive_entry_free(e);
+    }
+    if (a) {
+        ok &= archive_write_close(a) == ARCHIVE_OK;
+        archive_write_free(a);
+    }
+    return ok ? 0 : -1;
 }
 
 /* A forgectrl that takes each connection and closes it at once: every
@@ -190,11 +293,11 @@ int main(void)
     CHECK(evfeed_since(&f, evfeed_head(&f), ev, 16, &next, &dropped) == 0 && dropped == 0,
           "a reader that is current loses nothing");
 
-    /* ---- the feeder, with the wall clock an hour ahead ---- */
+    /* ---- the feeder, with the wall clock an hour ahead and stepped back ---- */
     {
         struct sockaddr_in a = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
         socklen_t al = sizeof(a);
-        struct timespec start, now, nap = { 0, 100 * 1000 * 1000 };
+        struct timespec start, now, cpu0, cpu1, nap = { 0, 100 * 1000 * 1000 };
         static evfeed_t g;
         pthread_t th;
         char err[200] = "";
@@ -210,28 +313,81 @@ int main(void)
             machine_cfg_defaults(&up);
             up.host = "127.0.0.1";
             up.port = ntohs(a.sin_port);
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu0);
             clock_gettime(CLOCK_MONOTONIC, &start);
-            realtime_ahead = 1;
+            set_wall_ahead(3600);
             CHECK(evfeed_start(&g, &up, err, sizeof(err)) == 0, "the feeder did not start: %s", err);
             evfeed_want(&g, 1);
             /* The first try at once, the next after the 2 s backoff, the
-             * third 4 s after that: two inside 4.5 s. */
+             * third 4 s after that: two inside 4.5 s. The wall clock steps
+             * back the hour 1 s in, inside the first backoff. */
             do {
                 nanosleep(&nap, NULL);
                 clock_gettime(CLOCK_MONOTONIC, &now);
-            } while ((double)(now.tv_sec - start.tv_sec) + (now.tv_nsec - start.tv_nsec) * 1e-9 < 4.5);
+                if (since(&start, &now) >= 1.0)
+                    set_wall_ahead(0);
+            } while (since(&start, &now) < 4.5);
             pthread_mutex_lock(&tries_mu);
             seen = tries;
             pthread_mutex_unlock(&tries_mu);
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu1);
             evfeed_stop(&g);
-            realtime_ahead = 0;
+            set_wall_ahead(0);
             shutdown(refuser, SHUT_RDWR);
             pthread_join(th, NULL);
-            CHECK(seen >= 2, "with the wall clock an hour ahead, the feeder asked %d time%s in 4.5 s, not twice: its "
-                  "backoff rode the wall clock", seen, seen == 1 ? "" : "s");
+            CHECK(seen == 2, "with the wall clock an hour ahead and stepped back 1 s in, the feeder asked %d time%s in "
+                  "4.5 s, not twice: once is a wait's deadline or the backoff on the wall clock, more is no backoff",
+                  seen, seen == 1 ? "" : "s");
+            CHECK(since(&cpu0, &cpu1) < 1.0, "the feeder did not sleep between its tries: %.2f s of CPU in 4.5 s",
+                  since(&cpu0, &cpu1));
         }
         if (refuser >= 0)
             close(refuser);
+    }
+
+    /* ---- fwup's and nft's bounds, with the wall clock stepped ten years ahead ---- */
+    {
+        char dir[] = "/tmp/ffx-evfeed-test.XXXXXX", fwup[64], nft[64], ffx[64], err[300];
+        pthread_t th;
+        int made = mkdtemp(dir) != NULL;
+        snprintf(fwup, sizeof(fwup), "%s/fwup", dir);
+        snprintf(nft, sizeof(nft), "%s/nft", dir);
+        snprintf(ffx, sizeof(ffx), "%s/x.ffx", dir);
+        /* fwup's reading of the metadata in two parts; nothing listed; verified. */
+        made = made && script(fwup, "#!/bin/sh\nif [ \"$1\" = -m ]; then\n    echo 'meta-product=\"" PKG_PRODUCT "\"'\n"
+                                    "    sleep 1\n    echo 'meta-version=\"1.0.0\"'\nfi\nexit 0\n") == 0
+               && script(nft, "#!/bin/sh\necho 'table inet ffx {'\nsleep 1\necho '}'\nexit 0\n") == 0
+               && archive_of(ffx) == 0;
+        CHECK(made, "the stand-ins and the archive were not made in %s", dir);
+        if (made) {
+            pkg_trust_t trust;
+            pkg_info_t info;
+            memset(&trust, 0, sizeof(trust));
+            trust.fwup = fwup;
+            err[0] = '\0';
+            set_wall_ahead(0);
+            pthread_create(&th, NULL, step_ahead, NULL);
+            int rc = pkg_open_product(&trust, ffx, PKG_PRODUCT, NULL, &info, err, sizeof(err));
+            pthread_join(th, NULL);
+            set_wall_ahead(0);
+            CHECK(rc == 0, "fwup's answer, read across a step of the wall clock: %d (%s): its bound rides the wall clock",
+                  rc, err);
+
+            net_env_t env;
+            memset(&env, 0, sizeof(env));
+            env.nft = nft;
+            err[0] = '\0';
+            pthread_create(&th, NULL, step_ahead, NULL);
+            rc = net_sweep(&env, err, sizeof(err));
+            pthread_join(th, NULL);
+            set_wall_ahead(0);
+            CHECK(rc == 0, "nft's answer, read across a step of the wall clock: %d (%s): its bound rides the wall clock",
+                  rc, err);
+        }
+        unlink(fwup);
+        unlink(nft);
+        unlink(ffx);
+        rmdir(dir);
     }
 
     printf("%s: evfeed_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
