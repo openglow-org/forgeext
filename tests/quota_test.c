@@ -13,14 +13,17 @@
  * directory swapped for a link between the walk's look at it and its
  * open, a data directory that is itself a link) read as -1 with the
  * reason, never as nothing. A directory the package removes between the
- * walk's look at it and its open holds nothing now, and the measurement
- * completes without it. A tree whose path is longer than PATH_MAX is
- * measured like any other: the walk goes by descriptors, not by a path it
- * builds.
+ * walk's look at it and its open, and a file it removes between the
+ * walk's listing of it and its look, hold nothing now, and the
+ * measurement completes without them. A tree whose path is longer than
+ * PATH_MAX is measured like any other: the walk goes by descriptors, not
+ * by a path it builds.
  *
  * The walk's readdir and fstatat are stand-ins defined here, so that a
- * case can fail a listing or move a directory at the moment the walk
- * reaches it. Until a case arms one, each goes through to the real call.
+ * case can fail a listing, or remove or move an entry, at the moment the
+ * walk reaches it. Until a case arms one, each goes through to the real
+ * call, by the name the C library's headers give the call it stands in
+ * for: a 32-bit build with 64-bit offsets and time renames both.
  */
 #define _GNU_SOURCE
 #include "../src/quota.h"
@@ -34,6 +37,21 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/* The names the headers give readdir and fstatat, and so the names these
+ * stand-ins take: each goes through to the call of that same name. */
+#ifdef __USE_FILE_OFFSET64
+#define REAL_READDIR "readdir64"
+#else
+#define REAL_READDIR "readdir"
+#endif
+#if defined __USE_TIME_BITS64
+#define REAL_FSTATAT "__fstatat64_time64"
+#elif defined __USE_FILE_OFFSET64
+#define REAL_FSTATAT "fstatat64"
+#else
+#define REAL_FSTATAT "fstatat"
+#endif
 
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); \
@@ -51,7 +69,7 @@ struct dirent *readdir(DIR *d)
     static struct dirent *(*real)(DIR *);
     struct stat st;
     if (!real)
-        *(void **)&real = dlsym(RTLD_NEXT, "readdir");
+        *(void **)&real = dlsym(RTLD_NEXT, REAL_READDIR);
     if (torn_ino && fstat(dirfd(d), &st) == 0 && st.st_dev == torn_dev && st.st_ino == torn_ino
         && torn_calls++ > 0) {
         errno = EIO;
@@ -62,16 +80,23 @@ struct dirent *readdir(DIR *d)
 
 /* The entry that the walk's next look moves, once that look has found a
  * directory, before the walk opens it: the package removes it, or, with
- * swap_to set, renames it away and puts a link to swap_to in its place. */
+ * swap_to set, renames it away and puts a link to swap_to in its place.
+ * With before_look set, the package removes the entry before that look,
+ * after the walk's listing has named it. */
 static char moving[64];
 static const char *swap_to;
+static int before_look;
 static int moved;
 
 int fstatat(int fd, const char *restrict path, struct stat *restrict st, int flags)
 {
     static int (*real)(int, const char *, struct stat *, int);
     if (!real)
-        *(void **)&real = dlsym(RTLD_NEXT, "fstatat");
+        *(void **)&real = dlsym(RTLD_NEXT, REAL_FSTATAT);
+    if (before_look && moving[0] && strcmp(path, moving) == 0) {
+        moving[0] = '\0';
+        moved = unlinkat(fd, path, 0) == 0;
+    }
     int rc = real(fd, path, st, flags);
     if (rc == 0 && moving[0] && strcmp(path, moving) == 0 && S_ISDIR(st->st_mode)) {
         char away[80];
@@ -230,10 +255,17 @@ int main(void)
               torn, whole, why);
     }
     /* A directory the package removes between the walk's look at it and
-     * its open holds nothing now: the measurement completes without it. */
+     * its open holds nothing now: the measurement completes without it.
+     * The directory is the only entry of a directory of its own, so the
+     * open's ENOENT is the last errno that listing sees: the walk that
+     * takes it for a failed listing reads -1 here, whatever order the
+     * filesystem lists the tree in. */
+    char tmp[160];
+    snprintf(tmp, sizeof(tmp), "%s/tmp", root);
     {
+        mkdir(tmp, 0700);
         long long base = quota_dir_bytes(root, why, sizeof(why));
-        snprintf(p, sizeof(p), "%s/vanish", root);
+        snprintf(p, sizeof(p), "%s/vanish", tmp);
         mkdir(p, 0700);
         snprintf(moving, sizeof(moving), "vanish");
         swap_to = NULL;
@@ -245,6 +277,28 @@ int main(void)
               "a directory removed between its look and its open reads as %lld after %lld (removed: %d): %s", gone,
               base, moved, why);
         rmdir(p);
+        rmdir(tmp);
+    }
+    /* A file the package removes between the walk's listing of it and its
+     * look holds nothing now either, the only entry of its directory in
+     * the same way. */
+    {
+        mkdir(tmp, 0700);
+        long long base = quota_dir_bytes(root, why, sizeof(why));
+        snprintf(p, sizeof(p), "%s/lone", tmp);
+        fill(p, 4096);
+        snprintf(moving, sizeof(moving), "lone");
+        before_look = 1;
+        moved = 0;
+        why[0] = '\0';
+        long long gone = quota_dir_bytes(root, why, sizeof(why));
+        moving[0] = '\0';
+        before_look = 0;
+        CHECK(moved && gone >= base && !why[0],
+              "a file removed between its listing and its look reads as %lld after %lld (removed: %d): %s", gone, base,
+              moved, why);
+        unlink(p);
+        rmdir(tmp);
     }
     /* A directory the package swaps for a link between the walk's look at
      * it and its open is not followed: the open refuses the link, and the
