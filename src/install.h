@@ -141,14 +141,14 @@ int ext_check(const ext_env_t *env, const state_pkg_t *p, char *err, size_t elen
 int ext_lock(const ext_env_t *env, char *err, size_t elen);
 void ext_unlock(int lock);
 
-/* The daemon's writes, each under the lock. A package that has run
- * healthy once gives up the version it replaced; a package the supervisor
- * gave up on is remembered as quarantined (and let out by quarantined=0).
- * ext_quarantine_if remembers it only while `still` accepts the package's
- * record as it reads under the lock: 1, with nothing written, when `still`
- * refuses it or the package is not installed. */
+/* The daemon's two writes, each under the lock. A package that has run
+ * healthy once gives up the version it replaced (ext_drop_previous). A
+ * package the supervisor gave up on is remembered as quarantined
+ * (ext_quarantine_if), only while `still` accepts the package's record as
+ * it reads under the lock: 1, with nothing written, when `still` refuses
+ * it or the package is not installed. The operator's enable lets a
+ * package out of quarantine (ext_set_enabled). */
 int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen);
-int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen);
 int ext_quarantine_if(const ext_env_t *env, const char *id, int (*still)(const state_pkg_t *p, void *arg), void *arg,
                       char *err, size_t elen);
 

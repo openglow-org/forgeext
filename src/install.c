@@ -868,11 +868,6 @@ int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t el
     return change(env, id, 1, -1, NULL, NULL, err, elen);
 }
 
-int ext_set_quarantined(const ext_env_t *env, const char *id, int on, char *err, size_t elen)
-{
-    return change(env, id, 0, on ? 1 : 0, NULL, NULL, err, elen);
-}
-
 int ext_quarantine_if(const ext_env_t *env, const char *id, int (*still)(const state_pkg_t *p, void *arg), void *arg,
                       char *err, size_t elen)
 {

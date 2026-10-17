@@ -32,9 +32,12 @@ say why, and runs again once its data is cleared and the operator enables
 it; a quarantine the host could not write holds all the same, and is
 written as soon as it can be. A destination the operator names in the
 meantime does not lift it. The operator's enable lifts it, and the host
-does not write the quarantine over that enable. One whose manifest cannot
-be read is set aside too, with the way out that fits it: remove the
-package and install it again. A package the operator removes inside the
+does not write the quarantine over that enable, nor over one that comes
+inside the host's turn, between its read of the state and its write. An
+enable that comes just before the measurement that sets the service
+aside lifts nothing. One whose manifest cannot be read is set aside too,
+with the way out that fits it: remove the package and install it again.
+A package the operator removes inside the
 turn that measures it, after the host has read the state and before it
 measures, is not set aside by the measurement its removal breaks. A
 package granted sender.keep_out that asks to keep the Grbl sender out has
@@ -768,6 +771,7 @@ def main():
         check(fx("remove", eid).get("ok") is True, "and it goes")
 
         print("a killed service comes back; one that keeps ending is quarantined")
+        walks = opens_of(os.path.join(root, "data", "org.example.beat"))   # the host's measurements, from here on
         old = svc("org.example.beat")["pid"]
         os.kill(old, signal.SIGKILL)
         check(wait_for(lambda: svc("org.example.beat").get("state") == "running" and svc("org.example.beat")["pid"] != old, 20),
@@ -805,19 +809,57 @@ def main():
                 time.sleep(0.05)
             return False
 
+        def measuring_turn_hook(act, done):
+            """A hook for the stand-in's GET /mode that runs act() inside the turn that measures next, after the host
+            has read the state and before it measures. The host's turns are a second apart and it measures every
+            30 s: the first question 29.3 s or more after the last measurement comes in one of the turns around 30 s
+            after it, and the answer waits until 30.1 s after it, so the turn that asked measures once it has the
+            answer. act's result and the time of the answer go into done."""
+            once = threading.Lock()
+
+            def hook():
+                if not walks or time.monotonic() < walks[-1] + 29.3 or not once.acquire(blocking=False):
+                    return
+                facts["on_mode"] = None
+                due = walks[-1] + 30.1
+                done["result"] = act()
+                time.sleep(max(0.0, due - time.monotonic()))
+                done["at"] = time.monotonic()
+            return hook
+
         print("over its storage quota: set aside, and back once its data is cleared and it is enabled")
         sid = "org.example.store"
         package(sid, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["storage:1", "net.outbound.operator"])
         check(wait_for(lambda: svc(sid).get("state") == "running", 40), "it runs: %s", svc(sid))
         spid = svc(sid).get("pid", 0)
+        # Just after a measurement, so that the next one, 30 s on, comes after the 2 MiB is there.
+        check(wait_for(lambda: walks and time.monotonic() < walks[-1] + 25, 35, poll=0.1), "the host measures")
         blocker = os.path.join(root, "state.json.new")
         os.mkdir(blocker)                               # state.json cannot be written while this is there: a full /data, in effect
         big = os.path.join(root, "data", sid, "toobig")
         with open(big, "wb") as f:
             f.write(b"x" * (2 << 20))
+        # The operator enables it inside the turn that measures it, after the host has read the state and before the
+        # measurement: the quarantine comes after that enable, so the enable does not lift it.
+        def enable_unblocked():
+            os.rmdir(blocker)                           # for the enable's own write of the state
+            r = fx("enable", sid)
+            os.mkdir(blocker)
+            return r
+
+        enabled = {}
+        at = mark()
+        facts["on_mode"] = measuring_turn_hook(enable_unblocked, enabled)
         q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)  # the host measures every 30 s
+        facts["on_mode"] = None
         check(q and "may hold" in q.get("reason", "") and not os.path.exists("/proc/%d" % spid),
               "2 MiB where it declares storage:1: stopped and set aside, in words that say what it may hold: %s", q or svc(sid))
+        after = wait_for(lambda: next((t for t in walks if t > enabled.get("at", 1e18)), None), 5, poll=0.1)
+        between = [t for t in asked_mode if enabled.get("at", 1e18) < t < (after or 0)]
+        check((enabled.get("result") or {}).get("ok") is True and after and not between,
+              "the operator's enable came inside the turn that set it aside, before its measurement (%.2f s after the "
+              "stand-in's answer, and the host asked the mode %d time%s between): %s", (after or 0) - enabled.get("at", 0),
+              len(between), "" if len(between) == 1 else "s", enabled.get("result"))
 
         print("a quarantine the host could not write stays in force, and is written as soon as it can be")
 
@@ -826,8 +868,9 @@ def main():
 
         check(wait_for(lambda: logged("the quarantine could not be written"), 5), "the host says the write failed")
         check(wait_for(lambda: svc(sid).get("state") != "quarantined" or svc(sid).get("pid"), 12, poll=0.5) is None
-              and not remembered(), "unwritten for 12 s: still set aside with no process, and state.json does not say so: %s",
-              svc(sid))
+              and not remembered() and not since(at, "lifted its quarantine"),
+              "unwritten for 12 s: still set aside with no process, state.json does not say so, and the enable that came "
+              "before the measurement lifted nothing: %s", svc(sid))
         # The way clears, and the operator names a destination for it before the host's next turn: a destination
         # lifts no quarantine, so the host's write lands all the same.
         at = mark()
@@ -870,34 +913,45 @@ def main():
               r.get("error", ""), svc(sid), looks.count(True))
 
         print("a manifest the host cannot read is set aside too, with the way out that fits it")
-        walks = opens_of(os.path.join(root, "data", "org.example.beat"))   # the host's measurements, from here on
         mf, kept = os.path.join(root, "pkg", sid, "current", "manifest.json"), os.path.join(top, "store-manifest.json")
+        at = mark()
+        os.mkdir(blocker)
         os.rename(mf, kept)
         q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)
         why = (q or {}).get("reason", "")
         check("manifest could not be read" in why and "remove the package and install it again" in why
-              and "clear its data" not in why,
-              "its manifest gone: set aside, and told to remove the package and install it again: %s", q or svc(sid))
+              and "clear its data" not in why and wait_for(lambda: since(at, "could not be written"), 5),
+              "its manifest gone: set aside, unwritten, and told to remove the package and install it again: %s",
+              q or svc(sid))
         os.rename(kept, mf)
-        r = fx("enable", sid)
-        check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running", 20),
-              "its manifest back and enabled: it runs: %s %s", r.get("error", ""), svc(sid))
+        # The operator enables it inside the host's turn, after the host has read the state and before it asks for
+        # the quarantine's write again: the write, asked again, finds the enable under the lock and writes nothing.
+        lifted, lifting = {}, threading.Lock()
 
-        print("removed inside the turn that measures it: not set aside by the measurement its removal breaks")
-        removal, removing = {}, threading.Lock()
-
-        def remove_in_measuring_turn():
-            # The first question about the mode 29.3 s after a measurement is asked in the turn that measures
-            # next, after the host has read the state; the measurement waits for the answer.
-            if not walks or time.monotonic() < walks[-1] + 29.3 or not removing.acquire(blocking=False):
+        def enable_before_the_write():
+            if not lifting.acquire(blocking=False):
                 return
             facts["on_mode"] = None
-            removal["result"] = fx("remove", sid)
-            time.sleep(0.5)
-            removal["at"] = time.monotonic()
+            os.rmdir(blocker)
+            lifted["result"] = fx("enable", sid)
 
         at = mark()
-        facts["on_mode"] = remove_in_measuring_turn
+        facts["on_mode"] = enable_before_the_write
+        looks = []
+        ran = wait_for(lambda: looks.append(remembered()) or svc(sid).get("state") == "running", 20, poll=0.2)
+        facts["on_mode"] = None
+        check((lifted.get("result") or {}).get("ok") is True and ran and not any(looks)
+              and since(at, "%s: the operator lifted its quarantine before it could be written" % sid)
+              and not since(at, "its quarantine is written now"),
+              "its manifest back and enabled inside the host's turn, between its read of the state and its write: it "
+              "runs, and state.json never said quarantined: %s %s %s", lifted.get("result"), svc(sid), looks.count(True))
+        if os.path.isdir(blocker):
+            os.rmdir(blocker)
+
+        print("removed inside the turn that measures it: not set aside by the measurement its removal breaks")
+        removal = {}
+        at = mark()
+        facts["on_mode"] = measuring_turn_hook(lambda: fx("remove", sid), removal)
         check(walks is not None and wait_for(lambda: removal.get("at"), 70, poll=0.5),
               "the operator's removal was made inside the host's question: %s", removal)
         facts["on_mode"] = None
