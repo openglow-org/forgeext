@@ -724,13 +724,20 @@ def run_all(w, top):
     check(r.get("ok") is True, "and it checks: %s" % r)
     # An install that fails after current has turned, at the write of state.json (a directory where its new copy
     # goes): current turns back to the version the state names, and nothing the state names is deleted. The kept
-    # predecessor installed again, an update, and a first install, each refused that way.
+    # predecessor installed again, an update, and a first install, each refused that way. current is read after the
+    # kept predecessor's refusal, before the update's own turn back points it at the state's version again.
     blocker = os.path.join(root, "state.json.new")
     os.mkdir(blocker)
     a4 = w.pack(w.tree(manifest(A, "1.3.0", caps=["events", "hold"]), RUN), "official")
     F = "org.example.first"
-    refused = [w.run("install", a3, "--grant", "hold"), w.run("install", a4, "--grant", "hold"),
-               w.run("install", w.pack(w.tree(manifest(F, runtime="data")), "official"))]
+    refused = [w.run("install", a3, "--grant", "hold")]
+    cur, p = os.readlink(os.path.join(pkg, "current")), w.run("list")["packages"][0]
+    read = (p.get("package") or {}).get("version")
+    check(cur == "1.1.0" and p["version"] == "1.1.0" and read == "1.1.0" and "manifest_error" not in p,
+          "the kept predecessor refused: current turns back to the version the state names: current %s, state %s, "
+          "list reads %s" % (cur, p["version"], read or p.get("manifest_error")))
+    refused += [w.run("install", a4, "--grant", "hold"),
+                w.run("install", w.pack(w.tree(manifest(F, runtime="data")), "official"))]
     os.rmdir(blocker)
     p = w.run("list")["packages"][0]
     check(all(r.get("ok") is False and "state.json" in r.get("error", "") for r in refused),
