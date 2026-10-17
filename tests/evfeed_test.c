@@ -44,7 +44,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifdef __USE_TIME_BITS64
+/* The name the headers give clock_gettime, and so the name the stand-in
+ * looks up. The condition is the headers' own. 64-bit time renames the
+ * call to __clock_gettime64, but only on an ABI whose time_t is 32 bits
+ * wide by default (__TIMESIZE == 32). A C library can define
+ * __USE_TIME_BITS64 where time_t is always 64 bits wide, and it renames
+ * nothing there. */
+#if defined __USE_TIME_BITS64 && __TIMESIZE == 32
 #define REAL_CLOCK_GETTIME "__clock_gettime64"
 #else
 #define REAL_CLOCK_GETTIME "clock_gettime"
