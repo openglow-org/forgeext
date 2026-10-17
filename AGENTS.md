@@ -114,6 +114,28 @@ included.
 - `fflog.c` and `fflog.h` are vendored verbatim from forgectrl; keep the
   copies identical.
 
+### CI couplings that set the push order
+
+- The `holds-wire` job of this repository's CI checks out `forgectrl` at
+  the head of its default branch, unpinned. It builds forgectrl's
+  `holds_wire_test` against this tree's `src/holdkeep.c` and runs it. The
+  CI of `forgectrl` builds the same test against the head of this
+  repository. A change to the hold-file wire that needs both sides fails
+  the CI of the repository that is pushed first, until the other is
+  pushed. **Push the two together.** To run the test before a push, build
+  it from a `forgectrl` checkout:
+
+  ```sh
+  cmake -S <forgectrl checkout> -B wire -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Werror -DFORGEEXT_SRC="$PWD/src"
+  cmake --build wire --target holds_wire_test
+  ./wire/holds_wire_test
+  ```
+- The native job checks out `forgefirm` at the head of its default branch,
+  unpinned, for the image's rule file (`ffx.nft`), which
+  `tests/netrules_test.py`, `tests/run_test.py` and `tests/sdk_test.py`
+  load. **Push a rule-file change to `forgefirm` first**, then the change
+  here that matches it.
+
 ## Project-wide rules
 
 The sections above are specific to this repository. The rules below apply to
