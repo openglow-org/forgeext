@@ -39,18 +39,23 @@
 #include <unistd.h>
 
 /* The names the headers give readdir and fstatat, and so the names these
- * stand-ins take: each goes through to the call of that same name. */
+ * stand-ins take: each goes through to the call of that same name. The
+ * conditions are the headers' own. 64-bit offsets rename both calls.
+ * 64-bit time renames fstatat to __fstatat64_time64, but only on an ABI
+ * whose time_t is 32 bits wide by default (__TIMESIZE == 32). A C
+ * library can define __USE_TIME_BITS64 where time_t is always 64 bits
+ * wide, and it renames nothing there. */
 #ifdef __USE_FILE_OFFSET64
 #define REAL_READDIR "readdir64"
 #else
 #define REAL_READDIR "readdir"
 #endif
-#if defined __USE_TIME_BITS64
-#define REAL_FSTATAT "__fstatat64_time64"
-#elif defined __USE_FILE_OFFSET64
-#define REAL_FSTATAT "fstatat64"
-#else
+#ifndef __USE_FILE_OFFSET64
 #define REAL_FSTATAT "fstatat"
+#elif defined __USE_TIME_BITS64 && __TIMESIZE == 32
+#define REAL_FSTATAT "__fstatat64_time64"
+#else
+#define REAL_FSTATAT "fstatat64"
 #endif
 
 static int fails;
