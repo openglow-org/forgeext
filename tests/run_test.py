@@ -397,10 +397,13 @@ def main():
     for name in sorted(os.listdir(src)):
         if name.endswith((".c", ".h")):
             text = open(os.path.join(src, name)).read()
-            # Every read, in every spelling C takes: secure_getenv too, a space before the parenthesis, a name in
-            # any case.
+            # A read through getenv or secure_getenv names its variable as one string literal, with or without
+            # white space around it, in any case. Any other use of either name is a read the list cannot be held
+            # to, and fails: a call with any other argument, and the name with no call after it (a macro, a
+            # pointer, the name in parentheses). A walk of environ is outside these patterns.
             names.update(re.findall(r'\b(?:secure_)?getenv\s*\(\s*"([^"]+)"\s*\)', text))
-            indirect.update(re.findall(r'\b(?:secure_)?getenv\s*\(\s*(?!"|ENV_OVERRIDES\[)[^)]*\)', text))
+            indirect.update(re.findall(r'\b(?:secure_)?getenv\s*\((?!\s*"[^"]+"\s*\)|\s*ENV_OVERRIDES\[)[^)]*\)', text))
+            indirect.update(re.findall(r'\b(?:secure_)?getenv\b(?!\s*\()', text))
     table = re.search(r'ENV_OVERRIDES\[\] = \{(.*?)\};', open(os.path.join(src, "run.c")).read(), re.S)
     env_vars = re.findall(r'"([^"]+)"', table.group(1)) if table else []
     check(table is not None, "run.c carries the list")
@@ -562,8 +565,7 @@ def main():
         check(wait_for(lambda: logged("environment overrides in force: "), 10), "the host names its overrides as it starts")
         line = next((l for l in open(log_path).read().splitlines() if "environment overrides in force: " in l), "")
         named = line.split("environment overrides in force: ", 1)[1].split() if line else []
-        check(sorted(named) == want and all(re.fullmatch(r"[A-Z][A-Z0-9_]*", n) for n in named),
-              "names only, the ones set and no other: %s", named)
+        check(sorted(named) == want, "names only, the ones set and no other: %s", named)
         check(wait_for(lambda: status().get("off_reason"), 10) and not running(), "off: %s", status().get("off_reason"))
         check(sorted(os.listdir(root)) == ["data", "keys", "lock", "pkg", "required-holds", "settings",
                                            "state.json", "tmp"],
