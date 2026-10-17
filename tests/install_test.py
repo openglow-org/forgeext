@@ -722,6 +722,28 @@ def run_all(w, top):
           "the kept predecessor installed again: current is its tree, and the replaced version is kept: %s %s" % (r, p))
     r = w.run("check", A)
     check(r.get("ok") is True, "and it checks: %s" % r)
+    # An install that fails after current has turned, at the write of state.json (a directory where its new copy
+    # goes): current turns back to the version the state names, and nothing the state names is deleted. The kept
+    # predecessor installed again, an update, and a first install, each refused that way.
+    blocker = os.path.join(root, "state.json.new")
+    os.mkdir(blocker)
+    a4 = w.pack(w.tree(manifest(A, "1.3.0", caps=["events", "hold"]), RUN), "official")
+    F = "org.example.first"
+    refused = [w.run("install", a3, "--grant", "hold"), w.run("install", a4, "--grant", "hold"),
+               w.run("install", w.pack(w.tree(manifest(F, runtime="data")), "official"))]
+    os.rmdir(blocker)
+    p = w.run("list")["packages"][0]
+    check(all(r.get("ok") is False and "state.json" in r.get("error", "") for r in refused),
+          "the three installs are refused at the write of the state: %s" % [r.get("error") for r in refused])
+    check(p["version"] == "1.1.0" and p["previous"] == "1.2.0" and os.readlink(os.path.join(pkg, "current")) == "1.1.0"
+          and (p.get("package") or {}).get("version") == "1.1.0" and "manifest_error" not in p,
+          "current names the version the state names, and its manifest is the one read: %s" % p)
+    check(os.path.isfile(os.path.join(pkg, "1.2.0", "manifest.json")) and os.path.isfile(os.path.join(pkg, "1.2.0.files"))
+          and not os.path.exists(os.path.join(pkg, "1.3.0")) and not os.path.exists(os.path.join(pkg, "1.3.0.files")),
+          "the kept predecessor is whole, and the refused update's tree is gone: %s" % sorted(os.listdir(pkg)))
+    check(not os.path.exists(os.path.join(root, "pkg", F)) and F not in [x["id"] for x in w.run("list")["packages"]]
+          and not w.leftovers(), "the refused first install left nothing: %s" % os.listdir(os.path.join(root, "pkg")))
+    check(w.run("check", A).get("ok") is True, "and the package checks")
 
     print("the other tiers, and the namespace")
     B, C, D = "org.example.community", "org.example.unsigned", "org.example.stranger"

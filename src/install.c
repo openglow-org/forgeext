@@ -503,11 +503,41 @@ static void drop_version(const char *pkgdir, const char *version)
     unlink(p);
 }
 
+/* An install that fails after `current` turned to its version turns it
+ * back to the version the state still names (`kept`), or removes it on a
+ * first install, so that `current` and the state agree. The new tree
+ * goes unless the state keeps that version as the predecessor. When
+ * `current` cannot be turned back, the new tree stays where it points,
+ * and the words say so. */
+static void turn_back(const char *pkgdir, const char *version, const char *kept, const char *kept_prev,
+                      char *err, size_t elen)
+{
+    char link[400];
+    int back;
+    if (kept[0]) {
+        back = point_current(pkgdir, kept) == 0;
+    } else {
+        snprintf(link, sizeof(link), "%.340s/current", pkgdir);
+        back = unlink(link) == 0 || errno == ENOENT;
+    }
+    if (!back) {
+        size_t used = err ? strnlen(err, elen) : 0;
+        if (err && used + 1 < elen)
+            snprintf(err + used, elen - used, "; and current cannot be turned back from %s", version);
+        return;
+    }
+    if (strcmp(version, kept_prev) != 0)
+        drop_version(pkgdir, version);
+    if (!kept[0])
+        rmdir(pkgdir);                                  /* empty now, unless an earlier install left something */
+}
+
 int ext_install(const ext_env_t *env, const char *file, const install_opts_t *opts,
                 install_result_t *res, char *err, size_t elen)
 {
     char staging[288], pkgdir[340], from[400], to[400], datadir[340], missing[400] = "";
-    int rc = -1;
+    char kept[33] = "", kept_prev[33] = "";             /* the record's version and predecessor before this install */
+    int rc = -1, turned = 0;
     state_t *st = calloc(1, sizeof(*st));
     if (!st)
         return fail(err, elen, "out of memory");
@@ -564,8 +594,10 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
 
     /* Commit: the tree and its list move into place, `current` turns to
      * them, and the state is written last. A version older than the one
-     * being replaced's own predecessor goes now; the predecessor stays
-     * until the new version has run healthy once. */
+     * being replaced's own predecessor goes once the state is written; the
+     * predecessor stays until the new version has run healthy once. An
+     * install that fails after `current` turned turns it back
+     * (turn_back()), and deletes nothing the state still names. */
     snprintf(pkgdir, sizeof(pkgdir), "%.255s/pkg/%.63s", env->root, m->id);
     if (mkdir(pkgdir, 0755) != 0 && errno != EEXIST) {
         fail(err, elen, "cannot make %s: %s", pkgdir, strerror(errno));
@@ -585,10 +617,11 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
         drop_version(pkgdir, m->version);
         goto out;
     }
+    turned = 1;
     state_pkg_t *p = state_find(st, m->id);
     if (p) {
-        if (strcmp(p->previous, m->version) != 0)
-            drop_version(pkgdir, p->previous);          /* the kept predecessor installed again is the new tree */
+        snprintf(kept, sizeof(kept), "%s", p->version);
+        snprintf(kept_prev, sizeof(kept_prev), "%s", p->previous);
         snprintf(p->previous, sizeof(p->previous), "%s", p->version);
         p->quarantined = 0;
     } else {
@@ -621,7 +654,11 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
         }
     }
     rc = state_save(env->root, st, err, elen);
+    if (rc == 0 && strcmp(kept_prev, m->version) != 0)
+        drop_version(pkgdir, kept_prev);                /* the kept predecessor installed again is the new tree */
 out:
+    if (rc != 0 && turned)
+        turn_back(pkgdir, m->version, kept, kept_prev, err, elen);
     pkg_rmtree(staging);
     ext_unlock(lock);
     free(st);
