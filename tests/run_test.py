@@ -271,6 +271,7 @@ facts = {"armed": False, "controller": "running", "motion": "unverified", "mode"
          "down": False, "sender": [], "on_mode": None}
 streams = []                                    # each /events stream the stand-in holds: the events it has yet to write
 streams_mu = threading.Lock()
+asked_mode = []                                 # when each GET /mode came (time.monotonic()): one a turn
 
 
 def open_streams():
@@ -289,6 +290,8 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/events" and not facts["down"] and self.headers.get("X-ForgeFIRM-Client") == "extension-host":
             return self.stream()
+        if self.path == "/mode":
+            asked_mode.append(time.monotonic())
         if self.path == "/mode" and facts["on_mode"]:
             facts["on_mode"]()                      # the host asks this between its read of the state and its measurement
         body = {"/cool/status": {"armed": facts["armed"]},
@@ -898,13 +901,18 @@ def main():
         check(walks is not None and wait_for(lambda: removal.get("at"), 70, poll=0.5),
               "the operator's removal was made inside the host's question: %s", removal)
         facts["on_mode"] = None
+        # The host asks the mode once a turn, before it measures: no question between the answer and the
+        # measurement puts the two in one turn, the turn whose state was read before the removal.
         after = wait_for(lambda: next((t for t in walks or [] if t > removal.get("at", 1e18)), None), 5, poll=0.1)
-        check(after and after - removal["at"] < 0.9 and (removal.get("result") or {}).get("ok") is True,
-              "removed (%s), in a turn that measures, before its measurement (%.2f s after the removal)",
-              removal.get("result"), (after or 0) - removal.get("at", 0))
-        check(wait_for(lambda: not svc(sid), 10) and not since(at, "%s: its manifest could not be read" % sid)
-              and not since(at, "%s: its data directory could not be measured" % sid),
-              "it goes, and it was not set aside: %s", svc(sid))
+        between = [t for t in asked_mode if removal.get("at", 1e18) < t < (after or 0)]
+        check(after and not between and (removal.get("result") or {}).get("ok") is True,
+              "removed (%s), in a turn that measures, before its measurement (%.2f s after the stand-in's answer, "
+              "and the host asked the mode %d time%s between)", removal.get("result"), (after or 0) - removal.get("at", 0),
+              len(between), "" if len(between) == 1 else "s")
+        gone = wait_for(lambda: not svc(sid), 10)
+        log.flush()
+        aside = re.findall(r"%s: .*: set aside" % re.escape(sid), open(log_path).read()[at:])
+        check(gone and not aside, "it goes, and it was not set aside: %s %s", svc(sid), aside)
 
         print("removed and installed again inside one turn of the host: started again from the new install")
         old = svc("org.example.beat")["pid"]
