@@ -528,8 +528,11 @@ static void drop_version(const char *pkgdir, const char *version)
  * `current` that cannot be turned (the package has no directory, or a
  * directory stands where the link should) is said and left as it is:
  * that package stays refused by the checks that refuse a package without
- * its tree, and the others are repaired and run. 0, or -1 with the
- * reason when the lock cannot be taken. */
+ * its tree, and the others are repaired and run. A version is all
+ * `current` may ever name, so a tree is dropped only when the name it
+ * pointed at is one: a name that is no version, or too long to be read
+ * whole, is said and left where it is. 0, or -1 with the reason when the
+ * lock cannot be taken. */
 static int repair_current(const ext_env_t *env, char *err, size_t elen)
 {
     char pkgdir[340], link[400], cur[64];
@@ -543,15 +546,22 @@ static int repair_current(const ext_env_t *env, char *err, size_t elen)
             snprintf(pkgdir, sizeof(pkgdir), "%.255s/pkg/%.63s", env->root, p->id);
             snprintf(link, sizeof(link), "%.340s/current", pkgdir);
             ssize_t n = readlink(link, cur, sizeof(cur) - 1);
+            int whole = n < (ssize_t)sizeof(cur) - 1;
             cur[n < 0 ? 0 : n] = '\0';
-            if (strcmp(cur, p->version) == 0)
+            if (whole && strcmp(cur, p->version) == 0)
                 continue;
             if (point_current(pkgdir, p->version) != 0) {
                 fflog(LOG_ERR, "%s: current cannot be turned to %s (%s): the package is left as it is, and refused "
                       "until its tree is whole", p->id, p->version, strerror(errno));
                 continue;
             }
-            if (cur[0] && strcmp(cur, p->previous) != 0 && !strchr(cur, '/'))
+            if (!whole)
+                fflog(LOG_WARNING, "%s: current pointed at a name too long to read whole: turned to %s, and what it "
+                      "pointed at is left", p->id, p->version);
+            else if (cur[0] && strcmp(cur, p->previous) != 0 && !manifest_version_ok(cur))
+                fflog(LOG_WARNING, "%s: current pointed at %s, which is no version: turned to %s, and what it "
+                      "pointed at is left", p->id, cur, p->version);
+            else if (cur[0] && strcmp(cur, p->previous) != 0)
                 drop_version(pkgdir, cur);
         }
     }

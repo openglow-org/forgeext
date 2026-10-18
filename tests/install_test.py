@@ -773,6 +773,27 @@ def run_all(w, top):
     check(w.run("inspect", a4).get("ok") is True, "an inspect prepares the root again")
     check(os.readlink(cur) == "1.1.0" and not os.path.exists(os.path.join(pkg, "9.9.9")) and w.run("check", A).get("ok") is True,
           "current left on a version the state does not name: turned back, and that tree goes: %s" % sorted(os.listdir(pkg)))
+    # A version is all current may ever name, and only a tree named by one goes with the turn: current pointing at ..
+    # (root's hand) is turned back and nothing else is touched, and a name too long to read whole is turned back and
+    # the directory it named is left.
+    pkgs = sorted(os.listdir(os.path.join(root, "pkg")))
+    os.symlink("..", cur + ".new")
+    os.rename(cur + ".new", cur)
+    check(w.run("inspect", a4).get("ok") is True, "an inspect prepares the root with current pointing at ..")
+    check(os.path.islink(cur) and os.readlink(cur) == "1.1.0" and sorted(os.listdir(os.path.join(root, "pkg"))) == pkgs
+          and os.path.isfile(os.path.join(pkg, "1.1.0", "manifest.json")) and os.path.isfile(os.path.join(pkg, "1.2.0", "manifest.json"))
+          and w.run("check", A).get("ok") is True,
+          "current pointing at ..: turned back, and nothing else is removed: pkg holds %s, %s"
+          % (sorted(os.listdir(os.path.join(root, "pkg"))), sorted(os.listdir(pkg)) if os.path.isdir(pkg) else "gone"))
+    long = "9" * 70
+    os.makedirs(os.path.join(pkg, long))
+    os.symlink(long, cur + ".new")
+    os.rename(cur + ".new", cur)
+    check(w.run("inspect", a4).get("ok") is True, "an inspect prepares the root with current pointing at a long name")
+    check(os.path.islink(cur) and os.readlink(cur) == "1.1.0" and os.path.isdir(os.path.join(pkg, long))
+          and w.run("check", A).get("ok") is True,
+          "current pointing at a name too long to read whole: turned back, and that directory is left: %s" % sorted(os.listdir(pkg)))
+    os.rmdir(os.path.join(pkg, long))
 
     print("the other tiers, and the namespace")
     B, C, D = "org.example.community", "org.example.unsigned", "org.example.stranger"
