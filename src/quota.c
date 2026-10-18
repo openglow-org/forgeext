@@ -52,8 +52,10 @@ long long quota_of(const manifest_t *m)
  * link while it is measured is not followed, and no path is built that
  * could fail to fit. What the walk cannot measure is not counted as
  * nothing: the measurement fails, and the caller sets the service aside
- * with the reason. */
-static long long walk(int fd, int depth, char *err, size_t elen)
+ * with the reason. The entries are counted in *entries across the whole
+ * tree, and the walk fails past max_entries: what is over the bound is
+ * not walked, so the bound is on the walk's time as well. */
+static long long walk(int fd, int depth, long long max_entries, long long *entries, char *err, size_t elen)
 {
     DIR *d;
     struct dirent *e;
@@ -75,6 +77,10 @@ static long long walk(int fd, int depth, char *err, size_t elen)
             total = fail(err, elen, "cannot examine %s: %s", e->d_name, strerror(errno));
             break;
         }
+        if (++*entries > max_entries) {
+            total = fail(err, elen, "holds more than %lld files and directories", max_entries);
+            break;
+        }
         /* The blocks, not the size: a sparse file has taken what it has
          * taken, and a small file has taken a whole block. */
         total += (long long)st.st_blocks * 512;
@@ -94,7 +100,7 @@ static long long walk(int fd, int depth, char *err, size_t elen)
                     : fail(err, elen, "cannot read %s: %s", e->d_name, strerror(errno));
             break;
         }
-        long long under = walk(sub, depth + 1, err, elen);
+        long long under = walk(sub, depth + 1, max_entries, entries, err, elen);
         if (under < 0) {
             total = -1;
             break;
@@ -111,10 +117,11 @@ static long long walk(int fd, int depth, char *err, size_t elen)
     return total;
 }
 
-long long quota_dir_bytes(const char *path, char *err, size_t elen)
+long long quota_dir_bytes(const char *path, long long max_entries, char *err, size_t elen)
 {
+    long long entries = 0;
     int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0)
         return fail(err, elen, "cannot read %s: %s", path, strerror(errno));
-    return walk(fd, 0, err, elen);
+    return walk(fd, 0, max_entries, &entries, err, elen);
 }

@@ -14,7 +14,12 @@
  * counted is what the filesystem gives the files (their blocks), not the
  * sum of their apparent sizes: a package that makes one enormous sparse
  * file has taken nothing, and a package that makes ten thousand small
- * ones has taken more than their bytes.
+ * ones has taken more than their bytes. The entries are counted too: an
+ * empty file takes no block and costs the quota nothing by its bytes,
+ * and the machine's storage has a fixed number of inodes, so a package
+ * may hold one file or directory per QUOTA_ENTRY_BYTES of its quota. The
+ * bound on the entries also bounds the walk, which runs on the host's
+ * one thread.
  *
  * A package that declares no `storage` still has a data directory, and it
  * gets QUOTA_DEFAULT_MIB. Declaring the capability raises it, to what it
@@ -36,6 +41,9 @@
 #define QUOTA_DEFAULT_MIB 16        /* a service that asks for no storage */
 #define QUOTA_EVERY_S     30.0
 #define QUOTA_MAX_DEPTH   16        /* a tree deeper than this is not measured, and what is not measured sets the service aside */
+/* One file or directory per this much of the quota: 4096 entries for the
+ * default 16 MiB, 65536 for storage:256. */
+#define QUOTA_ENTRY_BYTES 4096
 
 /* What a package may hold, in bytes: its `storage:<MiB>`, or the default. */
 long long quota_of(const manifest_t *m);
@@ -48,8 +56,10 @@ long long quota_of(const manifest_t *m);
  * the reason in err, when the measurement did not complete: the
  * directory (or the path given, if it is a link) or one under it cannot
  * be read, an entry cannot be examined for a reason other than its being
- * gone, an entry changed while it was measured, or the tree is deeper
- * than QUOTA_MAX_DEPTH. What is not measured is never taken for nothing. */
-long long quota_dir_bytes(const char *path, char *err, size_t elen);
+ * gone, an entry changed while it was measured, the tree is deeper than
+ * QUOTA_MAX_DEPTH, or it holds more than max_entries files and
+ * directories together (the quota over QUOTA_ENTRY_BYTES). What is not
+ * measured is never taken for nothing. */
+long long quota_dir_bytes(const char *path, long long max_entries, char *err, size_t elen);
 
 #endif

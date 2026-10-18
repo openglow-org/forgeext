@@ -454,8 +454,9 @@ static int still_installed(const run_t *r, const svc_t *s)
 }
 
 /* Each running service's data directory, measured on its own slow
- * cadence. A service over what its manifest asked for is quarantined:
- * stopped, remembered, and shown with the reason. So is one whose
+ * cadence. A service over what its manifest asked for, in bytes or in
+ * files and directories (one per QUOTA_ENTRY_BYTES of its quota), is
+ * quarantined: stopped, remembered, and shown with the reason. So is one whose
  * manifest cannot be read or whose data directory cannot be measured:
  * what cannot be read is never taken for nothing, and one measurement is
  * the bound, since it is synchronous and has no slow case to wait out.
@@ -480,10 +481,9 @@ static void quota_turn(run_t *r, super_t *sv, double now)
         if (ext_manifest_of(&r->cfg->ext, s->id, &m, err, sizeof(err)) != 0) {
             snprintf(why, sizeof(why), "its manifest could not be read (%.150s)", err);
             remedy = "remove the package and install it again";
-        } else if ((used = quota_dir_bytes(data, err, sizeof(err))) < 0) {
+        } else if ((may = quota_of(&m), used = quota_dir_bytes(data, may / QUOTA_ENTRY_BYTES, err, sizeof(err))) < 0) {
             snprintf(why, sizeof(why), "its data directory could not be measured (%.150s)", err);
         } else {
-            may = quota_of(&m);
             if (used <= may)
                 continue;
             snprintf(why, sizeof(why), "its data directory holds %lld MiB and it may hold %lld", used >> 20, may >> 20);

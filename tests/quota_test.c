@@ -17,7 +17,9 @@
  * walk's listing of it and its look, hold nothing now, and the
  * measurement completes without them. A tree whose path is longer than
  * PATH_MAX is measured like any other: the walk goes by descriptors, not
- * by a path it builds.
+ * by a path it builds. The entries are counted against the bound the
+ * caller gives: a directory of as many files as the bound measures, and
+ * one file more does not.
  *
  * The walk's readdir and fstatat are stand-ins defined here, so that a
  * case can fail a listing, or remove or move an entry, at the moment the
@@ -61,6 +63,9 @@
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); \
                               fflush(stdout); } } while (0)
+
+/* An entry bound no case here reaches, for the cases that are not about it. */
+#define PLENTY (1LL << 20)
 
 /* The listing that fails, as a fault in a directory block fails it: the
  * directory, by device and inode, and the calls made on it. The first
@@ -157,28 +162,28 @@ int main(void)
     /* ---- what it holds ---- */
     snprintf(root, sizeof(root), "/tmp/ffx-quota-test.%d", (int)getpid());
     why[0] = '\0';
-    CHECK(quota_dir_bytes(root, why, sizeof(why)) == -1 && strstr(why, "cannot read"),
+    CHECK(quota_dir_bytes(root, PLENTY, why, sizeof(why)) == -1 && strstr(why, "cannot read"),
           "a directory that is not there reads as -1, with the reason: %s", why);
     mkdir(root, 0700);
-    long long empty = quota_dir_bytes(root, why, sizeof(why));
+    long long empty = quota_dir_bytes(root, PLENTY, why, sizeof(why));
     CHECK(empty == 0, "an empty directory holds nothing: %lld", empty);
 
     snprintf(p, sizeof(p), "%s/a", root);
     fill(p, 40 * 1024);
-    long long one = quota_dir_bytes(root, why, sizeof(why));
+    long long one = quota_dir_bytes(root, PLENTY, why, sizeof(why));
     CHECK(one >= 40 * 1024 && one < 200 * 1024, "40 KiB of file reads as %lld bytes", one);
 
     snprintf(p, sizeof(p), "%s/sub", root);
     mkdir(p, 0700);
     snprintf(p, sizeof(p), "%s/sub/b", root);
     fill(p, 40 * 1024);
-    long long two = quota_dir_bytes(root, why, sizeof(why));
+    long long two = quota_dir_bytes(root, PLENTY, why, sizeof(why));
     CHECK(two >= one + 40 * 1024, "a file in a subdirectory is counted too: %lld then %lld", one, two);
 
     /* A link out of the tree is a link, not what it points at. */
     snprintf(p, sizeof(p), "%s/link", root);
     if (symlink("/usr", p) == 0) {
-        long long three = quota_dir_bytes(root, why, sizeof(why));
+        long long three = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         CHECK(three < two + 64 * 1024, "a symbolic link to /usr was followed: %lld then %lld", two, three);
     } else {
         printf("(no symbolic link made: that case is not checked)\n");
@@ -192,7 +197,7 @@ int main(void)
             if (fseek(f, 64 * 1024 * 1024, SEEK_SET) == 0)
                 fputc('x', f);
             fclose(f);
-            long long four = quota_dir_bytes(root, why, sizeof(why));
+            long long four = quota_dir_bytes(root, PLENTY, why, sizeof(why));
             CHECK(four < 8 * 1024 * 1024,
                   "a 64 MiB sparse file was counted by what it claims: %lld bytes", four);
         }
@@ -201,7 +206,7 @@ int main(void)
     /* ---- what cannot be measured ---- */
     /* A tree deeper than the host measures is not measured, and what is
      * not measured is not nothing: -1, in words that say so. */
-    long long before = quota_dir_bytes(root, why, sizeof(why));
+    long long before = quota_dir_bytes(root, PLENTY, why, sizeof(why));
     {
         char chain[256];
         snprintf(chain, sizeof(chain), "%s/deep", root);
@@ -212,14 +217,14 @@ int main(void)
             mkdir(chain, 0700);
         }
         why[0] = '\0';
-        long long deep = quota_dir_bytes(root, why, sizeof(why));
+        long long deep = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         CHECK(deep == -1 && strstr(why, "deeper"),
               "a chain of %d directories reads as %lld, not -1 in words that say it is too deep: %s",
               QUOTA_MAX_DEPTH + 2, deep, why);
         char cmd[300];
         snprintf(cmd, sizeof(cmd), "rm -rf %s/deep", root);
         if (system(cmd)) { }
-        long long again = quota_dir_bytes(root, why, sizeof(why));
+        long long again = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         CHECK(again == before, "the chain removed, the tree measures as before: %lld then %lld", before, again);
     }
     /* A directory the host cannot read is a measurement that did not
@@ -233,11 +238,11 @@ int main(void)
         snprintf(p, sizeof(p), "%s/shut", root);
         chmod(p, 0);
         why[0] = '\0';
-        long long shut = quota_dir_bytes(root, why, sizeof(why));
+        long long shut = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         CHECK(shut == -1 && strstr(why, "cannot read"),
               "an unreadable subdirectory reads as %lld, not -1 in words that say it cannot be read: %s", shut, why);
         chmod(p, 0700);
-        long long readable = quota_dir_bytes(root, why, sizeof(why));
+        long long readable = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         CHECK(readable >= before + 40 * 1024, "readable again, its file is counted: %lld then %lld", before, readable);
     } else {
         printf("(root: the unreadable directory is not checked)\n");
@@ -246,14 +251,14 @@ int main(void)
      * -1, never the part of it that came before the fault. */
     {
         struct stat st;
-        long long whole = quota_dir_bytes(root, why, sizeof(why));
+        long long whole = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         if (stat(root, &st) == 0) {
             torn_dev = st.st_dev;
             torn_ino = st.st_ino;
             torn_calls = 0;
         }
         why[0] = '\0';
-        long long torn = quota_dir_bytes(root, why, sizeof(why));
+        long long torn = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         torn_ino = 0;
         CHECK(torn_calls > 1 && torn == -1 && strstr(why, "cannot read"),
               "a listing that fails part way reads as %lld after %lld, not -1 in words that say it cannot be read: %s",
@@ -269,14 +274,14 @@ int main(void)
     snprintf(tmp, sizeof(tmp), "%s/tmp", root);
     {
         mkdir(tmp, 0700);
-        long long base = quota_dir_bytes(root, why, sizeof(why));
+        long long base = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         snprintf(p, sizeof(p), "%s/vanish", tmp);
         mkdir(p, 0700);
         snprintf(moving, sizeof(moving), "vanish");
         swap_to = NULL;
         moved = 0;
         why[0] = '\0';
-        long long gone = quota_dir_bytes(root, why, sizeof(why));
+        long long gone = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         moving[0] = '\0';
         CHECK(moved && gone >= base && !why[0],
               "a directory removed between its look and its open reads as %lld after %lld (removed: %d): %s", gone,
@@ -289,14 +294,14 @@ int main(void)
      * the same way. */
     {
         mkdir(tmp, 0700);
-        long long base = quota_dir_bytes(root, why, sizeof(why));
+        long long base = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         snprintf(p, sizeof(p), "%s/lone", tmp);
         fill(p, 4096);
         snprintf(moving, sizeof(moving), "lone");
         before_look = 1;
         moved = 0;
         why[0] = '\0';
-        long long gone = quota_dir_bytes(root, why, sizeof(why));
+        long long gone = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         moving[0] = '\0';
         before_look = 0;
         CHECK(moved && gone >= base && !why[0],
@@ -321,7 +326,7 @@ int main(void)
         swap_to = elsewhere;
         moved = 0;
         why[0] = '\0';
-        long long swapped = quota_dir_bytes(root, why, sizeof(why));
+        long long swapped = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         moving[0] = '\0';
         CHECK(moved && swapped == -1 && strstr(why, "changed while it was measured"),
               "a directory swapped for a link between its look and its open reads as %lld (swapped: %d), not -1 in "
@@ -337,7 +342,7 @@ int main(void)
         snprintf(link, sizeof(link), "%s-link", root);
         if (symlink(root, link) == 0) {
             why[0] = '\0';
-            long long linked = quota_dir_bytes(link, why, sizeof(why));
+            long long linked = quota_dir_bytes(link, PLENTY, why, sizeof(why));
             CHECK(linked == -1 && strstr(why, "cannot read"),
                   "a data directory that is a link reads as %lld, not -1 in words that say it cannot be read: %s",
                   linked, why);
@@ -354,7 +359,7 @@ int main(void)
      * against the tree measured with the chain and without the file: only
      * the file at the bottom can make up the 40 KiB. */
     {
-        long long prior = quota_dir_bytes(root, why, sizeof(why));
+        long long prior = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         char name[256];
         memset(name, 'x', sizeof(name) - 1);
         name[sizeof(name) - 1] = '\0';
@@ -365,7 +370,7 @@ int main(void)
             dfd = next;
             made += next >= 0;
         }
-        long long chain = quota_dir_bytes(root, why, sizeof(why));
+        long long chain = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         int ffd = dfd >= 0 ? openat(dfd, "f", O_WRONLY | O_CREAT, 0600) : -1;
         long long wrote = 0;
         if (ffd >= 0) {
@@ -381,7 +386,7 @@ int main(void)
         if (dfd >= 0)
             close(dfd);
         why[0] = '\0';
-        long long far = quota_dir_bytes(root, why, sizeof(why));
+        long long far = quota_dir_bytes(root, PLENTY, why, sizeof(why));
         CHECK(made == QUOTA_MAX_DEPTH && ffd >= 0 && wrote == 40 * 1024,
               "the long chain was made: %d directories, %lld bytes written at the bottom", made, wrote);
         CHECK(chain >= prior && far >= chain + 40 * 1024,
@@ -389,9 +394,44 @@ int main(void)
               chain, prior, why);
     }
 
+    /* The entries are counted against the bound: a directory of as many
+     * empty files as the bound measures, and one file more is a
+     * measurement that did not complete, in words that say so. The files
+     * are empty, so by their blocks they cost nothing. */
+    char many[160];
+    snprintf(many, sizeof(many), "%s-many", root);
     {
-        char cmd[400];
-        snprintf(cmd, sizeof(cmd), "rm -rf %s %s", root, elsewhere);
+        const long long bound = ((long long)QUOTA_DEFAULT_MIB << 20) / QUOTA_ENTRY_BYTES;  /* the default quota's: 4096 */
+        int made = 0;
+        mkdir(many, 0700);
+        int dfd = open(many, O_RDONLY | O_DIRECTORY);
+        for (long long i = 0; dfd >= 0 && i < bound; i++) {
+            char name[32];
+            snprintf(name, sizeof(name), "f%lld", i);
+            int fd = openat(dfd, name, O_WRONLY | O_CREAT, 0600);
+            made += fd >= 0;
+            if (fd >= 0)
+                close(fd);
+        }
+        why[0] = '\0';
+        long long full = quota_dir_bytes(many, bound, why, sizeof(why));
+        CHECK(made == bound && full >= 0 && !why[0], "%lld empty files under a bound of %lld read as %lld (made %d): %s",
+              bound, bound, full, made, why);
+        int fd = dfd >= 0 ? openat(dfd, "one-more", O_WRONLY | O_CREAT, 0600) : -1;
+        if (fd >= 0)
+            close(fd);
+        if (dfd >= 0)
+            close(dfd);
+        why[0] = '\0';
+        long long over = quota_dir_bytes(many, bound, why, sizeof(why));
+        CHECK(fd >= 0 && over == -1 && strstr(why, "more than"),
+              "%lld empty files under a bound of %lld read as %lld, not -1 in words that say there are too many: %s",
+              bound + 1, bound, over, why);
+    }
+
+    {
+        char cmd[600];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s %s %s", root, elsewhere, many);
         if (system(cmd)) { }
     }
     printf("%s: quota_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
