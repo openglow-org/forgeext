@@ -81,7 +81,11 @@ void ext_read_core_version(char *out, size_t olen)
     ext_read_core_version_from(EXT_VERSION_FILE, out, olen);
 }
 
-int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
+static int repair_current(const ext_env_t *env, char *err, size_t elen);
+
+/* The root's directories (0755; tmp and settings 0700), made where they
+ * are missing. Takes no lock: stage() calls it under the install's. */
+static int root_dirs(const ext_env_t *env, char *err, size_t elen)
 {
     static const struct { const char *name; mode_t mode; } dirs[] = {
         { "", 0755 }, { "/pkg", 0755 }, { "/data", 0755 }, { "/keys", 0755 }, { "/required-holds", 0755 },
@@ -101,6 +105,13 @@ int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
             return fail(err, elen, "cannot set the mode of %s: %s", p, strerror(errno));
     }
     return 0;
+}
+
+int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
+{
+    if (root_dirs(env, err, elen) != 0)
+        return -1;
+    return repair_current(env, err, elen);
 }
 
 int ext_root_reachable(const ext_env_t *env, char *err, size_t elen)
@@ -412,7 +423,7 @@ static int stage(const ext_env_t *env, const char *file, state_t *st, install_re
     char payload[400], tree[400], list[400], mf[400];
 
     memset(res, 0, sizeof(*res));
-    if (ext_root_prepare(env, err, elen) != 0 || state_load(env->root, st, err, elen) != 0)
+    if (root_dirs(env, err, elen) != 0 || state_load(env->root, st, err, elen) != 0)
         return -1;
     snprintf(staging, slen, "%.255s/tmp/in.XXXXXX", env->root);
     if (!mkdtemp(staging))
@@ -463,7 +474,7 @@ int ext_inspect(const ext_env_t *env, const char *file, install_result_t *res, c
     state_t *st = calloc(1, sizeof(*st));
     if (!st)
         return fail(err, elen, "out of memory");
-    int rc = stage(env, file, st, res, staging, sizeof(staging), err, elen);
+    int rc = ext_root_prepare(env, err, elen) == 0 ? stage(env, file, st, res, staging, sizeof(staging), err, elen) : -1;
     if (rc == 0)
         pkg_rmtree(staging);
     free(st);
@@ -503,6 +514,44 @@ static void drop_version(const char *pkgdir, const char *version)
     unlink(p);
 }
 
+/* `current` and the state agree, or `current` is turned to the version
+ * the state names. An install that ended between the turn of `current`
+ * and the write of the state (the host or the machine stopping) left
+ * `current` on a version the state does not name: the state's version is
+ * what is installed, so `current` is turned back to it, and the tree it
+ * pointed at goes with the turn unless the state keeps that version as
+ * the predecessor. Under the lock. A state that cannot be read says
+ * nothing of what `current` should be, and nothing is changed: the
+ * daemon says so on every turn, and an install refuses on it. 0, or -1
+ * with the reason when `current` cannot be turned. */
+static int repair_current(const ext_env_t *env, char *err, size_t elen)
+{
+    char pkgdir[340], link[400], cur[64];
+    state_t *st = calloc(1, sizeof(*st));
+    if (!st)
+        return fail(err, elen, "out of memory");
+    int lock = ext_lock(env, err, elen), rc = lock < 0 ? -1 : 0;
+    if (lock >= 0 && state_load(env->root, st, err, elen) == 0) {
+        for (int i = 0; i < st->n && rc == 0; i++) {
+            const state_pkg_t *p = &st->pkgs[i];
+            snprintf(pkgdir, sizeof(pkgdir), "%.255s/pkg/%.63s", env->root, p->id);
+            snprintf(link, sizeof(link), "%.340s/current", pkgdir);
+            ssize_t n = readlink(link, cur, sizeof(cur) - 1);
+            cur[n < 0 ? 0 : n] = '\0';
+            if (strcmp(cur, p->version) == 0)
+                continue;
+            if (point_current(pkgdir, p->version) != 0) {
+                rc = fail(err, elen, "cannot turn %s to %s: %s", link, p->version, strerror(errno));
+                break;
+            }
+            if (cur[0] && strcmp(cur, p->previous) != 0 && !strchr(cur, '/'))
+                drop_version(pkgdir, cur);
+        }
+    }
+    ext_unlock(lock);
+    free(st);
+    return rc;
+}
 /* An install that fails after `current` turned to its version turns it
  * back to the version the state still names (`kept`), or removes it on a
  * first install, so that `current` and the state agree. The new tree

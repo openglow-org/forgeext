@@ -11,7 +11,9 @@ the three tiers and what each needs from the operator, the product gate
 in both of its directions, a firmware key on an extension, a payload that
 is not the one the signed metadata names, payloads that try to leave the
 package, the namespace, key pinning across an update, the capability diff,
-conflicts, the budget, the integrity check, the page a package serves
+conflicts, the budget, the integrity check, `current` left by a crash on
+a version the state does not name and turned back at the next prepare
+of the root, the page a package serves
 (as it shipped, and none when it is not installed or disabled), removal,
 the wipe a change of
 owner takes (every package, everything under data/, every key the owner
@@ -751,6 +753,26 @@ def run_all(w, top):
     check(not os.path.exists(os.path.join(root, "pkg", F)) and F not in [x["id"] for x in w.run("list")["packages"]]
           and not w.leftovers(), "the refused first install left nothing: %s" % os.listdir(os.path.join(root, "pkg")))
     check(w.run("check", A).get("ok") is True, "and the package checks")
+    # A crash between the turn of current and the write of the state leaves current on a version the state does not
+    # name. The next command to prepare the root (an inspect here) turns it back to the state's version: the kept
+    # predecessor's tree stays, and a tree the state does not name goes with the turn.
+    cur = os.path.join(pkg, "current")
+    os.symlink("1.2.0", cur + ".new")
+    os.rename(cur + ".new", cur)
+    check(w.run("inspect", a4).get("ok") is True, "an inspect prepares the root")
+    p = w.run("list")["packages"][0]
+    check(os.readlink(cur) == "1.1.0" and p["version"] == "1.1.0" and (p.get("package") or {}).get("version") == "1.1.0"
+          and os.path.isfile(os.path.join(pkg, "1.2.0", "manifest.json")),
+          "current left on the kept predecessor by a crash: turned back to the state's version, the predecessor's "
+          "tree kept: current %s, %s" % (os.readlink(cur), sorted(os.listdir(pkg))))
+    os.mkdir(os.path.join(pkg, "9.9.9"))
+    with open(os.path.join(pkg, "9.9.9", "manifest.json"), "w") as f:
+        f.write("{}\n")
+    os.symlink("9.9.9", cur + ".new")
+    os.rename(cur + ".new", cur)
+    check(w.run("inspect", a4).get("ok") is True, "an inspect prepares the root again")
+    check(os.readlink(cur) == "1.1.0" and not os.path.exists(os.path.join(pkg, "9.9.9")) and w.run("check", A).get("ok") is True,
+          "current left on a version the state does not name: turned back, and that tree goes: %s" % sorted(os.listdir(pkg)))
 
     print("the other tiers, and the namespace")
     B, C, D = "org.example.community", "org.example.unsigned", "org.example.stranger"

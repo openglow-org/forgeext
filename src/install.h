@@ -83,7 +83,10 @@ typedef struct {
 
 void ext_env_defaults(ext_env_t *env);
 
-/* Make the root's directories (0755; tmp 0700). */
+/* Make the root's directories (0755; tmp and settings 0700), and turn
+ * each package's `current` to the version the state names where the two
+ * disagree (an install that ended between the turn of `current` and the
+ * write of the state), under the lock. */
 int ext_root_prepare(const ext_env_t *env, char *err, size_t elen);
 
 /* Can a package's account walk to its files? Every directory from / down
