@@ -86,7 +86,10 @@ static int op_quarantine(void *ctx, svc_t *s, const char *why, int again)
     (void)ctx;
     if (again) {
         w.rewrites++;
-        return w.write_rc;
+        /* As the host's operation answers an ask again: the record it reads
+         * where it writes, here the lifts the sync read, lifted since the
+         * service was set aside, is nothing to write. */
+        return s->lifts != s->aside_lifts ? 1 : w.write_rc;
     }
     w.quarantines++;
     snprintf(w.last_quarantined, sizeof(w.last_quarantined), "%s", s->id);

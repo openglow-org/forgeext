@@ -490,7 +490,7 @@ static void aside_restore(run_t *r, super_t *sv)
  * that a host that ends first holds it again when it starts. Asked
  * again, the write lands only on the record the service was set aside
  * under, so an install or an enable that came after it is never written
- * over. */
+ * over; such a lift, or the write that lands, drops the kept aside. */
 static int op_quarantine(void *ctx, svc_t *s, const char *why, int again)
 {
     run_t *r = ctx;

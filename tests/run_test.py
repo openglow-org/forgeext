@@ -1006,12 +1006,23 @@ def main():
               "the write of the aside fails, and state.json does not say quarantined: %s", svc(uid_))
         check(os.path.isfile(kept) and open(kept).read().split("\n")[1] == svc(uid_).get("reason"),
               "the host keeps the unwritten quarantine under its run directory, with the reason: %s", kept_ones())
+        # A second record, for a package that runs, kept under lifts that match no state: the next host takes it up,
+        # finds at its first turn that the operator lifted it since, and the record goes with the lift.
+        lifted = os.path.join(run_dir, "aside", "org.example.jobtime")
+        with open(lifted, "w") as f:
+            f.write("ffffffffffffffff\nset aside under lifts that match no state\n")
         daemon.kill()                                   # SIGKILL: no chance to write anything on the way out
         daemon.wait(timeout=10)
         at = mark()
         daemon = start_daemon()
         check(wait_for(lambda: status().get("pid") == daemon.pid, 15) and since(at, "%s: set aside before the host last "
               "stopped, and not written" % uid_), "the host started again says it took the kept quarantine up")
+        check(wait_for(lambda: since(at, "org.example.jobtime: the operator lifted its quarantine before it could be "
+                                         "written"), 10)
+              and since(at, "org.example.jobtime: set aside before the host last stopped")
+              and wait_for(lambda: not os.path.exists(lifted), 5),
+              "a kept record the operator lifted since is taken up, let go at the first turn, and dropped with the lift: %s",
+              kept_ones())
         check(wait_for(lambda: svc(uid_).get("state") != "quarantined" or svc(uid_).get("pid"), 12, poll=0.5) is None
               and not remembered(uid_) and not since(at, "%s: started as" % uid_) and "may hold" in svc(uid_).get("reason", ""),
               "unwritten for 12 s under the new host: still set aside with no process and never started, state.json "

@@ -102,10 +102,14 @@ static void remember(super_t *sv, svc_t *s)
 /* A quarantine whose write failed keeps the service quarantined, whatever
  * the state says of it: the write is asked for again each tick, until it
  * lands or until the operator lifts the quarantine first, with a new
- * install or an enable. */
+ * install or an enable. The operation is what reads the lift, where it
+ * writes: asked again, it writes nothing on a record the operator lifted
+ * since the service was set aside, and lets go of what it kept of the
+ * quarantine meanwhile. A state it cannot read at this tick holds one
+ * tick more, as a write that fails does. */
 static void hold(super_t *sv, svc_t *s)
 {
-    int r = s->lifts != s->aside_lifts ? 1 : sv->ops->quarantine(sv->ctx, s, s->reason, 1);
+    int r = sv->ops->quarantine(sv->ctx, s, s->reason, 1);
     if (r < 0) {
         s->wanted = 0;
         return;

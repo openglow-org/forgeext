@@ -36,12 +36,12 @@
  *     install or an enable. A destination the operator names lifts
  *     nothing. A host that ends before the write lands holds it still
  *     when it starts again: the operation keeps the unwritten quarantine
- *     outside the state (run.c, under the run directory) and the host
- *     takes it up as it starts. A reboot forgets it, and the service then
- *     runs again until its cause sets it aside again: the next
- *     measurement for its storage, SUPER_QUARANTINE_CRASHES more early
- *     ends for a crash, and SUPER_POSTURE_TRIES turns of the next armed
- *     window for a freeze.
+ *     outside the state (run.c, under the run directory) until the write
+ *     lands or it finds the operator's lift, and the host takes it up as
+ *     it starts. A reboot forgets it, and the service then runs again
+ *     until its cause sets it aside again: the next measurement for its
+ *     storage, SUPER_QUARANTINE_CRASHES more early ends for a crash, and
+ *     SUPER_POSTURE_TRIES turns of the next armed window for a freeze.
  *   A service that should not run (disabled, removed, quarantined, the
  *     wrong controller mode, extensions off) is stopped; its end is not a
  *     crash.
@@ -94,8 +94,10 @@ typedef struct {
     /* The operator's lifts of a quarantine, as a digest the sync sets: the
      * install (its version, and its stamp) and the count of the operator's
      * enables. A quarantine whose write failed (unwritten) holds until it
-     * is written, or until lifts moves from aside_lifts, its value when the
-     * service was set aside. */
+     * is written, or until the operation, asked again, finds the lifts
+     * moved from aside_lifts, those the service was set aside under: the
+     * sync's lifts are where aside_lifts starts, for a first ask that
+     * cannot read them where it writes. */
     unsigned long long lifts, aside_lifts;
     int unwritten;
     double started, next_start, backoff_s;
