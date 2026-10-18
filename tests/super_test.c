@@ -13,9 +13,10 @@
  * fifth early end, which is remembered and keeps it down until a sync lets
  * it out; ends spread wider than the window never quarantine; a healthy
  * run starts the backoff over, is told once, and its end counts for
- * nothing; a failed start is a crash; a service that is disabled, gone, or
- * in the wrong controller mode is stopped without a crash, and a package
- * that is gone leaves the table; turning extensions off stops everything,
+ * nothing; a failed start is a crash; a service that is disabled, gone,
+ * in the wrong controller mode, or held out by the sync (with the sync's
+ * reason) is stopped without a crash, and a package that is gone leaves
+ * the table; turning extensions off stops everything,
  * and the ends that follow are nobody's crash; a package that keeps
  * ending does not take the start slots of the ones that would stay up;
  * and, for the window's posture, a freeze that will not take sets the
@@ -266,7 +267,17 @@ int main(void)
     CHECK(b->state == SVC_STOPPED && b->ncrashes == 0, "its end was counted as a crash");
     a->wanted = 0;
     super_tick(&sv, &READY, 130);
-    CHECK(a->state == SVC_STOPPED && w.stops == 2, "a disabled service was not stopped");
+    CHECK(a->state == SVC_STOPPED && w.stops == 2 && strstr(a->reason, "not enabled"),
+          "a disabled service was not stopped: %s (%s)", super_state_name(a->state), a->reason);
+    /* One the sync holds out, for a manifest it cannot read, is stopped
+     * with the sync's reason and not the state's. */
+    snprintf(a->held_out, sizeof(a->held_out), "its manifest could not be read (the package has no manifest.json)");
+    super_tick(&sv, &READY, 131);
+    CHECK(a->state == SVC_STOPPED && strstr(a->reason, "its manifest could not be read"),
+          "a service held out by the sync: %s (%s)", super_state_name(a->state), a->reason);
+    a->held_out[0] = '\0';
+    super_tick(&sv, &READY, 132);
+    CHECK(strstr(a->reason, "not enabled"), "held out no longer, the reason is the state's: %s", a->reason);
     super_sync_begin(&sv);
     add("org.example.b", 1);
     super_sync_end(&sv);

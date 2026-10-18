@@ -936,7 +936,11 @@ static unsigned long long lifts_digest(const state_pkg_t *p)
 
 /* What is installed, into the policy's table. */
 /* The table from the state: 0, or -1 when the state cannot be read, and
- * nothing is changed. */
+ * nothing is changed. A service that is not running takes what it runs
+ * in and what it answers from its manifest, read afresh; one whose
+ * manifest cannot be read (a tree the operator's hand took, or a damaged
+ * /data) is held out with that reason, said once, since nothing is known
+ * of it: the way out is to remove the package and install it again. */
 static int sync_installed(run_t *r, super_t *sv)
 {
     static state_t st;
@@ -962,12 +966,22 @@ static int sync_installed(run_t *r, super_t *sv)
         s->pkg_enabled = p->enabled;
         s->conf_wanted = conf_digest(p);
         s->lifts = lifts_digest(p);
-        if (s->state != SVC_RUNNING && ext_manifest_of(&r->cfg->ext, p->id, &m, err, sizeof(err)) == 0) {
-            s->mode_grbl = m.mode_grbl;
-            s->mode_cloud = m.mode_cloud;
-            s->mcodes = mcodes_of(&m);
+        if (s->state != SVC_RUNNING) {
+            if (ext_manifest_of(&r->cfg->ext, p->id, &m, err, sizeof(err)) == 0) {
+                s->mode_grbl = m.mode_grbl;
+                s->mode_cloud = m.mode_cloud;
+                s->mcodes = mcodes_of(&m);
+                s->held_out[0] = '\0';
+            } else {
+                char why[sizeof(s->held_out)];
+                snprintf(why, sizeof(why), "its manifest could not be read (%.80s): remove the package and install "
+                         "it again", err);
+                if (strcmp(why, s->held_out) != 0)
+                    fflog(LOG_WARNING, "%s: %s", p->id, why);
+                snprintf(s->held_out, sizeof(s->held_out), "%s", why);
+            }
         }
-        s->wanted = p->enabled && !p->quarantined;
+        s->wanted = p->enabled && !p->quarantined && !s->held_out[0];
         if (p->quarantined && s->state != SVC_RUNNING && s->state != SVC_QUARANTINED) {
             s->state = SVC_QUARANTINED;
             if (!s->reason[0])

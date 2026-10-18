@@ -38,7 +38,9 @@ does not write the quarantine over that enable, nor over one that comes
 inside the host's turn, between its read of the state and its write. An
 enable that comes just before the measurement that sets the service
 aside lifts nothing. One whose manifest cannot be read is set aside too,
-with the way out that fits it: remove the package and install it again.
+with the way out that fits it: remove the package and install it again;
+one enabled with no manifest to read when a host starts is held out by
+that host, never started, in words that name the manifest.
 A package the operator removes inside the
 turn that measures it, after the host has read the state and before it
 measures, is not set aside by the measurement its removal breaks. A
@@ -1173,6 +1175,14 @@ def main():
         shutil.rmtree(os.path.join(root, "pkg", notree))
         check(r.get("ok") is True and wait_for(lambda: svc(notree).get("state") != "running", 10),
               "installed, disabled, and its tree taken by hand: %s %s", r.get("error", ""), svc(notree))
+        # A second one the same way, enabled again once the host that would start it is killed below: the next
+        # host finds it enabled with no manifest to read, and holds it out in words that say so.
+        notree2 = "org.example.notree2"
+        package(notree2, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n")
+        r = fx("disable", notree2)
+        shutil.rmtree(os.path.join(root, "pkg", notree2))
+        check(r.get("ok") is True and wait_for(lambda: svc(notree2).get("state") != "running", 10),
+              "a second one, installed, disabled, and its tree taken by hand: %s %s", r.get("error", ""), svc(notree2))
 
         print("one daemon at a time; a killed daemon's services do not outlive the next one's start")
         check(wait_for(lambda: len(running()) >= 2, 30), "services are running before the daemon is killed: %s", running())
@@ -1186,6 +1196,8 @@ def main():
               "and the first one's services are untouched by it")
         daemon.kill()
         daemon.wait(timeout=10)
+        r = fx("enable", notree2)
+        check(r.get("ok") is True, "the second one enabled with no tree, with no host running: %s", r.get("error", ""))
         time.sleep(2.6)
         stale = held("org.example.crash")
         check(stale and stale["age"] > 2.0 and stale["required"], "a killed host's required hold stays and goes stale, which "
@@ -1216,6 +1228,13 @@ def main():
         with open(conf, "w") as f:
             f.write("ext_enabled=1\n")
         check(wait_for(lambda: len(running()) >= 1, 30), "turned on again, the services start under the new daemon")
+        check(wait_for(lambda: svc(notree2).get("reason", "").startswith("its manifest could not be read"), 10)
+              and svc(notree2).get("state") == "stopped" and not svc(notree2).get("pid")
+              and not since(at, "%s: started as" % notree2) and since(at, "%s: its manifest could not be read" % notree2),
+              "the enabled package with no tree is held out, in words that name its manifest, and never started: %s",
+              svc(notree2))
+        r = fx("remove", notree2)
+        check(r.get("ok") is True and wait_for(lambda: not svc(notree2), 10), "and it goes: %s", r.get("error", ""))
 
         check(wait_for(lambda: held("org.example.crash") is not None, 10), "on again: the required hold has its file again")
 

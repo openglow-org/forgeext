@@ -313,7 +313,7 @@ void super_tick(super_t *sv, const super_inputs_t *in, double now)
             s->backoff_s = 0;
         }
         if (!s->wanted) {
-            stop(sv, s, "not enabled");
+            stop(sv, s, s->held_out[0] ? s->held_out : "not enabled");
             continue;
         }
         if (!mode_fits(s, in)) {

@@ -43,7 +43,8 @@
  *     storage, SUPER_QUARANTINE_CRASHES more early ends for a crash, and
  *     SUPER_POSTURE_TRIES turns of the next armed window for a freeze.
  *   A service that should not run (disabled, removed, quarantined, the
- *     wrong controller mode, extensions off) is stopped; its end is not a
+ *     wrong controller mode, extensions off, or held out by the sync
+ *     because its manifest cannot be read) is stopped; its end is not a
  *     crash.
  *   A service whose version or whose operator's destinations changed is
  *     stopped and started again, outside an armed window; that is not a
@@ -79,7 +80,12 @@ typedef struct {
     int mode_grbl, mode_cloud;          /* the controller modes it runs in */
     unsigned long mcodes;               /* the M-codes it answers: bit n for M(CAPS_MCODE_MIN + n) */
     int present;                        /* the package is installed (set by every sync) */
-    int wanted;                         /* enabled and not quarantined (from state.json) */
+    int wanted;                         /* enabled and not quarantined (from state.json), and not held out */
+    /* Why the sync holds the service out when the state would have it
+     * run: its manifest could not be read, so what it runs in and what it
+     * answers are unknown. "" when nothing holds it out. It is the stop's
+     * reason in place of "not enabled". */
+    char held_out[160];
 
     svc_state_t state;
     pid_t pid;
