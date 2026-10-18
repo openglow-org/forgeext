@@ -197,7 +197,11 @@ int ext_dest(const ext_env_t *env, const char *id, int add, const char *dest, ch
  * package whose hold is granted and marked required, and nothing else.
  * forgectrl reads the names: a required hold nobody speaks for (no host
  * since the boot) stands. Made to match the state, by every command that
- * changes it and by the host on every turn. */
+ * changes it and by the host on every turn. The directory on the
+ * machine is one literal, EXT_REQUIRED_HOLDS_DIR: forgectrl's
+ * holds_wire_test holds its own name for the directory to it. */
+#define EXT_REQUIRED_HOLDS_NAME "required-holds"
+#define EXT_REQUIRED_HOLDS_DIR  EXT_ROOT_DEFAULT "/" EXT_REQUIRED_HOLDS_NAME
 int ext_required_holds_sync(const ext_env_t *env, const state_t *st);
 
 #endif

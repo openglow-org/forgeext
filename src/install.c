@@ -88,7 +88,8 @@ static int repair_current(const ext_env_t *env, char *err, size_t elen);
 static int root_dirs(const ext_env_t *env, char *err, size_t elen)
 {
     static const struct { const char *name; mode_t mode; } dirs[] = {
-        { "", 0755 }, { "/pkg", 0755 }, { "/data", 0755 }, { "/keys", 0755 }, { "/required-holds", 0755 },
+        { "", 0755 }, { "/pkg", 0755 }, { "/data", 0755 }, { "/keys", 0755 },
+        { "/" EXT_REQUIRED_HOLDS_NAME, 0755 },
         { "/" SETTINGS_DIR, 0700 }, { "/tmp", 0700 },
     };
     if (!env->root || !env->root[0] || strlen(env->root) > EXT_ROOT_MAX)
@@ -840,7 +841,7 @@ int ext_wipe(const ext_env_t *env, int *packages, int *keys, char *err, size_t e
 int ext_required_holds_sync(const ext_env_t *env, const state_t *st)
 {
     char dir[300], p[400];
-    snprintf(dir, sizeof(dir), "%.255s/required-holds", env->root);
+    snprintf(dir, sizeof(dir), "%.255s/" EXT_REQUIRED_HOLDS_NAME, env->root);
     if (mkdir(dir, 0755) != 0 && errno != EEXIST)
         return -1;
     int bad = 0;
