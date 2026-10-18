@@ -827,16 +827,16 @@ def main():
         def measuring_turn_hook(act, done):
             """A hook for the stand-in's GET /mode that runs act() inside the turn that measures next, after the host
             has read the state and before it measures. The host's turns are a second apart and it measures every
-            30 s: the first question 29.3 s or more after the last measurement comes in one of the turns around 30 s
-            after it, and the answer waits until 30.1 s after it, so the turn that asked measures once it has the
+            10 s: the first question 9.3 s or more after the last measurement comes in one of the turns around 10 s
+            after it, and the answer waits until 10.1 s after it, so the turn that asked measures once it has the
             answer. act's result and the time of the answer go into done."""
             once = threading.Lock()
 
             def hook():
-                if not walks or time.monotonic() < walks[-1] + 29.3 or not once.acquire(blocking=False):
+                if not walks or time.monotonic() < walks[-1] + 9.3 or not once.acquire(blocking=False):
                     return
                 facts["on_mode"] = None
-                due = walks[-1] + 30.1
+                due = walks[-1] + 10.1
                 done["result"] = act()
                 time.sleep(max(0.0, due - time.monotonic()))
                 done["at"] = time.monotonic()
@@ -847,8 +847,8 @@ def main():
         package(sid, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["storage:1", "net.outbound.operator"])
         check(wait_for(lambda: svc(sid).get("state") == "running", 40), "it runs: %s", svc(sid))
         spid = svc(sid).get("pid", 0)
-        # Just after a measurement, so that the next one, 30 s on, comes after the 2 MiB is there.
-        check(wait_for(lambda: walks and time.monotonic() < walks[-1] + 25, 35, poll=0.1), "the host measures")
+        # Just after a measurement, so that the next one, 10 s on, comes after the 2 MiB is there.
+        check(wait_for(lambda: walks and time.monotonic() < walks[-1] + 5, 15, poll=0.1), "the host measures")
         blocker = os.path.join(root, "state.json.new")
         os.mkdir(blocker)                               # state.json cannot be written while this is there: a full /data, in effect
         big = os.path.join(root, "data", sid, "toobig")
@@ -865,7 +865,7 @@ def main():
         enabled = {}
         at = mark()
         facts["on_mode"] = measuring_turn_hook(enable_unblocked, enabled)
-        q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)  # the host measures every 30 s
+        q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)  # the host measures every 10 s
         facts["on_mode"] = None
         check(q and "may hold" in q.get("reason", "") and not os.path.exists("/proc/%d" % spid),
               "2 MiB where it declares storage:1: stopped and set aside, in words that say what it may hold: %s", q or svc(sid))

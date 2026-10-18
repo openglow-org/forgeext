@@ -9,8 +9,9 @@
  * number in its manifest was decoration. The host measures each running
  * service's data directory and sets aside one that is over.
  *
- * Measuring costs a walk of the directory, so it is done on its own slow
- * cadence (QUOTA_EVERY_S) and only for services that are running. What is
+ * Measuring costs a walk of the directory, so it is done on its own
+ * cadence (QUOTA_EVERY_S), which is the longest a package writes
+ * unmeasured, and only for services that are running. What is
  * counted is what the filesystem gives the files (their blocks), not the
  * sum of their apparent sizes: a package that makes one enormous sparse
  * file has taken nothing, and a package that makes ten thousand small
@@ -40,7 +41,7 @@
 #include "manifest.h"
 
 #define QUOTA_DEFAULT_MIB 16        /* a service that asks for no storage */
-#define QUOTA_EVERY_S     30.0
+#define QUOTA_EVERY_S     10.0      /* a package writes unmeasured for at most this long */
 #define QUOTA_MAX_DEPTH   16        /* a tree deeper than this is not measured, and what is not measured sets the service aside */
 /* One file or directory per this much of the quota: 4096 entries for the
  * default 16 MiB, 65536 for storage:256. */
