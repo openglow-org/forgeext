@@ -1013,8 +1013,22 @@ def main():
             f.write("ffffffffffffffff\nset aside under lifts that match no state\n")
         daemon.kill()                                   # SIGKILL: no chance to write anything on the way out
         daemon.wait(timeout=10)
+        # The state unreadable as the host starts: nothing is taken up, and the kept records wait for the first turn
+        # the state reads, where they are taken up ahead of any start.
+        state_path, state_kept = os.path.join(root, "state.json"), os.path.join(top, "state.json.kept")
+        os.rename(state_path, state_kept)
+        with open(state_path, "w") as f:
+            f.write("not a state\n")
         at = mark()
         daemon = start_daemon()
+        check(wait_for(lambda: status().get("pid") == daemon.pid, 15)
+              and wait_for(lambda: since(at, "nothing is changed until it reads"), 10)
+              and not since(at, "set aside before the host last stopped") and os.path.isfile(kept) and os.path.isfile(lifted),
+              "started on a state it cannot read, the host takes nothing up and leaves the records: %s", kept_ones())
+        os.rename(state_kept, state_path)
+        check(wait_for(lambda: since(at, "%s: set aside before the host last stopped, and not written" % uid_), 10)
+              and not since(at, "%s: started as" % uid_),
+              "the state readable, the kept quarantine is taken up at the next turn, ahead of any start")
         check(wait_for(lambda: status().get("pid") == daemon.pid, 15) and since(at, "%s: set aside before the host last "
               "stopped, and not written" % uid_), "the host started again says it took the kept quarantine up")
         check(wait_for(lambda: since(at, "org.example.jobtime: the operator lifted its quarantine before it could be "

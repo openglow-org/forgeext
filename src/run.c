@@ -441,18 +441,20 @@ static void aside_drop(const run_t *r, const char *id)
  * again before anything runs, unwritten, so that the first tick asks for
  * its write, or finds the operator lifted it since. One for a package the
  * state no longer names is removed. While the state cannot be read
- * nothing is started, so each is left for a start that can read it. */
-static void aside_restore(run_t *r, super_t *sv)
+ * nothing is started, so each is left for the first turn that can read
+ * it, which takes them up ahead of that turn's starts: 0 then, 1 once
+ * the records were taken up. */
+static int aside_restore(run_t *r, super_t *sv)
 {
     static state_t st;
     char dir[PATH_MAX], err[300];
     struct dirent *e;
     if (state_load(r->cfg->ext.root, &st, err, sizeof(err)) != 0)
-        return;
+        return 0;
     snprintf(dir, sizeof(dir), "%.4000s/aside", r->cfg->run_dir);
     DIR *d = opendir(dir);
     if (!d)
-        return;
+        return 1;
     while ((e = readdir(d)) != NULL) {
         char p[PATH_MAX], line[200] = "";
         unsigned long long lifts;
@@ -483,6 +485,7 @@ static void aside_restore(run_t *r, super_t *sv)
               "written, or until the operator lifts it (%s)", e->d_name, s->reason);
     }
     closedir(d);
+    return 1;
 }
 /* The quarantine is remembered in state.json. A write that fails (a full
  * /data) is the policy's to hold (super.c), and it asks again each turn;
@@ -932,14 +935,16 @@ static unsigned long long lifts_digest(const state_pkg_t *p)
 }
 
 /* What is installed, into the policy's table. */
-static void sync_installed(run_t *r, super_t *sv)
+/* The table from the state: 0, or -1 when the state cannot be read, and
+ * nothing is changed. */
+static int sync_installed(run_t *r, super_t *sv)
 {
     static state_t st;
     static manifest_t m;
     char err[300];
     if (state_load(r->cfg->ext.root, &st, err, sizeof(err)) != 0) {
         fflog(LOG_ERR, "%s: nothing is changed until it reads", err);
-        return;
+        return -1;
     }
     super_sync_begin(sv);
     for (int i = 0; i < st.n; i++) {
@@ -972,6 +977,7 @@ static void sync_installed(run_t *r, super_t *sv)
     super_sync_end(sv);
     if (ext_required_holds_sync(&r->cfg->ext, &st) != 0)
         fflog(LOG_WARNING, "the required holds under %s could not be made to match the state", r->cfg->ext.root);
+    return 0;
 }
 
 static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
@@ -1152,7 +1158,7 @@ int run_daemon(const run_cfg_t *cfg)
         return 1;
     }
     super_init(&sv, &OPS, &r);
-    aside_restore(&r, &sv);
+    int restored = aside_restore(&r, &sv);
     fflog(LOG_NOTICE, "started: extension root %s, groups under %s", cfg->ext.root, cfg->cg_parent);
     say_env_overrides();
 
@@ -1190,7 +1196,11 @@ int run_daemon(const run_cfg_t *cfg)
 
         machine_t mc;
         int waiting = 0;
-        sync_installed(&r, &sv);
+        /* A state unreadable as the host started and readable now: what
+         * the last host kept is taken up here, before this turn starts
+         * anything, as it would have been at the start. */
+        if (sync_installed(&r, &sv) == 0 && !restored)
+            restored = aside_restore(&r, &sv);
         for (int i = 0; i < sv.n; i++)
             waiting |= sv.svc[i].wanted && sv.svc[i].state != SVC_RUNNING;
         machine_read(&cfg->machine, &mc, waiting);
