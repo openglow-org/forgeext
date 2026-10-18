@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 #include "run.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <jansson.h>
@@ -399,11 +400,97 @@ static int still_aside(const state_pkg_t *p, void *arg)
     return 1;
 }
 
+/* A quarantine the state could not take is kept under the run directory
+ * (aside/<id>, on tmpfs), so that a host that ends before the write
+ * lands, however it ends, holds it still when it starts again: the lifts
+ * it was set aside under and the reason, written whole and renamed into
+ * place, removed once the state takes the record or the operator lifts
+ * it. A reboot forgets it with the rest of /run, and the service then
+ * runs until its cause sets it aside again. */
+static void aside_path(const run_t *r, const char *id, char *out, size_t olen)
+{
+    snprintf(out, olen, "%.4000s/aside/%.63s", r->cfg->run_dir, id);
+}
+
+static void aside_keep(const run_t *r, const svc_t *s)
+{
+    char p[PATH_MAX], tmp[PATH_MAX];
+    aside_path(r, s->id, p, sizeof(p));
+    snprintf(tmp, sizeof(tmp), "%.4000s.new", p);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    int ok = f && fprintf(f, "%llx\n%s\n", s->aside_lifts, s->reason) > 0 && fflush(f) == 0;
+    if (f)
+        fclose(f);
+    else if (fd >= 0)
+        close(fd);
+    if (!ok || rename(tmp, p) != 0) {
+        fflog(LOG_ERR, "%s: its unwritten quarantine could not be kept at %s: %s", s->id, p, strerror(errno));
+        unlink(tmp);
+    }
+}
+
+static void aside_drop(const run_t *r, const char *id)
+{
+    char p[PATH_MAX];
+    aside_path(r, id, p, sizeof(p));
+    unlink(p);
+}
+
+/* What the last host kept under aside/: each is a service set aside
+ * again before anything runs, unwritten, so that the first tick asks for
+ * its write, or finds the operator lifted it since. One for a package the
+ * state no longer names is removed. While the state cannot be read
+ * nothing is started, so each is left for a start that can read it. */
+static void aside_restore(run_t *r, super_t *sv)
+{
+    static state_t st;
+    char dir[PATH_MAX], err[300];
+    struct dirent *e;
+    if (state_load(r->cfg->ext.root, &st, err, sizeof(err)) != 0)
+        return;
+    snprintf(dir, sizeof(dir), "%.4000s/aside", r->cfg->run_dir);
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    while ((e = readdir(d)) != NULL) {
+        char p[PATH_MAX], line[200] = "";
+        unsigned long long lifts;
+        if (e->d_name[0] == '.' || !manifest_id_ok(e->d_name))
+            continue;
+        if (!state_find(&st, e->d_name)) {
+            aside_drop(r, e->d_name);
+            continue;
+        }
+        aside_path(r, e->d_name, p, sizeof(p));
+        FILE *f = fopen(p, "re");
+        if (!f)
+            continue;
+        int ok = fscanf(f, "%llx\n", &lifts) == 1 && fgets(line, sizeof(line), f) != NULL;
+        fclose(f);
+        svc_t *s = ok ? super_service(sv, e->d_name) : NULL;
+        if (!s) {
+            fflog(LOG_ERR, "%s: a kept quarantine at %s could not be taken up", e->d_name, p);
+            continue;
+        }
+        line[strcspn(line, "\n")] = '\0';
+        s->state = SVC_QUARANTINED;
+        s->unwritten = 1;
+        s->aside_lifts = lifts;
+        s->wanted = 0;
+        snprintf(s->reason, sizeof(s->reason), "%s", line);
+        fflog(LOG_WARNING, "%s: set aside before the host last stopped, and not written: it stays aside until it is "
+              "written, or until the operator lifts it (%s)", e->d_name, s->reason);
+    }
+    closedir(d);
+}
 /* The quarantine is remembered in state.json. A write that fails (a full
- * /data) is the policy's to hold (super.c), and it asks again each turn.
- * Asked again, the write lands only on the record the service was set
- * aside under, so an install or an enable that came after it is never
- * written over. */
+ * /data) is the policy's to hold (super.c), and it asks again each turn;
+ * the aside is kept under the run directory meanwhile (aside_keep), so
+ * that a host that ends first holds it again when it starts. Asked
+ * again, the write lands only on the record the service was set aside
+ * under, so an install or an enable that came after it is never written
+ * over. */
 static int op_quarantine(void *ctx, svc_t *s, const char *why, int again)
 {
     run_t *r = ctx;
@@ -411,9 +498,13 @@ static int op_quarantine(void *ctx, svc_t *s, const char *why, int again)
     aside_t a = { s, again };
     (void)why;                                          /* the policy keeps it, in s->reason */
     int rc = ext_quarantine_if(&r->cfg->ext, s->id, still_aside, &a, err, sizeof(err));
-    if (rc < 0 && !again)
+    if (rc < 0 && !again) {
         fflog(LOG_ERR, "%s: the quarantine could not be written (%s): it stays in force until it is, or until the "
               "operator lifts it", s->id, err);
+        aside_keep(r, s);
+    } else if (rc >= 0) {
+        aside_drop(r, s->id);
+    }
     return rc;
 }
 
@@ -982,7 +1073,9 @@ int run_daemon(const run_cfg_t *cfg)
         fprintf(stderr, "forgeext run: %s\n", err);
         return 1;
     }
-    if (mkdir(cfg->run_dir, 0755) != 0 && errno != EEXIST) {
+    char aside_dir[PATH_MAX];
+    snprintf(aside_dir, sizeof(aside_dir), "%.4000s/aside", cfg->run_dir);
+    if ((mkdir(cfg->run_dir, 0755) != 0 && errno != EEXIST) || (mkdir(aside_dir, 0700) != 0 && errno != EEXIST)) {
         fflog(LOG_ERR, "not starting: cannot make %s: %s", cfg->run_dir, strerror(errno));
         return 1;
     }
@@ -1059,6 +1152,7 @@ int run_daemon(const run_cfg_t *cfg)
         return 1;
     }
     super_init(&sv, &OPS, &r);
+    aside_restore(&r, &sv);
     fflog(LOG_NOTICE, "started: extension root %s, groups under %s", cfg->ext.root, cfg->cg_parent);
     say_env_overrides();
 

@@ -30,8 +30,9 @@ remembers it. One that holds more than its storage capability asks for, a
 file it unlinked while it holds it open included, or whose data directory
 the host cannot measure, is set aside, in words that
 say why, and runs again once its data is cleared and the operator enables
-it; a quarantine the host could not write holds all the same, and is
-written as soon as it can be. A destination the operator names in the
+it; a quarantine the host could not write holds all the same, across a
+restart of the host too, and is written as soon as it can be. A
+destination the operator names in the
 meantime does not lift it. The operator's enable lifts it, and the host
 does not write the quarantine over that enable, nor over one that comes
 inside the host's turn, between its read of the state and its write. An
@@ -878,8 +879,8 @@ def main():
 
         print("a quarantine the host could not write stays in force, and is written as soon as it can be")
 
-        def remembered():
-            return json.load(open(os.path.join(root, "state.json")))["packages"][sid]["quarantined"]
+        def remembered(id_=sid):
+            return json.load(open(os.path.join(root, "state.json")))["packages"][id_]["quarantined"]
 
         check(wait_for(lambda: logged("the quarantine could not be written"), 5), "the host says the write failed")
         check(wait_for(lambda: svc(sid).get("state") != "quarantined" or svc(sid).get("pid"), 12, poll=0.5) is None
@@ -988,6 +989,7 @@ def main():
         package(uid_, "python", UNLINKED, caps=["storage:1"])
         check(wait_for(lambda: svc(uid_).get("state") == "running", 40), "it runs: %s", svc(uid_))
         upid = svc(uid_).get("pid", 0)
+        os.mkdir(blocker)                               # its quarantine's write fails: the restart below takes it from there
         q = wait_for(lambda: svc(uid_).get("state") == "quarantined" and svc(uid_), 45, poll=1)
         named = [n for n in os.listdir(os.path.join(root, "data", uid_)) if n != "tmp"]   # tmp is the host's, made at every start
         check(q and "may hold" in q.get("reason", "") and not os.path.exists("/proc/%d" % upid) and not named
@@ -995,6 +997,32 @@ def main():
               "2 MiB unlinked and held open where it declares storage:1, nothing named in its data directory (%s): "
               "stopped (pid %d %s) and set aside, in words that say what it may hold: %s", named, upid,
               "gone" if not os.path.exists("/proc/%d" % upid) else "there", q or svc(uid_))
+        print("a quarantine the host could not write outlives the host: set aside still after a restart")
+        kept = os.path.join(run_dir, "aside", uid_)
+
+        def kept_ones():
+            return sorted(os.listdir(os.path.dirname(kept))) if os.path.isdir(os.path.dirname(kept)) else None
+        check(wait_for(lambda: since(at, "%s: the quarantine could not be written" % uid_), 10) and not remembered(uid_),
+              "the write of the aside fails, and state.json does not say quarantined: %s", svc(uid_))
+        check(os.path.isfile(kept) and open(kept).read().split("\n")[1] == svc(uid_).get("reason"),
+              "the host keeps the unwritten quarantine under its run directory, with the reason: %s", kept_ones())
+        daemon.kill()                                   # SIGKILL: no chance to write anything on the way out
+        daemon.wait(timeout=10)
+        at = mark()
+        daemon = start_daemon()
+        check(wait_for(lambda: status().get("pid") == daemon.pid, 15) and since(at, "%s: set aside before the host last "
+              "stopped, and not written" % uid_), "the host started again says it took the kept quarantine up")
+        check(wait_for(lambda: svc(uid_).get("state") != "quarantined" or svc(uid_).get("pid"), 12, poll=0.5) is None
+              and not remembered(uid_) and not since(at, "%s: started as" % uid_) and "may hold" in svc(uid_).get("reason", ""),
+              "unwritten for 12 s under the new host: still set aside with no process and never started, state.json "
+              "does not say so, and the reason is the one it was set aside for: %s", svc(uid_))
+        os.rmdir(blocker)
+        check(wait_for(lambda: remembered(uid_), 5) and since(at, "%s: its quarantine is written now" % uid_)
+              and wait_for(lambda: not os.path.exists(kept), 2),
+              "the way clear, the write lands at the next turn, the host says so, and the kept copy goes: %s",
+              kept_ones())
+        check(wait_for(lambda: all(s_ in running() for s_ in ("org.example.beat", "org.example.dial", "org.example.jobtime")), 40),
+              "the services the killed host left run again under the new one: %s", running())
         check(fx("remove", uid_).get("ok") is True and wait_for(lambda: not svc(uid_), 10), "and it goes")
         print("removed and installed again inside one turn of the host: started again from the new install")
         old = svc("org.example.beat")["pid"]
@@ -1132,8 +1160,9 @@ def main():
               "(what the sweep is for): alive %s", alive)
         with open(conf, "w") as f:
             f.write("ext_enabled=0\n")                    # the next daemon starts nothing: what ends them is the sweep
+        at = mark()
         daemon = start_daemon()
-        check(wait_for(lambda: logged("a previous extension host left"), 15), "the next daemon says what it found")
+        check(wait_for(lambda: since(at, "a previous extension host left"), 15), "the next daemon says what it found")
         check(wait_for(lambda: status().get("pid") == daemon.pid, 10), "and the status file is the new host's word")
         gone = wait_for(lambda: not any(os.path.exists("/proc/%d" % pid) for pid in mine.values()), 10)
         left = [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))]

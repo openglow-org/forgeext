@@ -34,8 +34,11 @@
  *     quarantined and the write is asked for again each tick, until it
  *     lands or until the operator lifts the quarantine first, with a new
  *     install or an enable. A destination the operator names lifts
- *     nothing. A host that ends before the write lands forgets it, and the
- *     service runs again until its cause sets it aside again: the next
+ *     nothing. A host that ends before the write lands holds it still
+ *     when it starts again: the operation keeps the unwritten quarantine
+ *     outside the state (run.c, under the run directory) and the host
+ *     takes it up as it starts. A reboot forgets it, and the service then
+ *     runs again until its cause sets it aside again: the next
  *     measurement for its storage, SUPER_QUARANTINE_CRASHES more early
  *     ends for a crash, and SUPER_POSTURE_TRIES turns of the next armed
  *     window for a freeze.
