@@ -439,28 +439,27 @@ static void aside_drop(const run_t *r, const char *id)
 
 /* What the last host kept under aside/: each is a service set aside
  * again before anything runs, unwritten, so that the first tick asks for
- * its write, or finds the operator lifted it since. One for a package the
- * state no longer names is removed. While the state cannot be read
- * nothing is started, so each is left for the first turn that can read
- * it, which takes them up ahead of that turn's starts: 0 then, 1 once
- * the records were taken up. */
-static int aside_restore(run_t *r, super_t *sv)
+ * its write, or finds the operator lifted it since. The state is the
+ * caller's one read of it: at the start, or at the first turn the sync
+ * reads it when the start could not, ahead of that turn's starts, so
+ * that nothing is started between a read and a take-up. One for a
+ * package the state no longer names is removed, and so is one for a
+ * service that is running (super_take_aside): taken up after the fact
+ * it would set the service aside without stopping it. */
+static void aside_restore(run_t *r, super_t *sv, state_t *st)
 {
-    static state_t st;
-    char dir[PATH_MAX], err[300];
+    char dir[PATH_MAX];
     struct dirent *e;
-    if (state_load(r->cfg->ext.root, &st, err, sizeof(err)) != 0)
-        return 0;
     snprintf(dir, sizeof(dir), "%.4000s/aside", r->cfg->run_dir);
     DIR *d = opendir(dir);
     if (!d)
-        return 1;
+        return;
     while ((e = readdir(d)) != NULL) {
         char p[PATH_MAX], line[200] = "";
         unsigned long long lifts;
         if (e->d_name[0] == '.' || !manifest_id_ok(e->d_name))
             continue;
-        if (!state_find(&st, e->d_name)) {
+        if (!state_find(st, e->d_name)) {
             aside_drop(r, e->d_name);
             continue;
         }
@@ -470,22 +469,22 @@ static int aside_restore(run_t *r, super_t *sv)
             continue;
         int ok = fscanf(f, "%llx\n", &lifts) == 1 && fgets(line, sizeof(line), f) != NULL;
         fclose(f);
-        svc_t *s = ok ? super_service(sv, e->d_name) : NULL;
-        if (!s) {
+        line[strcspn(line, "\n")] = '\0';
+        int took = ok ? super_take_aside(sv, e->d_name, lifts, line) : -1;
+        if (took < 0) {
             fflog(LOG_ERR, "%s: a kept quarantine at %s could not be taken up", e->d_name, p);
             continue;
         }
-        line[strcspn(line, "\n")] = '\0';
-        s->state = SVC_QUARANTINED;
-        s->unwritten = 1;
-        s->aside_lifts = lifts;
-        s->wanted = 0;
-        snprintf(s->reason, sizeof(s->reason), "%s", line);
+        if (took > 0) {
+            fflog(LOG_ERR, "%s: a kept quarantine at %s names a service that is running, and is not taken up: dropped",
+                  e->d_name, p);
+            aside_drop(r, e->d_name);
+            continue;
+        }
         fflog(LOG_WARNING, "%s: set aside before the host last stopped, and not written: it stays aside until it is "
-              "written, or until the operator lifts it (%s)", e->d_name, s->reason);
+              "written, or until the operator lifts it (%s)", e->d_name, line);
     }
     closedir(d);
-    return 1;
 }
 /* The quarantine is remembered in state.json. A write that fails (a full
  * /data) is the policy's to hold (super.c), and it asks again each turn;
@@ -935,24 +934,24 @@ static unsigned long long lifts_digest(const state_pkg_t *p)
 }
 
 /* What is installed, into the policy's table. */
-/* The table from the state: 0, or -1 when the state cannot be read, and
- * nothing is changed. A service that is not running takes what it runs
- * in and what it answers from its manifest, read afresh; one whose
- * manifest cannot be read (a tree the operator's hand took, or a damaged
- * /data) is held out with that reason, said once, since nothing is known
- * of it: the way out is to remove the package and install it again. */
-static int sync_installed(run_t *r, super_t *sv)
+/* The table from the state, read into st for the turn: 0, or -1 when the
+ * state cannot be read, and nothing is changed. A service that is not
+ * running takes what it runs in and what it answers from its manifest,
+ * read afresh; one whose manifest cannot be read (a tree the operator's
+ * hand took, or a damaged /data) is held out with that reason, said
+ * once, since nothing is known of it: the way out is to remove the
+ * package and install it again. */
+static int sync_installed(run_t *r, super_t *sv, state_t *st)
 {
-    static state_t st;
     static manifest_t m;
     char err[300];
-    if (state_load(r->cfg->ext.root, &st, err, sizeof(err)) != 0) {
+    if (state_load(r->cfg->ext.root, st, err, sizeof(err)) != 0) {
         fflog(LOG_ERR, "%s: nothing is changed until it reads", err);
         return -1;
     }
     super_sync_begin(sv);
-    for (int i = 0; i < st.n; i++) {
-        const state_pkg_t *p = &st.pkgs[i];
+    for (int i = 0; i < st->n; i++) {
+        const state_pkg_t *p = &st->pkgs[i];
         if (p->slot < 0)
             continue;                                   /* nothing of it runs on the machine */
         svc_t *s = super_service(sv, p->id);
@@ -989,7 +988,7 @@ static int sync_installed(run_t *r, super_t *sv)
         }
     }
     super_sync_end(sv);
-    if (ext_required_holds_sync(&r->cfg->ext, &st) != 0)
+    if (ext_required_holds_sync(&r->cfg->ext, st) != 0)
         fflog(LOG_WARNING, "the required holds under %s could not be made to match the state", r->cfg->ext.root);
     return 0;
 }
@@ -1079,6 +1078,7 @@ int run_daemon(const run_cfg_t *cfg)
 {
     static run_t r;
     static super_t sv;
+    static state_t st;
     char err[300];
     sigset_t mask;
 
@@ -1172,7 +1172,12 @@ int run_daemon(const run_cfg_t *cfg)
         return 1;
     }
     super_init(&sv, &OPS, &r);
-    int restored = aside_restore(&r, &sv);
+    /* What the last host kept is taken up before anything runs, from
+     * the state as it reads now; one that does not read now is left for
+     * the first turn whose sync reads it. */
+    int restored = state_load(cfg->ext.root, &st, err, sizeof(err)) == 0;
+    if (restored)
+        aside_restore(&r, &sv, &st);
     fflog(LOG_NOTICE, "started: extension root %s, groups under %s", cfg->ext.root, cfg->cg_parent);
     say_env_overrides();
 
@@ -1211,10 +1216,13 @@ int run_daemon(const run_cfg_t *cfg)
         machine_t mc;
         int waiting = 0;
         /* A state unreadable as the host started and readable now: what
-         * the last host kept is taken up here, before this turn starts
-         * anything, as it would have been at the start. */
-        if (sync_installed(&r, &sv) == 0 && !restored)
-            restored = aside_restore(&r, &sv);
+         * the last host kept is taken up here, from the state this sync
+         * read, before this turn starts anything, as it would have been
+         * at the start. */
+        if (sync_installed(&r, &sv, &st) == 0 && !restored) {
+            aside_restore(&r, &sv, &st);
+            restored = 1;
+        }
         for (int i = 0; i < sv.n; i++)
             waiting |= sv.svc[i].wanted && sv.svc[i].state != SVC_RUNNING;
         machine_read(&cfg->machine, &mc, waiting);

@@ -29,6 +29,8 @@
  * each tick and said once when it lands; the operator's lift (a new
  * install or an enable, as the sync reads it or as the write finds it)
  * lets the service out, and a destination the operator names does not.
+ * A quarantine kept outside the state is taken up for a service that is
+ * not running, and refused for one that is.
  */
 #include "../src/super.h"
 
@@ -474,6 +476,28 @@ int main(void)
     super_tick(&sv, &READY, 200);
     CHECK(a->state == SVC_RUNNING && !a->unwritten && w.starts == 2, "a lift the write found did not let it out: %s",
           super_state_name(a->state));
+
+    /* a quarantine kept outside the state (run.c keeps one whose write
+     * failed, to outlive the host) is taken up for a service that is not
+     * running, as set aside and unwritten under its lifts, and the first
+     * tick asks for its write; one for a service that is running is
+     * refused, and the service runs on untouched */
+    fresh();
+    a = add("org.example.a", 0);
+    b = add("org.example.b", 1);
+    b->lifts = 7;
+    super_tick(&sv, &READY, 10);
+    int took = super_take_aside(&sv, "org.example.a", 7, "kept");
+    CHECK(took == 1 && a->state == SVC_RUNNING && !a->unwritten && a->wanted && !a->reason[0],
+          "a kept record for a running service was taken up: %d, %s (%s)", took, super_state_name(a->state), a->reason);
+    took = super_take_aside(&sv, "org.example.b", 7, "kept");
+    CHECK(took == 0 && b->state == SVC_QUARANTINED && b->unwritten && b->aside_lifts == 7 && !b->wanted
+          && strcmp(b->reason, "kept") == 0, "a kept record for a stopped service was not taken up: %d, %s (%s)", took,
+          super_state_name(b->state), b->reason);
+    super_tick(&sv, &READY, 20);
+    CHECK(w.rewrites == 1 && !b->unwritten && b->state == SVC_QUARANTINED && w.starts == 1,
+          "the first tick asked for its write and it stayed aside: %d asks, %s, %d starts", w.rewrites,
+          super_state_name(b->state), w.starts);
 
     printf("%s: super_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

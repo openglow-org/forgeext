@@ -155,6 +155,21 @@ int super_quarantine(super_t *sv, const char *id, const char *reason)
     return 0;
 }
 
+int super_take_aside(super_t *sv, const char *id, unsigned long long lifts, const char *reason)
+{
+    svc_t *s = super_service(sv, id);
+    if (!s)
+        return -1;
+    if (s->state == SVC_RUNNING)
+        return 1;
+    s->state = SVC_QUARANTINED;
+    s->unwritten = 1;
+    s->aside_lifts = lifts;
+    s->wanted = 0;
+    snprintf(s->reason, sizeof(s->reason), "%s", reason);
+    return 0;
+}
+
 void super_stop_all(super_t *sv, const char *reason)
 {
     for (int i = 0; i < sv->n; i++)

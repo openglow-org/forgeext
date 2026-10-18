@@ -166,6 +166,18 @@ void super_stop_all(super_t *sv, const char *why);
  * service. */
 int super_quarantine(super_t *sv, const char *id, const char *why);
 
+/* Takes up a quarantine kept outside the state (run.c keeps one whose
+ * write failed under the run directory, to outlive the host): the
+ * service is set aside again, unwritten, under the lifts it was set
+ * aside under and with its reason, for the first tick to ask for the
+ * write or find the operator's lift. 0. 1, and nothing changes, for a
+ * service that is running: a kept record is from before anything ran,
+ * and a service that runs was started by a sync that read the state the
+ * record waited on, under which the record would have been taken up
+ * first or found lifted; set aside without being stopped, it would run
+ * on under a quarantine. -1 when the table is full. */
+int super_take_aside(super_t *sv, const char *id, unsigned long long lifts, const char *reason);
+
 int super_running(const super_t *sv);
 const char *super_state_name(svc_state_t s);
 
