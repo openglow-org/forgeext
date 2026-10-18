@@ -1138,6 +1138,17 @@ def main():
         check(wait_for(lambda: (held("org.example.crash") or {}).get("raised"), 10), "with its required hold raised while it does")
         check(fx("enable", "org.example.nothere").get("ok") is False, "a package that is not installed cannot be enabled")
 
+        print("a package whose current cannot be turned stops its package, not the host")
+        # The operator's hand, or a damaged /data: no code path takes a package's tree from under its record. The
+        # host's start prepares the root, and its repair of current says so and leaves that package; the host starts
+        # and runs the others. Installed disabled here, so that nothing of it is started before its tree goes.
+        notree = "org.example.notree"
+        package(notree, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n")
+        r = fx("disable", notree)
+        shutil.rmtree(os.path.join(root, "pkg", notree))
+        check(r.get("ok") is True and wait_for(lambda: svc(notree).get("state") != "running", 10),
+              "installed, disabled, and its tree taken by hand: %s %s", r.get("error", ""), svc(notree))
+
         print("one daemon at a time; a killed daemon's services do not outlive the next one's start")
         check(wait_for(lambda: len(running()) >= 2, 30), "services are running before the daemon is killed: %s", running())
         # not the one that ends at every start: it is out of quarantine again, and its pid is gone before it is looked at
@@ -1164,6 +1175,12 @@ def main():
         daemon = start_daemon()
         check(wait_for(lambda: since(at, "a previous extension host left"), 15), "the next daemon says what it found")
         check(wait_for(lambda: status().get("pid") == daemon.pid, 10), "and the status file is the new host's word")
+        check(since(at, "%s: current cannot be turned to 1.0.0" % notree) and daemon.poll() is None
+              and svc(notree).get("state") != "running",
+              "the package with no tree is said as the host prepares the root, and the host starts without it: %s",
+              svc(notree))
+        r = fx("remove", notree)
+        check(r.get("ok") is True and wait_for(lambda: not svc(notree), 10), "and it goes: %s", r.get("error", ""))
         gone = wait_for(lambda: not any(os.path.exists("/proc/%d" % pid) for pid in mine.values()), 10)
         left = [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))]
         chains = subprocess.run([NFT, "list", "chains", "inet"], capture_output=True, text=True).stdout

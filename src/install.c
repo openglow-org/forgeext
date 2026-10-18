@@ -6,6 +6,7 @@
  */
 #define _GNU_SOURCE
 #include "install.h"
+#include "fflog.h"
 #include "index.h"
 #include "netrules.h"
 
@@ -523,8 +524,12 @@ static void drop_version(const char *pkgdir, const char *version)
  * pointed at goes with the turn unless the state keeps that version as
  * the predecessor. Under the lock. A state that cannot be read says
  * nothing of what `current` should be, and nothing is changed: the
- * daemon says so on every turn, and an install refuses on it. 0, or -1
- * with the reason when `current` cannot be turned. */
+ * daemon says so on every turn, and an install refuses on it. A
+ * `current` that cannot be turned (the package has no directory, or a
+ * directory stands where the link should) is said and left as it is:
+ * that package stays refused by the checks that refuse a package without
+ * its tree, and the others are repaired and run. 0, or -1 with the
+ * reason when the lock cannot be taken. */
 static int repair_current(const ext_env_t *env, char *err, size_t elen)
 {
     char pkgdir[340], link[400], cur[64];
@@ -533,7 +538,7 @@ static int repair_current(const ext_env_t *env, char *err, size_t elen)
         return fail(err, elen, "out of memory");
     int lock = ext_lock(env, err, elen), rc = lock < 0 ? -1 : 0;
     if (lock >= 0 && state_load(env->root, st, err, elen) == 0) {
-        for (int i = 0; i < st->n && rc == 0; i++) {
+        for (int i = 0; i < st->n; i++) {
             const state_pkg_t *p = &st->pkgs[i];
             snprintf(pkgdir, sizeof(pkgdir), "%.255s/pkg/%.63s", env->root, p->id);
             snprintf(link, sizeof(link), "%.340s/current", pkgdir);
@@ -542,8 +547,9 @@ static int repair_current(const ext_env_t *env, char *err, size_t elen)
             if (strcmp(cur, p->version) == 0)
                 continue;
             if (point_current(pkgdir, p->version) != 0) {
-                rc = fail(err, elen, "cannot turn %s to %s: %s", link, p->version, strerror(errno));
-                break;
+                fflog(LOG_ERR, "%s: current cannot be turned to %s (%s): the package is left as it is, and refused "
+                      "until its tree is whole", p->id, p->version, strerror(errno));
+                continue;
             }
             if (cur[0] && strcmp(cur, p->previous) != 0 && !strchr(cur, '/'))
                 drop_version(pkgdir, cur);
