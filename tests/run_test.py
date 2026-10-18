@@ -26,8 +26,9 @@ programs to run: the file that is really in its data directory gets as far as
 the machine, and a symbolic link out of the directory and a name with a
 directory in it are refused in words before anything does. A killed service
 comes back. The one that keeps ending is quarantined, and state.json
-remembers it. One that holds more than its storage capability asks for, or
-whose data directory the host cannot measure, is set aside, in words that
+remembers it. One that holds more than its storage capability asks for, a
+file it unlinked while it holds it open included, or whose data directory
+the host cannot measure, is set aside, in words that
 say why, and runs again once its data is cleared and the operator enables
 it; a quarantine the host could not write holds all the same, and is
 written as soon as it can be. A destination the operator names in the
@@ -233,6 +234,18 @@ while True:
     place = (ans or {}).get("next", place)
 '''
 
+# The one that unlinks a file while it holds it open: no name for the walk to find, and 2 MiB held all the same.
+UNLINKED = r'''
+import os, time
+d = os.environ["FFX_DATA"]
+f = open(os.path.join(d, "gone"), "wb")
+os.unlink(os.path.join(d, "gone"))
+f.write(b"x" * (2 << 20))
+f.flush()
+print("holding 2 MiB unlinked", flush=True)
+while True:
+    time.sleep(1)
+'''
 # One that keeps the Grbl sender out as it starts.
 KEEPOUT = API_CLIENT + r'''
 import time
@@ -970,6 +983,19 @@ def main():
         aside = re.findall(r"%s: .*: set aside" % re.escape(sid), open(log_path).read()[at:])
         check(gone and not aside, "it goes, and it was not set aside: %s %s", svc(sid), aside)
 
+        print("a file the service unlinked while it holds it open counts: set aside all the same")
+        uid_, at = "org.example.unlinked", mark()
+        package(uid_, "python", UNLINKED, caps=["storage:1"])
+        check(wait_for(lambda: svc(uid_).get("state") == "running", 40), "it runs: %s", svc(uid_))
+        upid = svc(uid_).get("pid", 0)
+        q = wait_for(lambda: svc(uid_).get("state") == "quarantined" and svc(uid_), 45, poll=1)
+        named = [n for n in os.listdir(os.path.join(root, "data", uid_)) if n != "tmp"]   # tmp is the host's, made at every start
+        check(q and "may hold" in q.get("reason", "") and not os.path.exists("/proc/%d" % upid) and not named
+              and logged("ext %s: holding 2 MiB unlinked" % uid_),
+              "2 MiB unlinked and held open where it declares storage:1, nothing named in its data directory (%s): "
+              "stopped (pid %d %s) and set aside, in words that say what it may hold: %s", named, upid,
+              "gone" if not os.path.exists("/proc/%d" % upid) else "there", q or svc(uid_))
+        check(fx("remove", uid_).get("ok") is True and wait_for(lambda: not svc(uid_), 10), "and it goes")
         print("removed and installed again inside one turn of the host: started again from the new install")
         old = svc("org.example.beat")["pid"]
         os.kill(daemon.pid, signal.SIGSTOP)             # the host sees neither step alone, only where the two end

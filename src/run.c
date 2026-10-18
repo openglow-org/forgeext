@@ -453,10 +453,26 @@ static int still_installed(const run_t *r, const svc_t *s)
     return p && conf_digest(p) == s->conf_wanted;
 }
 
+/* What the service holds open after unlinking it, by the descriptors of
+ * the processes in its group: a file with no name still holds its blocks.
+ * -1 with the reason when the group's processes or their open files
+ * cannot be read. */
+static long long open_bytes(const run_t *r, const svc_t *s, const char *data, char *err, size_t elen)
+{
+    pid_t pids[RUN_PIDS];
+    int n = cg_procs(r->cfg->cg_parent, s->id, pids, RUN_PIDS);
+    if (n < 0) {
+        snprintf(err, elen, "cannot read the processes of its group");
+        return -1;
+    }
+    return quota_open_bytes(data, pids, n, err, elen);
+}
+
 /* Each running service's data directory, measured on its own slow
- * cadence. A service over what its manifest asked for, in bytes or in
- * files and directories (one per QUOTA_ENTRY_BYTES of its quota), is
- * quarantined: stopped, remembered, and shown with the reason. So is one whose
+ * cadence, with what its processes hold open there unlinked. A service
+ * over what its manifest asked for, in bytes or in files and directories
+ * (one per QUOTA_ENTRY_BYTES of its quota), is quarantined: stopped,
+ * remembered, and shown with the reason. So is one whose
  * manifest cannot be read or whose data directory cannot be measured:
  * what cannot be read is never taken for nothing, and one measurement is
  * the bound, since it is synchronous and has no slow case to wait out.
@@ -474,16 +490,19 @@ static void quota_turn(run_t *r, super_t *sv, double now)
         manifest_t m;
         char data[420], err[300], why[200];
         const char *remedy = "remove the package, or clear its data and enable it again";
-        long long used = -1, may = 0;
+        long long used = -1, may = 0, held = 0;
         if (s->state != SVC_RUNNING)
             continue;
         snprintf(data, sizeof(data), "%.255s/data/%.63s", r->cfg->ext.root, s->id);
         if (ext_manifest_of(&r->cfg->ext, s->id, &m, err, sizeof(err)) != 0) {
             snprintf(why, sizeof(why), "its manifest could not be read (%.150s)", err);
             remedy = "remove the package and install it again";
-        } else if ((may = quota_of(&m), used = quota_dir_bytes(data, may / QUOTA_ENTRY_BYTES, err, sizeof(err))) < 0) {
+        } else if ((may = quota_of(&m), used = quota_dir_bytes(data, may / QUOTA_ENTRY_BYTES, err, sizeof(err))) < 0
+                   || (held = open_bytes(r, s, data, err, sizeof(err))) < 0) {
+            used = -1;
             snprintf(why, sizeof(why), "its data directory could not be measured (%.150s)", err);
         } else {
+            used += held;
             if (used <= may)
                 continue;
             snprintf(why, sizeof(why), "its data directory holds %lld MiB and it may hold %lld", used >> 20, may >> 20);

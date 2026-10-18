@@ -47,6 +47,10 @@ int cg_frozen(const char *parent, const char *id);          /* 1, 0, or -1 */
 int cg_populated(const char *parent, const char *id);       /* 1, 0, or -1 when there is no group */
 long long cg_event(const char *parent, const char *id, const char *file, const char *key);
 
+/* The processes of the package's group, as its cgroup.procs lists them:
+ * the count, or -1 when the file cannot be read or they do not fit. */
+int cg_procs(const char *parent, const char *id, pid_t *out, int max);
+
 /* Kill every process in the group (cgroup.kill, which reaches a frozen
  * one too), wait until it is empty, and remove it. 0 when it is gone. */
 int cg_destroy(const char *parent, const char *id);

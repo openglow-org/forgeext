@@ -19,7 +19,10 @@
  * PATH_MAX is measured like any other: the walk goes by descriptors, not
  * by a path it builds. The entries are counted against the bound the
  * caller gives: a directory of as many files as the bound measures, and
- * one file more does not.
+ * one file more does not. quota_open_bytes() over this process's own
+ * descriptors: a file unlinked while it is held open is counted, once
+ * however many times it is open, and a file that has its name, one
+ * unlinked outside the tree, and one closed are not.
  *
  * The walk's readdir and fstatat are stand-ins defined here, so that a
  * case can fail a listing, or remove or move an entry, at the moment the
@@ -427,6 +430,60 @@ int main(void)
         CHECK(fd >= 0 && over == -1 && strstr(why, "more than"),
               "%lld empty files under a bound of %lld read as %lld, not -1 in words that say there are too many: %s",
               bound + 1, bound, over, why);
+    }
+
+    /* A file the package unlinked while it holds it open has no name for
+     * the walk to find and holds its blocks all the same: it is counted by
+     * the descriptors of the package's processes, this process here. One
+     * held open twice is counted once; one held open with its name is the
+     * walk's, not this count's; one unlinked outside the tree is not
+     * counted; and one closed no longer is. */
+    {
+        pid_t self = getpid();
+        char block[4096];
+        long long wrote = 0;
+        memset(block, 'x', sizeof(block));
+        snprintf(p, sizeof(p), "%s/gone", root);
+        int gone = open(p, O_WRONLY | O_CREAT, 0600);
+        int unlinked = gone >= 0 && unlink(p) == 0;
+        for (int i = 0; gone >= 0 && i < 1024; i++)
+            wrote += write(gone, block, sizeof(block)) == (ssize_t)sizeof(block) ? (long long)sizeof(block) : 0;
+        snprintf(p, sizeof(p), "%s/twice", root);
+        int twice = open(p, O_WRONLY | O_CREAT, 0600), again = open(p, O_RDONLY);
+        unlinked = unlinked && unlink(p) == 0;
+        for (int i = 0; twice >= 0 && i < 16; i++)
+            if (write(twice, block, sizeof(block)) != (ssize_t)sizeof(block))
+                break;
+        snprintf(p, sizeof(p), "%s/named-and-still-there", root);
+        int named = open(p, O_WRONLY | O_CREAT, 0600);
+        for (int i = 0; named >= 0 && i < 64; i++)
+            if (write(named, block, sizeof(block)) != (ssize_t)sizeof(block))
+                break;
+        snprintf(p, sizeof(p), "%s/gone", elsewhere);
+        int outside = open(p, O_WRONLY | O_CREAT, 0600);
+        unlinked = unlinked && outside >= 0 && unlink(p) == 0;
+        for (int i = 0; outside >= 0 && i < 64; i++)
+            if (write(outside, block, sizeof(block)) != (ssize_t)sizeof(block))
+                break;
+        why[0] = '\0';
+        long long held = quota_open_bytes(root, &self, 1, why, sizeof(why));
+        CHECK(unlinked && wrote == 4LL << 20 && again >= 0 && named >= 0,
+              "the open files were made: unlinked %d, %lld bytes written, open twice %d, named %d", unlinked, wrote,
+              again >= 0, named >= 0);
+        CHECK(held >= (4LL << 20) + 64 * 1024 && held < (4LL << 20) + 128 * 1024,
+              "4 MiB unlinked and held open, and 64 KiB held open twice, read as %lld (named and outside files not "
+              "counted would be 4 MiB plus 64 KiB): %s", held, why);
+        close(gone);
+        close(twice);
+        close(again);
+        close(named);
+        close(outside);
+        why[0] = '\0';
+        long long closed = quota_open_bytes(root, &self, 1, why, sizeof(why));
+        CHECK(closed == 0, "closed, nothing is held: %lld: %s", closed, why);
+        pid_t none = 2000000000;
+        long long absent = quota_open_bytes(root, &none, 1, why, sizeof(why));
+        CHECK(absent == 0, "a process that is gone holds nothing: %lld: %s", absent, why);
     }
 
     {

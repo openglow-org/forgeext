@@ -35,6 +35,7 @@
 #define FORGEEXT_QUOTA_H
 
 #include <stddef.h>
+#include <sys/types.h>
 
 #include "manifest.h"
 
@@ -61,5 +62,22 @@ long long quota_of(const manifest_t *m);
  * directories together (the quota over QUOTA_ENTRY_BYTES). What is not
  * measured is never taken for nothing. */
 long long quota_dir_bytes(const char *path, long long max_entries, char *err, size_t elen);
+
+/* The most files one package's processes can hold open together: 32
+ * processes (RUN_PIDS), each under the sandbox's RLIMIT_NOFILE of 256.
+ * Past this many, a file held open more than once is counted again
+ * rather than not at all: counting twice is the closed side. */
+#define QUOTA_OPEN_MAX (32 * 256)
+
+/* What a service holds open after unlinking it is counted too, by the
+ * descriptors of its processes: a name is not what takes the space, and
+ * a file with no name for the walk to find holds its blocks until it is
+ * closed. The bytes, by their blocks, of the regular files under the
+ * data directory that the processes given hold open unlinked, each read
+ * from /proc/<pid>/fd, a file held open more than once counted once by
+ * its inode. A process that is gone holds nothing. -1, with the reason,
+ * when a process's open files cannot be read or examined for a reason
+ * other than its ending. */
+long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err, size_t elen);
 
 #endif

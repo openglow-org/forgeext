@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,4 +125,92 @@ long long quota_dir_bytes(const char *path, long long max_entries, char *err, si
     if (fd < 0)
         return fail(err, elen, "cannot read %s: %s", path, strerror(errno));
     return walk(fd, 0, max_entries, &entries, err, elen);
+}
+
+/* One open file, by device and inode, for counting a file open more
+ * than once as the one file it is. */
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+} open_file_t;
+
+static int seen_before(open_file_t *seen, int *nseen, const struct stat *st)
+{
+    for (int i = 0; i < *nseen; i++)
+        if (seen[i].dev == st->st_dev && seen[i].ino == st->st_ino)
+            return 1;
+    if (*nseen < QUOTA_OPEN_MAX) {
+        seen[*nseen].dev = st->st_dev;
+        seen[*nseen].ino = st->st_ino;
+        (*nseen)++;
+    }
+    return 0;
+}
+
+long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err, size_t elen)
+{
+    static open_file_t seen[QUOTA_OPEN_MAX];
+    static const char gone[] = " (deleted)";
+    char real[PATH_MAX];
+    int nseen = 0;
+    long long total = 0;
+
+    /* The kernel names what a descriptor is open on by its path from
+     * the root: the directory is matched as the kernel would name it. */
+    if (!realpath(data, real))
+        return fail(err, elen, "cannot read %s: %s", data, strerror(errno));
+    size_t rlen = strlen(real);
+    for (int i = 0; i < n; i++) {
+        char dir[64];
+        struct dirent *e;
+        snprintf(dir, sizeof(dir), "/proc/%ld/fd", (long)pids[i]);
+        int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0) {
+            if (errno == ENOENT)
+                continue;                               /* the process ended: it holds nothing now */
+            return fail(err, elen, "cannot read the open files of process %ld: %s", (long)pids[i], strerror(errno));
+        }
+        DIR *d = fdopendir(fd);
+        if (!d) {
+            int saved = errno;
+            close(fd);
+            return fail(err, elen, "cannot read the open files of process %ld: %s", (long)pids[i], strerror(saved));
+        }
+        while ((errno = 0, e = readdir(d)) != NULL) {
+            char target[PATH_MAX + sizeof(gone)];
+            struct stat st;
+            if (e->d_name[0] == '.')
+                continue;
+            ssize_t len = readlinkat(fd, e->d_name, target, sizeof(target) - 1);
+            if (len < 0) {
+                if (errno == ENOENT)
+                    continue;                           /* closed between the listing and the look */
+                total = fail(err, elen, "cannot examine an open file of process %ld: %s", (long)pids[i],
+                             strerror(errno));
+                break;
+            }
+            target[len] = '\0';
+            /* Under the data directory, and unlinked: a file with a name
+             * is the walk's to count. */
+            if ((size_t)len < rlen + 1 + sizeof(gone) - 1 || strncmp(target, real, rlen) != 0 || target[rlen] != '/'
+                || strcmp(target + len - (sizeof(gone) - 1), gone) != 0)
+                continue;
+            if (fstatat(fd, e->d_name, &st, 0) != 0) {     /* through the link, to the open file itself */
+                if (errno == ENOENT)
+                    continue;
+                total = fail(err, elen, "cannot examine an open file of process %ld: %s", (long)pids[i],
+                             strerror(errno));
+                break;
+            }
+            if (!S_ISREG(st.st_mode) || seen_before(seen, &nseen, &st))
+                continue;
+            total += (long long)st.st_blocks * 512;
+        }
+        if (total >= 0 && !e && errno != 0)
+            total = fail(err, elen, "cannot read the open files of process %ld: %s", (long)pids[i], strerror(errno));
+        closedir(d);
+        if (total < 0)
+            return -1;
+    }
+    return total;
 }

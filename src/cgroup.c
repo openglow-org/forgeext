@@ -162,6 +162,28 @@ int cg_populated(const char *parent, const char *id)
     return v < 0 ? -1 : v != 0;
 }
 
+int cg_procs(const char *parent, const char *id, pid_t *out, int max)
+{
+    char p[512], line[32];
+    int n = 0;
+    if (path_of(p, sizeof(p), parent, id, "cgroup.procs") != 0)
+        return -1;
+    FILE *f = fopen(p, "re");
+    if (!f)
+        return -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (n >= max) {
+            n = -1;
+            break;
+        }
+        out[n++] = (pid_t)atol(line);
+    }
+    if (ferror(f))
+        n = -1;
+    fclose(f);
+    return n;
+}
+
 int cg_frozen(const char *parent, const char *id)
 {
     long long v = cg_event(parent, id, "cgroup.events", "frozen");
