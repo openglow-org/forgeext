@@ -20,9 +20,12 @@
  * by a path it builds. The entries are counted against the bound the
  * caller gives: a directory of as many files as the bound measures, and
  * one file more does not. quota_open_bytes() over this process's own
- * descriptors: a file unlinked while it is held open is counted, once
- * however many times it is open, and a file that has its name, one
- * unlinked outside the tree, and one closed are not.
+ * descriptors and mappings: a file unlinked while it is held open is
+ * counted, once however many times it is open, and a file that has its
+ * name, one unlinked outside the tree, and one closed are not; one
+ * unlinked and kept mapped with its descriptor closed is counted as
+ * root, once when it is open and mapped both, and is a measurement that
+ * did not complete where the kernel refuses the look at it (unprivileged).
  *
  * The walk's readdir and fstatat are stand-ins defined here, so that a
  * case can fail a listing, or remove or move an entry, at the moment the
@@ -40,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -484,6 +488,48 @@ int main(void)
         pid_t none = 2000000000;
         long long absent = quota_open_bytes(root, &none, 1, why, sizeof(why));
         CHECK(absent == 0, "a process that is gone holds nothing: %lld: %s", absent, why);
+    }
+
+    /* A file the package unlinked and keeps mapped, its descriptor
+     * closed, holds its blocks by the mapping alone, and no descriptor
+     * names it: it is counted by the mappings of the package's processes.
+     * The kernel lets root alone follow a mapping to its file, which is
+     * how the host runs; unprivileged, the look is refused, and a look
+     * refused is a measurement that did not complete, never nothing. */
+    {
+        pid_t self = getpid();
+        char block[4096];
+        long long wrote = 0;
+        int root_user = geteuid() == 0;
+        memset(block, 'x', sizeof(block));
+        snprintf(p, sizeof(p), "%s/mapped", root);
+        int fd = open(p, O_RDWR | O_CREAT, 0600);
+        for (int i = 0; fd >= 0 && i < 1024; i++)
+            wrote += write(fd, block, sizeof(block)) == (ssize_t)sizeof(block) ? (long long)sizeof(block) : 0;
+        void *map = fd >= 0 ? mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+        int made = map != MAP_FAILED && unlink(p) == 0;
+        CHECK(made && wrote == 4LL << 20, "the mapped file was made: %d, %lld bytes written", made, wrote);
+        why[0] = '\0';
+        long long both = quota_open_bytes(root, &self, 1, why, sizeof(why));
+        if (fd >= 0)
+            close(fd);
+        why[0] = '\0';
+        long long held = quota_open_bytes(root, &self, 1, why, sizeof(why));
+        if (root_user) {
+            CHECK(both >= (4LL << 20) && both < (4LL << 20) + 64 * 1024,
+                  "4 MiB unlinked, held open and mapped both, read once as %lld: %s", both, why);
+            CHECK(held >= (4LL << 20) && held < (4LL << 20) + 64 * 1024,
+                  "4 MiB unlinked, its descriptor closed and one page of it mapped, read as %lld: %s", held, why);
+        } else {
+            CHECK(held == -1 && strstr(why, "mapped file"),
+                  "unprivileged, the look at the mapped file is refused, and that is a measurement that did not "
+                  "complete: %lld: %s", held, why);
+        }
+        if (map != MAP_FAILED)
+            munmap(map, 4096);
+        why[0] = '\0';
+        long long unmapped = quota_open_bytes(root, &self, 1, why, sizeof(why));
+        CHECK(unmapped == 0, "unmapped, nothing is held: %lld: %s", unmapped, why);
     }
 
     {

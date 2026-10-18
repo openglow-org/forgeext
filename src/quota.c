@@ -147,10 +147,89 @@ static int seen_before(open_file_t *seen, int *nseen, const struct stat *st)
     return 0;
 }
 
+/* A name the kernel gives an open or mapped file, matched as the file
+ * the count is after: under the data directory (real, of rlen bytes, as
+ * the kernel names it), and unlinked. A file with a name is the walk's
+ * to count. */
+static int unlinked_under(const char *name, size_t len, const char *real, size_t rlen)
+{
+    static const char gone[] = " (deleted)";
+    return len >= rlen + 1 + sizeof(gone) - 1 && strncmp(name, real, rlen) == 0 && name[rlen] == '/'
+           && strcmp(name + len - (sizeof(gone) - 1), gone) == 0;
+}
+
+/* The bytes of the unlinked regular files under the data directory that
+ * one process keeps mapped, by its blocks, or -1 with the reason. A
+ * mapping holds its file with no descriptor: /proc/<pid>/maps names each
+ * one, a line per mapping with the file's name last, and the file itself
+ * is examined through /proc/<pid>/map_files/<range>, which the kernel
+ * lets a privileged reader follow to the file. A line too long to read
+ * whole, or a look the kernel refuses, is a measurement that did not
+ * complete. */
+static long long mapped_bytes(pid_t pid, const char *real, size_t rlen, open_file_t *seen, int *nseen, char *err,
+                              size_t elen)
+{
+    char path[64], line[PATH_MAX + 128];
+    long long total = 0;
+
+    snprintf(path, sizeof(path), "/proc/%ld/maps", (long)pid);
+    FILE *f = fopen(path, "re");
+    if (!f) {
+        if (errno == ENOENT)
+            return 0;                                   /* the process ended: it holds nothing now */
+        return fail(err, elen, "cannot read the mappings of process %ld: %s", (long)pid, strerror(errno));
+    }
+    snprintf(path, sizeof(path), "/proc/%ld/map_files", (long)pid);
+    int dfd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) {
+        int saved = errno;
+        fclose(f);
+        return saved == ENOENT ? 0 : fail(err, elen, "cannot read the mappings of process %ld: %s", (long)pid,
+                                          strerror(saved));
+    }
+    while (fgets(line, sizeof(line), f)) {
+        struct stat st;
+        size_t len = strlen(line);
+        if (len == 0 || line[len - 1] != '\n') {
+            total = fail(err, elen, "a mapping of process %ld has a name too long to examine", (long)pid);
+            break;
+        }
+        line[--len] = '\0';
+        /* The range, then the permissions, the offset, the device and the
+         * inode, then the name, after the padding that aligns it. */
+        char *name = strchr(line, ' ');
+        if (!name)
+            continue;
+        *name++ = '\0';
+        for (int k = 0; k < 4 && name; k++)
+            if ((name = strchr(name, ' ')) != NULL)
+                name++;
+        if (!name)
+            continue;
+        while (*name == ' ')
+            name++;
+        if (!unlinked_under(name, strlen(name), real, rlen))
+            continue;
+        if (fstatat(dfd, line, &st, 0) != 0) {         /* through the link, to the mapped file itself */
+            if (errno == ENOENT)
+                continue;                               /* unmapped between the listing and the look */
+            total = fail(err, elen, "cannot examine a mapped file of process %ld: %s", (long)pid, strerror(errno));
+            break;
+        }
+        if (!S_ISREG(st.st_mode) || seen_before(seen, nseen, &st))
+            continue;
+        total += (long long)st.st_blocks * 512;
+    }
+    if (total >= 0 && ferror(f))
+        total = fail(err, elen, "cannot read the mappings of process %ld: %s", (long)pid, strerror(errno));
+    fclose(f);
+    close(dfd);
+    return total;
+}
+
 long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err, size_t elen)
 {
     static open_file_t seen[QUOTA_OPEN_MAX];
-    static const char gone[] = " (deleted)";
     char real[PATH_MAX];
     int nseen = 0;
     long long total = 0;
@@ -177,7 +256,7 @@ long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err
             return fail(err, elen, "cannot read the open files of process %ld: %s", (long)pids[i], strerror(saved));
         }
         while ((errno = 0, e = readdir(d)) != NULL) {
-            char target[PATH_MAX + sizeof(gone)];
+            char target[PATH_MAX + 16];
             struct stat st;
             if (e->d_name[0] == '.')
                 continue;
@@ -190,10 +269,7 @@ long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err
                 break;
             }
             target[len] = '\0';
-            /* Under the data directory, and unlinked: a file with a name
-             * is the walk's to count. */
-            if ((size_t)len < rlen + 1 + sizeof(gone) - 1 || strncmp(target, real, rlen) != 0 || target[rlen] != '/'
-                || strcmp(target + len - (sizeof(gone) - 1), gone) != 0)
+            if (!unlinked_under(target, (size_t)len, real, rlen))
                 continue;
             if (fstatat(fd, e->d_name, &st, 0) != 0) {     /* through the link, to the open file itself */
                 if (errno == ENOENT)
@@ -211,6 +287,12 @@ long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err
         closedir(d);
         if (total < 0)
             return -1;
+        /* Then what it keeps mapped with no descriptor, the files its
+         * descriptors hold counted once. */
+        long long mapped = mapped_bytes(pids[i], real, rlen, seen, &nseen, err, elen);
+        if (mapped < 0)
+            return -1;
+        total += mapped;
     }
     return total;
 }

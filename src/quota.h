@@ -70,15 +70,20 @@ long long quota_dir_bytes(const char *path, long long max_entries, char *err, si
  * rather than not at all: counting twice is the closed side. */
 #define QUOTA_OPEN_MAX (32 * 256)
 
-/* What a service holds open after unlinking it is counted too, by the
- * descriptors of its processes: a name is not what takes the space, and
- * a file with no name for the walk to find holds its blocks until it is
- * closed. The bytes, by their blocks, of the regular files under the
- * data directory that the processes given hold open unlinked, each read
- * from /proc/<pid>/fd, a file held open more than once counted once by
+/* What a service holds open or mapped after unlinking it is counted too,
+ * by the descriptors and the mappings of its processes: a name is not
+ * what takes the space, and a file with no name for the walk to find
+ * holds its blocks until the last descriptor on it is closed and the
+ * last mapping of it is gone. The bytes, by their blocks, of the regular
+ * files under the data directory that the processes given hold open or
+ * mapped unlinked, each read from /proc/<pid>/fd and /proc/<pid>/maps
+ * (the mapped file itself through /proc/<pid>/map_files, which the
+ * kernel lets root follow), a file held more than once counted once by
  * its inode. A process that is gone holds nothing. -1, with the reason,
- * when a process's open files cannot be read or examined for a reason
- * other than its ending. */
+ * when a process's open files or mappings cannot be read or examined
+ * for a reason other than its ending. What is not seen: a descriptor in
+ * flight in a socket's queue, sent and never received, has no entry
+ * under /proc; the partition's root reserve is the floor under that. */
 long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err, size_t elen);
 
 #endif
