@@ -165,9 +165,15 @@ static int unlinked_under(const char *name, size_t len, const char *real, size_t
  * is examined through /proc/<pid>/map_files/<range>, which the kernel
  * lets a privileged reader follow to the file. A line too long to read
  * whole, or a look the kernel refuses, is a measurement that did not
- * complete. */
-static long long mapped_bytes(pid_t pid, const char *real, size_t rlen, open_file_t *seen, int *nseen, char *err,
-                              size_t elen)
+ * complete. So is one that would take more than QUOTA_OPEN_MAX looks:
+ * the mappings of unlinked files under the data directory are counted
+ * in *examined across the measurement, and each costs a look and a
+ * search of the seen table, so the bound on them is the bound on the
+ * measurement's time. The descriptors have that bound by construction
+ * (RLIMIT_NOFILE); the mappings do not, since a process may hold tens
+ * of thousands of them inside its memory limit. */
+static long long mapped_bytes(pid_t pid, const char *real, size_t rlen, open_file_t *seen, int *nseen, int *examined,
+                              char *err, size_t elen)
 {
     char path[64], line[PATH_MAX + 128];
     long long total = 0;
@@ -210,6 +216,10 @@ static long long mapped_bytes(pid_t pid, const char *real, size_t rlen, open_fil
             name++;
         if (!unlinked_under(name, strlen(name), real, rlen))
             continue;
+        if (++*examined > QUOTA_OPEN_MAX) {
+            total = fail(err, elen, "holds more than %d mappings of files it unlinked", QUOTA_OPEN_MAX);
+            break;
+        }
         if (fstatat(dfd, line, &st, 0) != 0) {         /* through the link, to the mapped file itself */
             if (errno == ENOENT)
                 continue;                               /* unmapped between the listing and the look */
@@ -231,7 +241,7 @@ long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err
 {
     static open_file_t seen[QUOTA_OPEN_MAX];
     char real[PATH_MAX];
-    int nseen = 0;
+    int nseen = 0, examined = 0;
     long long total = 0;
 
     /* The kernel names what a descriptor is open on by its path from
@@ -289,7 +299,7 @@ long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err
             return -1;
         /* Then what it keeps mapped with no descriptor, the files its
          * descriptors hold counted once. */
-        long long mapped = mapped_bytes(pids[i], real, rlen, seen, &nseen, err, elen);
+        long long mapped = mapped_bytes(pids[i], real, rlen, seen, &nseen, &examined, err, elen);
         if (mapped < 0)
             return -1;
         total += mapped;

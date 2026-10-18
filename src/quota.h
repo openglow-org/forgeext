@@ -67,7 +67,11 @@ long long quota_dir_bytes(const char *path, long long max_entries, char *err, si
 /* The most files one package's processes can hold open together: 32
  * processes (RUN_PIDS), each under the sandbox's RLIMIT_NOFILE of 256.
  * Past this many, a file held open more than once is counted again
- * rather than not at all: counting twice is the closed side. */
+ * rather than not at all: counting twice is the closed side. The
+ * mappings of unlinked files have no such bound of their own, and each
+ * costs a look through map_files and a search of the table: a
+ * measurement that would take more than this many looks does not
+ * complete, which bounds its time as the entry bound does the walk's. */
 #define QUOTA_OPEN_MAX (32 * 256)
 
 /* What a service holds open or mapped after unlinking it is counted too,
@@ -81,7 +85,9 @@ long long quota_dir_bytes(const char *path, long long max_entries, char *err, si
  * kernel lets root follow), a file held more than once counted once by
  * its inode. A process that is gone holds nothing. -1, with the reason,
  * when a process's open files or mappings cannot be read or examined
- * for a reason other than its ending. What is not seen: a descriptor in
+ * for a reason other than its ending, or when the processes together
+ * hold more than QUOTA_OPEN_MAX mappings of unlinked files under the
+ * data directory. What is not seen: a descriptor in
  * flight in a socket's queue, sent and never received, has no entry
  * under /proc; the partition's root reserve is the floor under that. */
 long long quota_open_bytes(const char *data, const pid_t *pids, int n, char *err, size_t elen);

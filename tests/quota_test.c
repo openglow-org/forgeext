@@ -25,7 +25,9 @@
  * name, one unlinked outside the tree, and one closed are not; one
  * unlinked and kept mapped with its descriptor closed is counted as
  * root, once when it is open and mapped both, and is a measurement that
- * did not complete where the kernel refuses the look at it (unprivileged).
+ * did not complete where the kernel refuses the look at it (unprivileged);
+ * as many such mappings as the bound (QUOTA_OPEN_MAX) are measured, and
+ * one more is a measurement that did not complete (root).
  *
  * The walk's readdir and fstatat are stand-ins defined here, so that a
  * case can fail a listing, or remove or move an entry, at the moment the
@@ -530,6 +532,49 @@ int main(void)
         why[0] = '\0';
         long long unmapped = quota_open_bytes(root, &self, 1, why, sizeof(why));
         CHECK(unmapped == 0, "unmapped, nothing is held: %lld: %s", unmapped, why);
+    }
+
+    /* The mappings of unlinked files are bounded as the descriptors are
+     * by construction: as many as the bound, each of a distinct unlinked
+     * one-page file, are measured, and one more is a measurement that
+     * did not complete, in words that say there are too many. Root alone
+     * can follow a mapping to its file; unprivileged, the first look is
+     * refused, which is the case above. */
+    if (geteuid() == 0) {
+        pid_t self = getpid();
+        void **maps = calloc(QUOTA_OPEN_MAX + 1, sizeof(*maps));
+        int made = 0;
+        for (int i = 0; maps && i <= QUOTA_OPEN_MAX; i++) {
+            snprintf(p, sizeof(p), "%s/m%d", root, i);
+            int fd = open(p, O_RDWR | O_CREAT, 0600);
+            if (fd < 0)
+                break;
+            maps[i] = write(fd, "x", 1) == 1 ? mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+            close(fd);
+            unlink(p);
+            if (maps[i] == MAP_FAILED)
+                break;
+            made++;
+        }
+        why[0] = '\0';
+        long long over = quota_open_bytes(root, &self, 1, why, sizeof(why));
+        CHECK(made == QUOTA_OPEN_MAX + 1 && over == -1 && strstr(why, "more than"),
+              "%d one-page files unlinked and mapped (made %d) read as %lld, not -1 in words that say there are too "
+              "many: %s", QUOTA_OPEN_MAX + 1, made, over, why);
+        if (made == QUOTA_OPEN_MAX + 1)
+            munmap(maps[made - 1], 4096);
+        why[0] = '\0';
+        long long at_bound = quota_open_bytes(root, &self, 1, why, sizeof(why));
+        CHECK(at_bound >= (long long)QUOTA_OPEN_MAX * 512 && !why[0],
+              "%d one-page files unlinked and mapped read as %lld: %s", QUOTA_OPEN_MAX, at_bound, why);
+        for (int i = 0; i < made - 1; i++)
+            munmap(maps[i], 4096);
+        free(maps);
+        why[0] = '\0';
+        long long none = quota_open_bytes(root, &self, 1, why, sizeof(why));
+        CHECK(none == 0, "all unmapped, nothing is held: %lld: %s", none, why);
+    } else {
+        printf("(unprivileged: the bound on the mappings is not checked)\n");
     }
 
     {
