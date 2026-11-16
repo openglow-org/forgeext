@@ -18,8 +18,11 @@ inputs:
     description: "'true' builds the extension host and fetches the image's deny rules"
     default: 'false'
   forgefirm-ref:
-    description: The forgefirm revision whose deny rules a test under the host runs against
-    default: master
+    description: >
+      The forgefirm revision whose deny rules a test under the host runs
+      against: master, and next in a run on next (a push to next, or a pull
+      request into it) of an openglow-org repository
+    default: ${{ github.repository_owner == 'openglow-org' && (github.ref_name == 'next' || github.base_ref == 'next') && 'next' || 'master' }}
 
 runs:
   using: composite

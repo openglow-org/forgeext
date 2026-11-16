@@ -117,7 +117,8 @@ included.
 ### CI couplings that set the push order
 
 - The `holds-wire` job of this repository's CI checks out `forgectrl` at
-  the head of its default branch, unpinned. It builds forgectrl's
+  the head of its default branch (of its `next` in a run on `next`),
+  unpinned. It builds forgectrl's
   `holds_wire_test` against this tree's `src/holdkeep.c` and runs it. The
   CI of `forgectrl` builds the same test against the head of this
   repository. A change to the hold-file wire that needs both sides fails
@@ -130,8 +131,9 @@ included.
   cmake --build wire --target holds_wire_test
   ./wire/holds_wire_test
   ```
-- The native job checks out `forgefirm` at the head of its default branch,
-  unpinned, for the image's rule file (`ffx.nft`), which
+- The native job checks out `forgefirm` at the head of its default branch
+  (of its `next` in a run on `next`), unpinned, for the image's rule file
+  (`ffx.nft`), which
   `tests/netrules_test.py`, `tests/run_test.py` and `tests/sdk_test.py`
   load. **Push a rule-file change to `forgefirm` first**, then the change
   here that matches it.
