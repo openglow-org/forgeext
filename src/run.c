@@ -52,7 +52,7 @@ typedef struct {
 typedef struct {
     const run_cfg_t *cfg;
     logpipe_t logs[SUPER_MAX_SERVICES];
-    char last_status[8192];
+    char *last_status;                          /* what status.json says now, whatever its size (heap) */
     char unreachable[300];                      /* the last word on a root no account can walk to, said once */
     holdkeep_t holds;
     holdkeep_t senders;             /* the claims on the Grbl sender, kept as holds are */
@@ -62,10 +62,10 @@ typedef struct {
     char dropped[SUPER_MAX_SERVICES][64];       /* the advisory holds dropped at the last turn, each said once */
     int ndropped;
     int window, enabled;                        /* at the last turn: the armed window, and extensions on */
+    run_drop_t drop_due[SUPER_MAX_SERVICES];    /* predecessors put off while a command held the root's lock */
+    int ndrop_due;
     double grace_until;                         /* services stop after this: ext.shutdown's second to be read */
 } run_t;
-
-#define SHUTDOWN_GRACE_S 1.0
 
 /* The M-codes a manifest answers, as the service record's bits. */
 static unsigned long mcodes_of(const manifest_t *m)
@@ -83,7 +83,7 @@ static unsigned long mcodes_of(const manifest_t *m)
 /* The host's own events, into the ring every package reads beside the
  * machine's: ext.will_freeze as the armed window opens (a service with
  * job_time.run reads it at once; a frozen one when it thaws), ext.thawed
- * as it closes, and ext.shutdown SHUTDOWN_GRACE_S before every service is
+ * as it closes, and ext.shutdown RUN_SHUTDOWN_GRACE_S before every service is
  * stopped - extensions off, safe mode, or the host stopping. The grace is
  * for the services alone: holds follow the machine's word at once. */
 static void host_event(run_t *r, const char *name, const char *reason)
@@ -106,6 +106,7 @@ void run_cfg_defaults(run_cfg_t *cfg)
     cfg->senders_dir = RUN_SENDERS_DIR_DEFAULT;
     cfg->api_dir = API_DIR_DEFAULT;
     cfg->call_dir = CALL_DIR_DEFAULT;
+    cfg->shutdown_grace_s = RUN_SHUTDOWN_GRACE_S;
 }
 
 static double mono(void)
@@ -148,11 +149,29 @@ static void log_line(logpipe_t *l, const char *line)
     fflog(LOG_INFO, "ext %s: %s", l->id, line);
 }
 
+/* A read of 0 is the service closing its last writer (its stdout and
+ * stderr both, or its end): what is left of a line and the count of lines
+ * muted are said, and the slot is let go, or every poll would wake on the
+ * hang-up at once while the service runs on. */
 static void log_drain(logpipe_t *l)
 {
     for (;;) {
         ssize_t k = read(l->fd, l->buf + l->used, sizeof(l->buf) - 1 - l->used);
-        if (k <= 0)
+        if (k == 0) {
+            if (l->used) {
+                l->buf[l->used] = '\0';
+                for (char *c = l->buf; *c; c++)
+                    if ((unsigned char)*c < ' ' && *c != '\t')
+                        *c = '?';
+                log_line(l, l->buf);
+            }
+            if (l->muted)
+                fflog(LOG_WARNING, "ext %s: %d lines of its output were not logged", l->id, l->muted);
+            close(l->fd);
+            memset(l, 0, sizeof(*l));
+            return;
+        }
+        if (k < 0)
             return;
         l->used += (size_t)k;
         l->buf[l->used] = '\0';
@@ -179,8 +198,9 @@ static void log_close(run_t *r, const char *id)
 {
     for (int i = 0; i < SUPER_MAX_SERVICES; i++)
         if (r->logs[i].fd > 0 && strcmp(r->logs[i].id, id) == 0) {
-            log_drain(&r->logs[i]);
-            close(r->logs[i].fd);
+            log_drain(&r->logs[i]);                     /* a drain that reads the end lets the slot go itself */
+            if (r->logs[i].fd > 0)
+                close(r->logs[i].fd);
             memset(&r->logs[i], 0, sizeof(r->logs[i]));
         }
 }
@@ -190,16 +210,6 @@ static void log_close(run_t *r, const char *id)
 static const cg_limits_t LIMITS = { RUN_CPU_PCT, RUN_MEMORY_BYTES, RUN_PIDS };
 static const cg_limits_t JOB_LIMITS = { RUN_JOB_CPU_PCT, RUN_MEMORY_BYTES, RUN_PIDS };
 
-static int own_dir(const char *path, uid_t uid)
-{
-    struct stat st;
-    if (mkdir(path, 0700) != 0 && errno != EEXIST)
-        return -1;
-    if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode))
-        return -1;
-    return chown(path, uid, uid) == 0 && chmod(path, 0700) == 0 ? 0 : -1;
-}
-
 static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
 {
     run_t *r = ctx;
@@ -207,63 +217,80 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
     static manifest_t m;
     static state_t st;
     static net_dest_t dests[NET_MAX_DESTS];
-    char pkg[400], data[340], tmp[360], exec[600], resolv[PATH_MAX];
+    char pkg[400], data[340], exec[600], resolv[PATH_MAX];
     uid_t uid = (uid_t)(STATE_POOL_UID + s->slot);
     int ndests = 0, listen_port = 0, dns = 0, pfd[2] = { -1, -1 };
 
+    /* What fails for the machine's reason is SUPER_START_NOT_READY and
+     * counts against nobody; what fails for the package's (its account,
+     * its files, its manifest, its exec) is -1, a crash; a start whose
+     * names are still being looked up is SUPER_START_PENDING, tried again
+     * a moment later and never waited for. */
     if (s->slot < 0 || s->slot >= STATE_POOL_SIZE)
         return snprintf(err, elen, "it has no account"), -1;
     if (state_load(cfg->ext.root, &st, err, elen) != 0)
-        return -1;
+        return SUPER_START_NOT_READY;
     state_pkg_t *p = state_find(&st, s->id);
     if (!p)
         return snprintf(err, elen, "it is not installed"), -1;
-    if (ext_check(&cfg->ext, p, err, elen) != 0 || ext_manifest_of(&cfg->ext, s->id, &m, err, elen) != 0)
+    if (ext_manifest_of(&cfg->ext, s->id, &m, err, elen) != 0)
         return -1;
     if (!manifest_has_service(&m))
         return snprintf(err, elen, "it has no service"), -1;
     if (net_base_ok(&cfg->net, err, elen) != 0)
-        return -1;
+        return SUPER_START_NOT_READY;
 
     sandbox_cfg_t sb;
     memset(&sb, 0, sizeof(sb));
     /* Where it may connect: its manifest's destinations, then those the
-     * operator named for it, each the same way through. */
-    static const char *where[NET_MAX_DESTS];
-    int nwhere = 0;
+     * operator typed for it, each the same way through. */
+    static const char *where[EXT_DESTS_MAX];
+    int own = 0, nwhere = ext_reach(&m, p, where, &own);
     for (int i = 0; i < m.ncaps; i++)
-        if (strncmp(m.caps[i], "net.outbound:", 13) == 0 && nwhere < EXT_DESTS_MAX)
-            where[nwhere++] = m.caps[i] + 13;
-        else if (strncmp(m.caps[i], "net.listen:", 11) == 0)
-            listen_port = atoi(m.caps[i] + 11);
-    for (int i = 0; manifest_has_cap(&m, "net.outbound.operator") && i < p->ndests && nwhere < EXT_DESTS_MAX; i++)
-        where[nwhere++] = p->dests[i];
+        if (strncmp(m.caps[i], "net.listen:", 11) == 0 && state_granted(p, m.caps[i]))
+            listen_port = atoi(m.caps[i] + 11);         /* the operator's grant, or no listener */
     for (int i = 0; i < nwhere; i++) {
         if (caps_outbound_parse(where[i], dests[ndests].host, sizeof(dests[ndests].host), &dests[ndests].port) != 0)
             continue;
         /* A name, not an address: it has a letter, and no colon. */
         dns |= dests[ndests].host[strcspn(dests[ndests].host, "abcdefghijklmnopqrstuvwxyz")] != '\0'
                && !strchr(dests[ndests].host, ':');
+        dests[ndests].typed = i >= own;
         sb.connect_ports[ndests] = dests[ndests].port;
         ndests++;
     }
     if (dns)
         sb.connect_ports[ndests] = 53;                  /* a lookup that falls back to TCP */
+    /* Its names before anything else is spent on the start, the tree's
+     * hash included: not answered yet, the start is put off; not answered
+     * in their own time, or answered with what is no destination, it is
+     * the machine's to put right. */
+    int looked = net_lookups(dests, ndests, err, elen);
+    if (looked != 0)
+        return looked == NET_PENDING ? SUPER_START_PENDING : SUPER_START_NOT_READY;
+    if (ext_check(&cfg->ext, p, err, elen) != 0)
+        return -1;
 
     snprintf(pkg, sizeof(pkg), "%.255s/pkg/%.63s/%.32s", cfg->ext.root, s->id, p->version);
     snprintf(data, sizeof(data), "%.255s/data/%.63s", cfg->ext.root, s->id);
-    snprintf(tmp, sizeof(tmp), "%.339s/tmp", data);
     snprintf(exec, sizeof(exec), "%.399s/%.192s", pkg, m.exec);
-    if (own_dir(data, uid) != 0 || own_dir(tmp, uid) != 0)
-        return snprintf(err, elen, "cannot make its data directory: %s", strerror(errno)), -1;
+    if (ext_data_own(data, uid, (gid_t)uid, err, elen) != 0) {
+        /* A full or read-only /data is the machine's; a tree the package
+         * made that cannot be handed over (a link where tmp is, a depth
+         * past the bound) is its own. */
+        int e = errno;
+        return e == ENOSPC || e == EROFS || e == EIO || e == EDQUOT || e == ENOMEM || e == EMFILE || e == ENFILE
+                   ? SUPER_START_NOT_READY : -1;
+    }
     if (cg_create(cfg->cg_parent, s->id, &LIMITS, err, elen) != 0)
-        return -1;
-    if (net_allow(&cfg->net, uid, dests, ndests, listen_port, dns, err, elen) != 0 || pipe2(pfd, O_CLOEXEC) != 0) {
+        return SUPER_START_NOT_READY;
+    int allowed = net_allow(&cfg->net, uid, dests, ndests, listen_port, dns, err, elen);
+    if (allowed != 0 || pipe2(pfd, O_CLOEXEC) != 0) {
         if (pfd[0] < 0 && !err[0])
             snprintf(err, elen, "cannot make its log pipe: %s", strerror(errno));
         net_revoke(&cfg->net, uid, NULL, 0);
         cg_destroy(cfg->cg_parent, s->id);
-        return -1;
+        return allowed == NET_PENDING ? SUPER_START_PENDING : SUPER_START_NOT_READY;
     }
 
     int a = 0;
@@ -295,7 +322,7 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
         close(pfd[1]);
         net_revoke(&cfg->net, uid, NULL, 0);
         cg_destroy(cfg->cg_parent, s->id);
-        return -1;
+        return SUPER_START_NOT_READY;
     }
     snprintf(api_env, sizeof(api_env), "FFX_API=%s", api_path);
     sb.env[0] = api_env;
@@ -313,7 +340,7 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
             close(pfd[1]);
             net_revoke(&cfg->net, uid, NULL, 0);
             cg_destroy(cfg->cg_parent, s->id);
-            return -1;
+            return SUPER_START_NOT_READY;
         }
         snprintf(call_env, sizeof(call_env), "FFX_CALL_FD=%d", CALL_FD);
         sb.env[1] = call_env;
@@ -345,7 +372,7 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
         api_close(&r->api, s->id);
         net_revoke(&cfg->net, uid, NULL, 0);
         cg_destroy(cfg->cg_parent, s->id);
-        return -1;
+        return pid > 0 || pid == SANDBOX_NOT_READY ? SUPER_START_NOT_READY : -1;
     }
     memset(l, 0, sizeof(*l));
     snprintf(l->id, sizeof(l->id), "%s", s->id);
@@ -364,8 +391,12 @@ static void op_stop(void *ctx, svc_t *s)
         fflog(LOG_ERR, "%s: %s", s->id, err);
     api_close(&r->api, s->id);
     call_close(r->cfg->call_dir, s->id);
+    /* Killed with its group; an ended one is already reaped. One that has
+     * not ended yet (a kill that did not land, a task asleep in the
+     * kernel) is reaped by the loop's waitpid(-1) when it does, with
+     * nothing left to match it: this turn never waits on it. */
     if (s->pid > 0)
-        waitpid(s->pid, NULL, 0);                       /* killed with its group; an ended one is already reaped */
+        waitpid(s->pid, NULL, WNOHANG);
     log_close(r, s->id);
 }
 
@@ -510,12 +541,59 @@ static int op_quarantine(void *ctx, svc_t *s, const char *why, int again)
     return rc;
 }
 
+void run_drop_due(run_drop_t due[], int *n, int max, const char *id, const char *previous, const char *stamp, int busy)
+{
+    int at = -1;
+    for (int i = 0; i < *n; i++)
+        if (strcmp(due[i].id, id) == 0)
+            at = i;
+    if (busy && at < 0 && *n < max)
+        at = (*n)++;
+    if (busy && at >= 0) {
+        /* One put off per package: the latest predecessor, the one the
+         * record names now. */
+        snprintf(due[at].id, sizeof(due[at].id), "%s", id);
+        snprintf(due[at].previous, sizeof(due[at].previous), "%s", previous);
+        snprintf(due[at].stamp, sizeof(due[at].stamp), "%s", stamp);
+    }
+    if (!busy && at >= 0)
+        memmove(&due[at], &due[at + 1], sizeof(due[0]) * (size_t)(--*n - at));
+}
+
+/* Its predecessor goes once it has run healthy: the one the record named
+ * then, and only while the record is still that install's (its stamp) and
+ * still names it. The root's lock held by a command (an install's fwup can
+ * take minutes) puts the removal off to a later turn rather than holding
+ * this one, and an install that lands meanwhile has a predecessor of its
+ * own, the same version or another, which stays until its own successor
+ * has run healthy. */
+static void drop_previous(run_t *r, const char *id, const char *previous, const char *stamp)
+{
+    char err[200];
+    int busy = 0;
+    if (ext_drop_previous(&r->cfg->ext, id, previous, stamp, err, sizeof(err)) < 0) {
+        busy = errno == EWOULDBLOCK;
+        if (!busy)
+            fflog(LOG_WARNING, "%s: its previous version could not be removed: %s", id, err);
+    }
+    run_drop_due(r->drop_due, &r->ndrop_due, SUPER_MAX_SERVICES, id, previous, stamp, busy);
+}
+
+const state_pkg_t *run_healthy_record(state_t *st, const char *id, unsigned long long started)
+{
+    const state_pkg_t *p = state_find(st, id);
+    return p && p->previous[0] && run_conf_digest(p) == started ? p : NULL;
+}
+
 static void op_healthy(void *ctx, svc_t *s)
 {
     run_t *r = ctx;
-    char err[200];
-    if (ext_drop_previous(&r->cfg->ext, s->id, err, sizeof(err)) != 0)
-        fflog(LOG_WARNING, "%s: its previous version could not be removed: %s", s->id, err);
+    static state_t st;
+    char err[300];
+    const state_pkg_t *p = state_load(r->cfg->ext.root, &st, err, sizeof(err)) == 0
+                                   ? run_healthy_record(&st, s->id, s->conf_started) : NULL;
+    if (p)
+        drop_previous(r, s->id, p->previous, p->stamp);
 }
 
 static void op_log(void *ctx, int prio, const char *text)
@@ -527,8 +605,6 @@ static void op_log(void *ctx, int prio, const char *text)
 static const super_ops_t OPS = { op_start, op_stop, op_freeze, op_job_limits, op_quarantine, op_healthy, op_log };
 
 /* ---- the storage quota --------------------------------------------------------- */
-
-static unsigned long long conf_digest(const state_pkg_t *p);
 
 /* The service still runs what state.json says is installed. The
  * operator's removal writes the state first and then deletes the files,
@@ -543,7 +619,7 @@ static int still_installed(const run_t *r, const svc_t *s)
     if (state_load(r->cfg->ext.root, &st, err, sizeof(err)) != 0)
         return 1;
     const state_pkg_t *p = state_find(&st, s->id);
-    return p && conf_digest(p) == s->conf_wanted;
+    return p && run_conf_digest(p) == s->conf_wanted;
 }
 
 /* What the service holds open after unlinking it, by the descriptors of
@@ -911,7 +987,7 @@ static unsigned long long digest(const char *const *parts, int n)
  * (the version, and the stamp every install writes anew, so a package
  * removed and installed again between two turns is not taken for the one
  * still running) and the operator's destinations, in order. */
-static unsigned long long conf_digest(const state_pkg_t *p)
+unsigned long long run_conf_digest(const state_pkg_t *p)
 {
     const char *parts[2 + STATE_MAX_DESTS];
     int n = 0;
@@ -963,7 +1039,7 @@ static int sync_installed(run_t *r, super_t *sv, state_t *st)
         s->hold = state_granted(p, "hold");
         s->hold_required = s->hold && p->hold_required;
         s->pkg_enabled = p->enabled;
-        s->conf_wanted = conf_digest(p);
+        s->conf_wanted = run_conf_digest(p);
         s->lifts = lifts_digest(p);
         if (s->state != SVC_RUNNING) {
             if (ext_manifest_of(&r->cfg->ext, p->id, &m, err, sizeof(err)) == 0) {
@@ -1010,7 +1086,7 @@ static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
     json_t *mcodes = json_array();
     for (int i = 0; i < sv->n; i++) {
         const svc_t *s = &sv->svc[i];
-        for (int k = 0; s->state == SVC_RUNNING && s->job_time && k <= CAPS_MCODE_MAX - CAPS_MCODE_MIN; k++)
+        for (int k = 0; super_answers_mcodes(s) && k <= CAPS_MCODE_MAX - CAPS_MCODE_MIN; k++)
             if (s->mcodes & (1UL << k))
                 json_array_append_new(mcodes, json_pack("{s:i, s:s}", "code", CAPS_MCODE_MIN + k, "id", s->id));
     }
@@ -1035,19 +1111,29 @@ static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
     json_decref(top);
     if (!text)
         return;
-    if (strlen(text) < sizeof(r->last_status) && strcmp(text, r->last_status) != 0) {
-        char path[400], tmp[420];
-        snprintf(path, sizeof(path), "%.380s/status.json", r->cfg->run_dir);
-        snprintf(tmp, sizeof(tmp), "%.380s/status.json.new", r->cfg->run_dir);
-        FILE *f = fopen(tmp, "we");
-        if (f) {
-            fputs(text, f);
-            fputc('\n', f);
-            if (fclose(f) == 0 && rename(tmp, path) == 0)
-                snprintf(r->last_status, sizeof(r->last_status), "%s", text);
-        }
+    if ((!r->last_status || strcmp(text, r->last_status) != 0) && run_status_file(r->cfg->run_dir, text) == 0) {
+        free(r->last_status);
+        r->last_status = text;                          /* kept: it is what the file says now */
+        text = NULL;
     }
     free(text);
+}
+
+int run_status_file(const char *run_dir, const char *text)
+{
+    char path[400], tmp[420];
+    snprintf(path, sizeof(path), "%.380s/status.json", run_dir);
+    snprintf(tmp, sizeof(tmp), "%.380s/status.json.new", run_dir);
+    FILE *f = fopen(tmp, "we");
+    if (!f)
+        return -1;
+    fputs(text, f);
+    fputc('\n', f);
+    if (fclose(f) != 0 || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
 }
 
 /* Every environment variable this program reads, in one place: the
@@ -1228,9 +1314,11 @@ int run_daemon(const run_cfg_t *cfg)
         machine_read(&cfg->machine, &mc, waiting);
         /* A service whose account cannot walk to its package would end at
          * once, five times, and be quarantined for a fault that is the
-         * machine's: it is the machine that is not ready. */
+         * machine's: it is the machine that is not ready. So is a machine
+         * whose root mount is not shared, where a service would hold on to
+         * the machine's mounts. */
         if (mc.may_start) {
-            if (ext_root_reachable(&cfg->ext, err, sizeof(err)) != 0) {
+            if (ext_root_reachable(&cfg->ext, err, sizeof(err)) != 0 || sandbox_root_shared(err, sizeof(err)) != 0) {
                 mc.may_start = 0;
                 snprintf(mc.not_ready, sizeof(mc.not_ready), "%.95s", err);
                 if (strcmp(err, r.unreachable) != 0)
@@ -1244,7 +1332,7 @@ int run_daemon(const run_cfg_t *cfg)
         int window = mc.enabled && mc.armed != 0;       /* one that cannot be read is open, as the supervisor has it */
         if (r.enabled && !mc.enabled && !stopping) {
             host_event(&r, "ext.shutdown", mc.off_reason[0] ? mc.off_reason : "extensions are off");
-            r.grace_until = mono() + SHUTDOWN_GRACE_S;
+            r.grace_until = mono() + cfg->shutdown_grace_s;
         }
         if (window && !r.window && !stopping)
             host_event(&r, "ext.will_freeze", NULL);
@@ -1263,6 +1351,10 @@ int run_daemon(const run_cfg_t *cfg)
         }
         if (!stopping)
             super_tick(&sv, &tick, mono());
+        for (int i = r.ndrop_due - 1; i >= 0; i--) {
+            run_drop_t due = r.drop_due[i];
+            drop_previous(&r, due.id, due.previous, due.stamp);
+        }
         if (!window && r.window && mc.enabled && !stopping)
             host_event(&r, "ext.thawed", NULL);
         r.window = window;
@@ -1280,7 +1372,9 @@ int run_daemon(const run_cfg_t *cfg)
     }
     if (super_running(&sv)) {
         host_event(&r, "ext.shutdown", "the extension host is stopping");
-        struct timespec grace = { 1, 0 };
+        /* The machine's second, whatever --shutdown-grace says: no turn runs
+         * here, so nothing would be frozen for a window opening meanwhile. */
+        struct timespec grace = { (time_t)RUN_SHUTDOWN_GRACE_S, 0 };
         nanosleep(&grace, NULL);                        /* the broker's thread answers the polls meanwhile */
     }
     super_stop_all(&sv, "the extension host is stopping");
@@ -1293,6 +1387,8 @@ int run_daemon(const run_cfg_t *cfg)
     snprintf(off.off_reason, sizeof(off.off_reason), "the extension host is not running");
     off.armed = -1;
     write_status(&r, &sv, &off);
+    free(r.last_status);
+    r.last_status = NULL;
     fflog(LOG_NOTICE, "stopped");
     close(sfd);
     close(lfd);

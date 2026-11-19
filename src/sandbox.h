@@ -8,8 +8,13 @@
  * single instruction of the package:
  *
  *   is in the package's cgroup (the parent puts it there; the child waits)
- *   is idle-class in every scheduler: SCHED_IDLE, nice 19, I/O class idle
+ *   is idle-class in every scheduler: SCHED_IDLE, nice 19, I/O class idle,
+ *     with RLIMIT_NICE and RLIMIT_RTPRIO at 0 so that it stays there
  *   is first in line for the OOM killer (oom_score_adj 900)
+ *   has a mount namespace of its own, whose /dev holds null, zero, urandom
+ *     and random, and the links fd, stdin, stdout and stderr to its own
+ *     descriptors, and nothing else (no log daemon's socket, then or later)
+ *   starts with no signal blocked and none ignored
  *   holds no descriptor but stdin (/dev/null), its log pipe, and the
  *     listening end of its page's calls when it has a page
  *   has the package's account and no group but its own
@@ -19,7 +24,10 @@
  *   connects and binds only on the TCP ports it declared (landlock, where
  *     the kernel has the network rules), and sends only where the image's
  *     nftables rules allow
- *   cannot make the system calls a package has no business making (seccomp)
+ *   cannot make the system calls a package has no business making (seccomp):
+ *     among them SysV IPC, a namespace by clone(), raising its I/O class
+ *     (ioprio_set, and kernel AIO, whose requests carry a class of their own),
+ *     and running code that is no file (memfd_create, execveat)
  *
  * A step that cannot be taken is a failed start, never a looser sandbox,
  * with one exception that is a property of the kernel and not of the
@@ -60,8 +68,31 @@ typedef struct {
 /* The landlock ABI the running kernel offers: 0 when it has none. */
 int sandbox_landlock_abi(void);
 
-/* Start it. The pid, or -1 with the words: either this process could not
- * fork, or the child reported which step failed before its exec. */
+/* In a forked child about to exec: no signal blocked and none ignored, as
+ * a program started anew has it (the host blocks some and ignores SIGPIPE,
+ * and an exec keeps both). Async-signal-safe. */
+void sandbox_signals_default(void);
+
+/* Is the root mount shared, as forgefirm-sandbox makes it? A service's
+ * mount namespace holds the machine's mounts as slaves, and an unmount of
+ * the machine's (an update's slot) reaches it only from a shared one. 0,
+ * or -1 with the words. */
+int sandbox_root_shared(char *err, size_t elen);
+
+/* Start it. The pid; -1 with the words when the child reported that a
+ * step of the package's failed (its package or data directory would not
+ * open or be entered, its exec), or the configuration is no service's; or
+ * SANDBOX_NOT_READY with the words for the machine's fault and not the
+ * package's: on this side no pipe, no fork, the group not joined, a kernel
+ * without the landlock demanded; in the child any other step (the session,
+ * the mount namespace and its /dev, the scheduler and I/O classes, the
+ * limits, the descriptors, landlock's ruleset and every rule the kernel
+ * will not take, the package's own directories' included, the system's
+ * paths, the host's and the ports, the account, no_new_privs, landlock's
+ * restriction, the seccomp filter), and the package's own directories
+ * failing to open or be entered for want of memory, descriptors or the
+ * disk (ENOMEM, ENFILE, EMFILE, EIO, ENOSPC, EROFS, EDQUOT). */
+#define SANDBOX_NOT_READY (-2)
 pid_t sandbox_spawn(const sandbox_cfg_t *cfg, char *err, size_t elen);
 
 #endif

@@ -13,11 +13,13 @@ is not the one the signed metadata names, payloads that try to leave the
 package, the namespace, key pinning across an update, the capability diff,
 conflicts, the budget, the integrity check, `current` left by a crash on
 a version the state does not name and turned back at the next prepare
-of the root, the page a package serves
+of the root, what a prepare sweeps and what it leaves (a staging still
+held by its command, an entry under pkg/ that is no package id), the page
+a package serves
 (as it shipped, and none when it is not installed or disabled), removal,
 the wipe a change of
-owner takes (every package, everything under data/, every key the owner
-added), and the signed index (kept only under the OpenGlow extension key,
+owner takes (every package, everything under data/ and settings/, every
+key the owner added), and the signed index (kept only under the OpenGlow extension key,
 held to its form, never older than the one kept, endorsing its author key
 for one id and no other, judged version by version against the firmware
 when read, and what it withdraws). After every refusal the root holds
@@ -27,15 +29,20 @@ nothing the refused archive brought.
 
 Exits 0 on a pass, 1 on a failure, 77 when fwup or the binary is missing.
 """
+import fcntl
 import io
 import json
 import os
+import resource
+import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FORGEEXT = os.environ.get("FORGEEXT") or os.path.join(HERE, "..", "build", "forgeext")
@@ -75,12 +82,13 @@ class World:
     def pub(self, name):
         return self.keys[name][:-5] + ".pub"
 
-    def run(self, *args, budget=None, core=None):
-        cmd = [FORGEEXT, "--root", self.root, "--fwup", FWUP, "--official-key", self.pub("official"),
+    def run(self, *args, budget=None, core=None, pre=None, fwup=None):
+        """forgeext's answer; pre runs in the child before the exec (limits), fwup is another fwup to use."""
+        cmd = [FORGEEXT, "--root", self.root, "--fwup", fwup or FWUP, "--official-key", self.pub("official"),
                "--firmware-key", self.pub("firmware"), "--no-reserve"]
         cmd += (["--budget-mib", str(budget)] if budget else [])
         cmd += (["--core-version", core] if core else []) + list(args)
-        p = subprocess.run(cmd, capture_output=True, text=True)
+        p = subprocess.run(cmd, capture_output=True, text=True, preexec_fn=pre)
         try:
             out = json.loads(p.stdout)
         except ValueError:
@@ -153,11 +161,12 @@ def manifest(id_, version="1.0.0", runtime="shell", caps=(), **more):
 RUN = {"bin/run.sh": ("#!/bin/sh\nexec sleep 3600\n", 0o755), "share/notes.txt": ("notes\n", 0o644)}
 
 
-def member(name, data=b"x", type_=tarfile.REGTYPE, linkname="", mode=0o644):
+def member(name, data=b"x", type_=tarfile.REGTYPE, linkname="", mode=0o644, pax=None):
     info = tarfile.TarInfo(name)
     info.type = type_
     info.linkname = linkname
     info.mode = mode
+    info.pax_headers = dict(pax or {})
     info.size = len(data) if type_ == tarfile.REGTYPE else 0
     return info, (data if type_ == tarfile.REGTYPE else None)
 
@@ -256,20 +265,20 @@ def operator_destinations(t):
 
 def mcodes(t):
     """An M-code is one package's, and it is answered during a job, which takes job_time.run."""
-    r = t.run("inspect", t.pack(t.tree(manifest("org.example.mc0", caps=["mcode:170"]), RUN), "owner"))
+    r = t.run("inspect", t.pack(t.tree(manifest("org.example.mc0", runtime="python", caps=["mcode:170"]), RUN), "owner"))
     check(r.get("ok") is False and "which takes job_time.run" in (r.get("error") or ""),
           "mcode with no job_time.run -> %s" % r.get("error"))
     for cap in ("mcode:159", "mcode:180", "mcode:0170", "mcode", "mcode:17x"):
         r = t.run("inspect", t.pack(t.tree(manifest("org.example.mc1", caps=[cap, "job_time.run"]), RUN), "owner"))
         check(r.get("ok") is False and "mcode" in (r.get("error") or ""), "%s -> %s" % (cap, r.get("error")))
-    a = t.pack(t.tree(manifest("org.example.mca", caps=["mcode:170", "mcode:171", "job_time.run"]), RUN), "owner")
+    a = t.pack(t.tree(manifest("org.example.mca", runtime="python", caps=["mcode:170", "mcode:171", "job_time.run"]), RUN), "owner")
     r = t.run("install", a, "--consent-unverified", "--grant", "job_time.run")
     check(r.get("ok") is True, "a package answering M170 and M171 installs: %s" % r.get("error"))
-    b = t.pack(t.tree(manifest("org.example.mcb", caps=["mcode:171", "job_time.run"]), RUN), "owner")
+    b = t.pack(t.tree(manifest("org.example.mcb", runtime="python", caps=["mcode:171", "job_time.run"]), RUN), "owner")
     r = t.run("install", b, "--consent-unverified", "--grant", "job_time.run")
     check(r.get("ok") is False and "org.example.mca, which is installed, already answers M171" in (r.get("error") or ""),
           "a second package answering M171 -> %s" % r.get("error"))
-    c = t.pack(t.tree(manifest("org.example.mcb", caps=["mcode:172", "job_time.run"]), RUN), "owner")
+    c = t.pack(t.tree(manifest("org.example.mcb", runtime="python", caps=["mcode:172", "job_time.run"]), RUN), "owner")
     r = t.run("install", c, "--consent-unverified", "--grant", "job_time.run")
     check(r.get("ok") is True, "another number is its own: %s" % r.get("error"))
     for id_ in ("org.example.mca", "org.example.mcb"):
@@ -658,9 +667,103 @@ def run_all(w, top):
     pkg = os.path.join(root, "pkg", A)
     check(os.path.isfile(os.path.join(pkg, "1.0.0", "bin", "run.sh")) and os.readlink(os.path.join(pkg, "current")) == "1.0.0"
           and os.path.isfile(os.path.join(pkg, "1.0.0.files")) and os.path.isdir(os.path.join(root, "data", A))
-          and stat.S_IMODE(os.stat(os.path.join(root, "data", A)).st_mode) == 0o700, "the installed layout")
+          and stat.S_IMODE(os.stat(os.path.join(root, "data", A)).st_mode) == 0o770, "the installed layout")
     check(stat.S_IMODE(os.stat(os.path.join(pkg, "1.0.0", "bin", "run.sh")).st_mode) == 0o755
           and stat.S_IMODE(os.stat(os.path.join(pkg, "1.0.0", "share", "notes.txt")).st_mode) == 0o644, "the unpacked modes")
+    # Installed by somebody whose umask is 077 (root at a console): every directory of the tree is 0755 all the same,
+    # or the service's account could not read its own files.
+    strict = w.pack(w.tree(manifest("org.example.umask", runtime="data"), {"share/deep/notes.txt": ("x", 0o644)}), "official")
+    was = os.umask(0o077)
+    try:
+        r = w.run("install", strict)
+    finally:
+        os.umask(was)
+    upkg = os.path.join(root, "pkg", "org.example.umask")
+    modes = {p: stat.S_IMODE(os.stat(os.path.join(upkg, p)).st_mode) for p in ("", "1.0.0", "1.0.0/share", "1.0.0/share/deep")}
+    check(r.get("ok") is True and set(modes.values()) == {0o755}, "installed under umask 077: %s" % modes)
+    check(w.run("remove", "org.example.umask").get("ok") is True, "and removed")
+
+    # What a process left that ended before it could take it away (forgectrl's kill, a power cut) goes at the next
+    # command that prepares the root, and nothing under way does: a staging directory that nobody holds, a tree no
+    # record names, a version of a recorded package that is neither its own nor its predecessor, and an index swap
+    # cut between its two renames.
+    # A version whose own name ends in ".files" keeps its tree.
+    odd = "org.example.oddver"
+    check(w.run("install", w.pack(w.tree(manifest(odd, version="1.0.0-a.files", runtime="data")), "official")).get("ok")
+          is True, "a version named 1.0.0-a.files installs")
+    tmp, old = os.path.join(root, "tmp"), time.time() - 60
+    for name in ("in.stale1", "index.stale2", "in.live1", "in.young1"):
+        os.makedirs(os.path.join(tmp, name, "tree"))
+        if name != "in.young1":                         # made a moment ago, between its mkdtemp and its lock
+            os.utime(os.path.join(tmp, name), (old, old))
+    live = os.open(os.path.join(tmp, "in.live1"), os.O_RDONLY)
+    fcntl.flock(live, fcntl.LOCK_EX)
+    os.makedirs(os.path.join(root, "pkg", "org.example.ghost", "1.0.0"))
+    os.makedirs(os.path.join(root, "pkg", "not_an_id", "kept"))    # no package id: no install made it
+    os.makedirs(os.path.join(pkg, "9.9.9"))
+    index, index_old = os.path.join(root, "index"), os.path.join(root, "index.old")
+    if os.path.isdir(index):
+        os.rename(index, index_old)
+    else:
+        os.makedirs(index_old)
+        open(os.path.join(index_old, "kept"), "w").close()
+    kept = sorted(os.listdir(index_old))
+    r = w.run("inspect", w.pack(w.tree(manifest("org.example.sweep", runtime="data")), "official"))
+    check(r.get("ok") is True and sorted(os.listdir(tmp)) == ["in.live1", "in.young1"], "a staging nobody holds goes, one "
+          "under way stays, and so does one made a moment ago: %s" % sorted(os.listdir(tmp)))
+    check(sorted(os.listdir(os.path.join(root, "pkg", odd))) == ["1.0.0-a.files", "1.0.0-a.files.files", "current"]
+          and (w.run("check", odd).get("packages") or [{}])[0].get("intact") is True,
+          "the version named 1.0.0-a.files keeps its tree and its list: %s"
+          % sorted(os.listdir(os.path.join(root, "pkg", odd))))
+    check(w.run("remove", odd).get("ok") is True, "and it goes")
+    shutil.rmtree(os.path.join(tmp, "in.young1"))
+    check(not os.path.exists(os.path.join(root, "pkg", "org.example.ghost")) and not os.path.exists(os.path.join(pkg, "9.9.9"))
+          and os.path.isdir(os.path.join(pkg, "1.0.0")), "a tree no record names goes, and the recorded version stays")
+    check(os.path.isdir(os.path.join(root, "pkg", "not_an_id", "kept")),
+          "an entry under pkg/ whose name is no package id is nobody's install, and stays")
+    shutil.rmtree(os.path.join(root, "pkg", "not_an_id"), ignore_errors=True)
+    check(os.path.isdir(index) and sorted(os.listdir(index)) == kept and not os.path.exists(index_old),
+          "the index this machine kept is put back")
+    os.close(live)
+    shutil.rmtree(os.path.join(tmp, "in.live1"))
+    # A staging under way is locked by the command that made it: while an inspect is inside fwup (a stand-in that
+    # waits there), its staging, made to look a minute old, outlives another command's prepare of the root.
+    held_stub, held_seen = os.path.join(top, "fwup-held"), os.path.join(top, "fwup-held-seen")
+    sweep2 = w.pack(w.tree(manifest("org.example.sweep2", runtime="data")), "official")
+    other = " ".join(shlex.quote(x) for x in (FORGEEXT, "--root", root, "--fwup", FWUP, "--official-key", w.pub("official"),
+                                              "--no-reserve", "inspect", sweep2))
+    with open(held_stub, "w") as f:
+        f.write('#!/bin/sh\nif [ "$1" = -V ] && [ ! -e %s ]; then\n  touch -d "1 minute ago" %s/in.*\n'
+                '  ls %s > %s.before\n  %s > %s.other\n  ls %s > %s\nfi\nexec %s "$@"\n'
+                % (shlex.quote(held_seen), shlex.quote(tmp), shlex.quote(tmp), shlex.quote(held_seen), other,
+                   shlex.quote(held_seen), shlex.quote(tmp), shlex.quote(held_seen), shlex.quote(FWUP)))
+    os.chmod(held_stub, 0o755)
+    r = w.run("inspect", sweep2, fwup=held_stub)
+
+    def read(path):
+        return open(path).read() if os.path.exists(path) else ""
+
+    before, after = read(held_seen + ".before").split(), read(held_seen).split()
+    check(r.get("ok") is True and len(before) == 1 and after == before
+          and json.loads(read(held_seen + ".other") or "{}").get("ok") is True,
+          "an inspect's staging, a minute old and still held, outlives another command's prepare: %s, staged %s, after "
+          "the other command %s" % (r.get("error") or "ok", before, after))
+    check(not w.leftovers(), "and it is gone once its inspect ends: %s" % w.leftovers())
+
+    # state.json has one writer at a time: a command that changes it waits while another holds the root's lock, and
+    # goes on once it is let go.
+    held = open(os.path.join(root, "lock"), "a")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    p = subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--no-reserve", "disable", A], stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True)
+    time.sleep(1)
+    waited = p.poll() is None
+    fcntl.flock(held, fcntl.LOCK_UN)
+    held.close()
+    out = p.communicate(timeout=20)[0]
+    check(waited and json.loads(out or "{}").get("ok") is True, "a state change waited for the root's lock (%s) and "
+          "finished once it was let go: %s" % (waited, out.strip()))
+    check(w.run("enable", A).get("ok") is True, "and enabled again")
     lst = w.run("list")["packages"]
     check(len(lst) == 1 and lst[0]["id"] == A and lst[0]["account"] == "ffx0" and lst[0]["grants"] == ["hold"]
           and lst[0]["enabled"] and lst[0]["tier"] == "official" and len(lst[0]["key"]) == 64, "list: %s" % lst)
@@ -816,6 +919,16 @@ def run_all(w, top):
         check("OpenGlow's namespace" in r.get("error", ""), "org.openglow.* by %s -> %s" % (signer or "nobody", r.get("error")))
     check(w.run("install", w.pack(w.tree(manifest("org.openglow.align", runtime="data")), "official")).get("ok") is True,
           "org.openglow.* by the OpenGlow key")
+    # The pin holds inside one tier too: a second author whose key the owner added does not replace the first one's
+    # package, which would keep its data and its account.
+    pinned = "org.example.pinned"
+    check(w.run("install", w.pack(w.tree(manifest(pinned, runtime="data")), "owner"), "--consent-community").get("ok") is True,
+          "a community package by the owner's first key")
+    check(w.run("key-add", "second", w.pub("stranger")).get("ok") is True, "the owner adds a second author's key")
+    r = w.run("install", w.pack(w.tree(manifest(pinned, version="2.0.0", runtime="data")), "stranger"), "--consent-community")
+    check(r.get("ok") is False and "signed by the key that signed the installed version" in (r.get("error") or ""),
+          "its version 2, community too but by the second key -> %s" % r.get("error"))
+    check(w.run("key-remove", "second").get("ok") is True and w.run("remove", pinned).get("ok") is True, "both taken away")
 
     print("the product gate, and a firmware key")
     good_payload = w.tar([manifest_member(manifest("org.example.gate", runtime="data"))])
@@ -863,6 +976,58 @@ def run_all(w, top):
         zout.writestr("data/payload.tar.gz", open(other_payload, "rb").read())
     r = w.run("inspect", swapped)
     check("not the one the archive's metadata names" in r.get("error", ""), "another payload under a good signature -> %s" % r.get("error"))
+    # The signed payload itself with one byte changed and zipped again: the same length and a good CRC, so only
+    # this reader's hash against the signed metadata tells it from the one that was signed (fwup reads the file
+    # again, and the installed tree is unpacked from this reader's own copy).
+    with zipfile.ZipFile(signed) as zin:
+        payload_bytes = bytearray(zin.read("data/payload.tar.gz"))
+        heads = [(name, zin.read(name)) for name in ("meta.conf.ed25519", "meta.conf")]
+    payload_bytes[len(payload_bytes) // 2] ^= 0x01
+    onebyte = w.path("onebyte.ffx")
+    with zipfile.ZipFile(onebyte, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in heads:
+            zout.writestr(name, data)
+        zout.writestr("data/payload.tar.gz", bytes(payload_bytes))
+    r = w.run("inspect", onebyte)
+    check("not the one the archive's metadata names" in r.get("error", ""), "one byte of the signed payload changed, "
+          "same length, good CRC -> %s" % r.get("error"))
+    # The other verifier, fwup, counts on its own: a stand-in that runs the real one except where a case changes its
+    # answer, and notes how it was asked. Its -V refusing an archive this reader takes is a refusal; it is given the
+    # key that verified the archive; the product it reads is compared; and where its -V takes anything, this reader
+    # still refuses a metadata with a NUL in it, in its own words.
+    stub = os.path.join(top, "fwup-stand-in")
+    with open(stub, "w") as f:
+        f.write('#!/bin/sh\necho "$*" >> "$FWUP_SEEN"\ncase "$FWUP_MODE:$1" in\n  pass:-V) exit 0 ;;\n'
+                '  fail:-V) exit 1 ;;\n  product:-m) "$FWUP_REAL" "$@" | sed "s/^meta-product=.*/meta-product=\\"Another\\"/";'
+                ' exit 0 ;;\nesac\nexec "$FWUP_REAL" "$@"\n')
+    os.chmod(stub, 0o755)
+
+    def with_fwup(mode, archive):
+        seen = os.path.join(top, "fwup-seen")
+        open(seen, "w").close()
+        os.environ.update(FWUP_REAL=FWUP, FWUP_MODE=mode, FWUP_SEEN=seen)
+        try:
+            r = w.run("inspect", archive, fwup=stub)
+        finally:
+            for k in ("FWUP_REAL", "FWUP_MODE", "FWUP_SEEN"):
+                os.environ.pop(k, None)
+        return r, open(seen).read()
+
+    r, seen = with_fwup("real", signed)
+    check(r.get("ok") is True and ("-V -i %s -p %s" % (signed, w.pub("official"))) in seen,
+          "fwup is asked to verify with the key that verified the archive: %s" % seen.strip().replace("\n", " | "))
+    r, _ = with_fwup("fail", signed)
+    check("fwup does not verify the archive" in (r.get("error") or ""), "fwup's own refusal -> %s" % r.get("error"))
+    r, _ = with_fwup("product", signed)
+    check("fwup reads another product" in (r.get("error") or ""), "fwup reading another product -> %s" % r.get("error"))
+    with zipfile.ZipFile(signed) as zin:
+        parts = {name: zin.read(name) for name in ("meta.conf.ed25519", "meta.conf", "data/payload.tar.gz")}
+    nul = w.path("nul-meta.ffx")
+    with zipfile.ZipFile(nul, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name in ("meta.conf.ed25519", "meta.conf", "data/payload.tar.gz"):
+            zout.writestr(name, parts[name] + (b"\0tail" if name == "meta.conf" else b""))
+    r, _ = with_fwup("pass", nul)
+    check("holds a NUL" in (r.get("error") or ""), "a metadata with a NUL, fwup taking anything -> %s" % r.get("error"))
     # The same, with the metadata rewritten to match and the old signature kept: the signature no longer holds.
     resigned = w.path("rewritten.ffx")
     import hashlib
@@ -901,11 +1066,19 @@ def run_all(w, top):
         "a path too deep": [member("/".join(["d"] * 17) + "/f", b"x")],
         "a path too long": [member("d/" + "n" * 200, b"x")],
         "too many files": [member("f/%04d" % i, b"") for i in range(4097)],
+        "too many directories": [member("d/%04d" % i, type_=tarfile.DIRTYPE) for i in range(4097)],
+        "one directory over and over": [member("/".join(["d"] * 16), type_=tarfile.DIRTYPE)] * 4097,
+        # 63 MiB of files, under the 64 the files may hold, and then 10.5 MiB of headers: past the stream's 72
+        "headers past the stream's bound": [member("big%d" % i, b"\0" * (63 << 19)) for i in range(2)]
+                                           + [member("p%02d" % i, b"x", pax={"comment": "x" * (900 << 10)}) for i in range(12)],
     }
+    # The caps that are this reader's own, each refused in its own words (the others are refused on the way in).
+    said = {"too many directories": "directory entries", "one directory over and over": "directory entries",
+            "headers past the stream's bound": "tar stream is larger"}
     for what, members in hostile.items():
         payload = w.tar([manifest_member(manifest(E, runtime="data"))] + members)
         r = w.run("install", w.pack_raw(payload, "1.0.0", "official"))
-        check(r.get("ok") is False, "%s -> %s" % (what, r.get("error")))
+        check(r.get("ok") is False and said.get(what, "") in (r.get("error") or ""), "%s -> %s" % (what, r.get("error")))
         check(not os.path.exists(os.path.join(root, "pkg", E)) and not w.leftovers()
               and not os.path.exists(os.path.join(top, "evil.txt")) and not os.path.exists(os.path.join(root, "evil.txt"))
               and not os.path.exists("/tmp/forgeext-evil.txt"), "%s left something behind" % what)
@@ -920,6 +1093,22 @@ def run_all(w, top):
     no_manifest = w.tar([member("readme.txt", b"hello")])
     check("no manifest.json" in w.run("inspect", w.pack_raw(no_manifest, "1.0.0", "official")).get("error", ""), "no manifest")
 
+    page_unasked = w.pack(w.tree(manifest("org.example.pageless", runtime="data"), {"ui/index.html": ("<p>page</p>", 0o644)}),
+                          "official")
+    r = w.run("inspect", page_unasked)
+    check("has a ui/index.html and does not ask for ui" in r.get("error", ""), "a page shipped without ui -> %s" % r.get("error"))
+    pagenul = w.pack(w.tree(manifest("org.example.pagenul", runtime="ui", caps=["ui"]), {"ui/index.html": ("<p>a\0b</p>", 0o644)}),
+                     "official")
+    r = w.run("inspect", pagenul)
+    check("ui/index.html holds a NUL" in r.get("error", ""), "a page that holds a NUL -> %s" % r.get("error"))
+
+    many = manifest("org.example.many", runtime="python", caps=["net.outbound:h%d.example:443" % i for i in range(20)])
+    check(w.run("install", w.pack(w.tree(many, RUN), "official")).get("ok") is True, "twenty destinations install")
+    reach = next((x for x in w.run("list").get("packages", []) if x["id"] == "org.example.many"), {}).get("reach")
+    check(reach == ["h%d.example:443" % i for i in range(15)], "what its service may reach, capped as its start caps it "
+          "(the list GET /v0/self serves): %s" % reach)
+    check(w.run("remove", "org.example.many").get("ok") is True, "and removed")
+
     print("the service's entry point, conflicts, the port, the budget")
     r = w.run("inspect", w.pack(w.tree(manifest("org.example.noexec", caps=[])), "official"))
     check("is not a file of the package" in r.get("error", ""), "an entry point that is not there -> %s" % r.get("error"))
@@ -932,8 +1121,11 @@ def run_all(w, top):
     check(w.run("install", jealous).get("ok") is True, "a package that names a future rival installs")
     r = w.run("inspect", w.pack(w.tree(manifest("org.example.late", runtime="data")), "official"))
     check("which is installed, conflicts with org.example.late" in r.get("error", ""), "the rival, later -> %s" % r.get("error"))
-    check(w.run("install", w.pack(w.tree(manifest("org.example.web1", caps=["net.listen:8123"]), RUN), "official")).get("ok") is True,
-          "a listener installs")
+    web1 = w.pack(w.tree(manifest("org.example.web1", caps=["net.listen:8123"]), RUN), "official")
+    r = w.run("install", web1)
+    check(r.get("ok") is False and "only the operator grants: net.listen:8123" in (r.get("error") or ""),
+          "a listener with no grant -> %s" % r.get("error"))
+    check(w.run("install", web1, "--grant", "net.listen:8123").get("ok") is True, "a listener installs with the operator's grant")
     r = w.run("inspect", w.pack(w.tree(manifest("org.example.web2", caps=["net.listen:8123"]), RUN), "official"))
     check("already listens on port 8123" in r.get("error", ""), "the same port again -> %s" % r.get("error"))
 
@@ -997,6 +1189,14 @@ def run_all(w, top):
     check(w.run("inspect", community).get("tier") == "unverified", "without it the same package is unverified")
     check(w.run("key-remove", "maker").get("ok") is False, "removing a key that is not there")
     check(w.run("key-remove", "../../etc/passwd").get("ok") is False, "removing a path")
+    # The verifier reads 32 keys: a 33rd is refused at its add, never listed and trusted for nothing.
+    for k in range(31):
+        shutil.copy(pub, os.path.join(keydir, "k%02d.pub" % k))
+    check(w.run("key-add", "k31", pub).get("ok") is True, "a 32nd key is taken")
+    r = w.run("key-add", "k32", pub)
+    check(r.get("ok") is False and "that is the limit" in (r.get("error") or ""), "a 33rd key -> %s" % r.get("error"))
+    for k in range(32):
+        os.remove(os.path.join(keydir, "k%02d.pub" % k))
 
     print("the firmware range a package says it needs")
     core_range(w)
@@ -1037,6 +1237,9 @@ def wipe(w, root, keydir):
             print("the last owner's", file=f)
     listed = sorted(x["id"] for x in w.run("list").get("packages", []))
     check(set(ids) <= set(listed), "the three packages are not installed: %s" % listed)
+    # And what the owner typed into a package's settings.
+    with open(os.path.join(root, "settings", ids[0] + ".json"), "w") as f:
+        f.write('{"broker": "the last owner\'s"}\n')
 
     r = w.run("wipe")
     check(r.get("ok") is True and r.get("packages") == len(listed) and r.get("keys") == 1,
@@ -1048,8 +1251,9 @@ def wipe(w, root, keydir):
             left = os.path.join(root, sub, id_)
             check(not os.path.exists(left), "%s stayed behind" % left)
     # Everything under data/ goes, the leftovers of a package removed with
-    # its data kept included: they hold what the wipe is for.
-    for sub in ("pkg", "data", "keys"):
+    # its data kept included: they hold what the wipe is for. So does every
+    # package's settings file.
+    for sub in ("pkg", "data", "keys", "settings"):
         here = os.path.join(root, sub)
         check(os.path.isdir(here) and os.listdir(here) == [], "%s is not an empty directory: %s"
               % (here, os.listdir(here) if os.path.isdir(here) else "gone"))
@@ -1062,6 +1266,100 @@ def wipe(w, root, keydir):
     check(w.run("inspect", arch).get("tier") == "unverified", "the owner's key outlived the wipe")
     r = w.run("install", arch, "--consent-unverified")
     check(r.get("ok") is True, "nothing installs after a wipe: %s" % r.get("error"))
+
+    # A wipe that cannot take one thing takes everything else: a data tree 65 directories deep goes, a directory it
+    # cannot empty is said (the first failure), and the owner's key and the other packages' data go all the same.
+    check(w.run("key-add", "maker", w.pub("owner")).get("ok") is True, "the key could not be added back")
+    for n in range(3):
+        arch = w.pack(w.tree(manifest("org.example.left%d" % n), RUN), "owner")
+        check(w.run("install", arch, "--consent-community").get("ok") is True, "left%d could not be installed" % n)
+        os.makedirs(os.path.join(root, "data", "org.example.left%d" % n), exist_ok=True)
+    deep = os.path.join(root, "data", "org.example.left0", *["d"] * 65)
+    os.makedirs(deep)
+    open(os.path.join(deep, "bottom"), "w").close()
+    stuck = os.path.join(root, "data", "org.example.left1", "stuck")
+    os.makedirs(stuck)
+    open(os.path.join(stuck, "f"), "w").close()
+    os.chmod(stuck, 0o500)                              # nothing in it can be unlinked, by anybody but root
+    r = w.run("wipe")
+    os.chmod(stuck, 0o700)
+    if os.geteuid() != 0:
+        check(r.get("ok") is False and "org.example.left1" in (r.get("error") or ""),
+              "a directory the wipe cannot empty is said: %s" % r.get("error"))
+    check(w.run("keys").get("keys") == [] and not os.path.exists(os.path.join(root, "data", "org.example.left0"))
+          and not os.path.exists(os.path.join(root, "data", "org.example.left2")) and w.run("list").get("packages") == [],
+          "past that failure, the owner's key, the deep tree and the other package's data are gone: %s" % os.listdir(
+              os.path.join(root, "data")))
+    check(w.run("wipe").get("ok") is True and os.listdir(os.path.join(root, "data")) == [], "a second wipe takes what is left")
+
+    # A removal holds a constant number of descriptors however deep the tree: 100 levels under a limit of 64.
+    arch = w.pack(w.tree(manifest("org.example.deep"), RUN), "official")
+    check(w.run("install", arch).get("ok") is True, "deep could not be installed")
+    os.makedirs(os.path.join(root, "data", "org.example.deep", *["d"] * 100))
+    r = w.run("remove", "org.example.deep", pre=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64)))
+    check(r.get("ok") is True and not os.path.exists(os.path.join(root, "data", "org.example.deep")),
+          "a data tree 100 directories deep, removed by a command with 64 descriptors: %s" % r.get("error"))
+
+    # A removal a running package races stays inside the package's tree: a directory moved up inside it or out of
+    # it under the walk is found by its "..", and a directory swapped for a link between the walk's look and its open
+    # is not followed. The hook makes each race once, inside the wipe; the directory beside the tree keeps all it had.
+    hook = os.environ.get("RACE_HOOK") or os.path.join(HERE, "..", "build", "race_hook.so")
+    check(os.path.isfile(hook), "the race hook is built: %s" % hook)
+    for mode, words in (("up", "Stale file handle"), ("out", "Stale file handle"), ("symlink", "Not a directory")):
+        rroot = os.path.join(w.top, "race-" + mode)
+        tree_ = os.path.join(rroot, "data", "org.example.race")
+        outside = os.path.join(rroot, "outside")
+        for d in ("a/b/c", "z"):
+            os.makedirs(os.path.join(tree_, d))
+        os.makedirs(os.path.join(outside, "keepdir"))
+        for f in ("a/b/c/trigger", "a/b/c/f1", "a/b/x", "a/t", "z/f"):
+            with open(os.path.join(tree_, f), "w") as g:
+                g.write("x")
+        for f in ("precious", "keepdir/f"):
+            with open(os.path.join(outside, f), "w") as g:
+                g.write("kept")
+        p = subprocess.run([FORGEEXT, "--root", rroot, "--no-reserve", "wipe"], capture_output=True, text=True,
+                           env=dict(os.environ, LD_PRELOAD=hook, RACE_MODE=mode, RACE_TREE=tree_, RACE_OUT=outside))
+        try:
+            out = json.loads(p.stdout)
+        except ValueError:
+            out = {"ok": None, "error": "not JSON: %r" % p.stdout[:200]}
+        kept = all(open(os.path.join(outside, f)).read() == "kept" for f in ("precious", "keepdir/f")
+                   if os.path.exists(os.path.join(outside, f))) and os.path.isfile(os.path.join(outside, "keepdir", "f")) \
+            and os.path.isfile(os.path.join(outside, "precious"))
+        check("race_hook:" in p.stderr and out.get("ok") is False and words in (out.get("error") or "") and kept,
+              "a wipe raced by a %s: %s, and beside the tree %s" % (mode, out.get("error") or out,
+                                                                    "all is kept" if kept else "something went"))
+        shutil.rmtree(rroot, ignore_errors=True)
+
+    # A /data that takes no more writes: the empty state cannot be written and the wipe stops there, the owner's keys
+    # gone all the same (removing one takes no space).
+    check(w.run("key-add", "maker", w.pub("owner")).get("ok") is True, "the key could not be added back")
+
+    def full():
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+    r = w.run("wipe", pre=full)
+    check(r.get("ok") is False and "state.json" in (r.get("error") or "") and not [k for k in os.listdir(keydir) if k.endswith(".pub")],
+          "a wipe whose state write fails still takes the owner's keys: %s, keys %s" % (r.get("error"), os.listdir(keydir)))
+    check(w.run("wipe").get("ok") is True, "and the next wipe finishes")
+
+    # A state that does not read names nothing, and the wipe takes everything all the same.
+    check(w.run("key-add", "maker", w.pub("owner")).get("ok") is True, "the key could not be added back")
+    arch = w.pack(w.tree(manifest("org.example.lost"), RUN), "owner")
+    check(w.run("install", arch, "--consent-community").get("ok") is True, "lost could not be installed")
+    for id_ in ("org.example.lost", "org.example.gone"):    # its settings, and those of a package no longer installed
+        with open(os.path.join(root, "settings", id_ + ".json"), "w") as f:
+            f.write('{"broker": "the last owner\'s"}\n')
+    with open(os.path.join(root, "state.json"), "w") as f:
+        f.write("{damaged")
+    r = w.run("wipe")
+    check(r.get("ok") is True and w.run("list").get("packages") == [] and w.run("keys").get("keys") == []
+          and os.listdir(os.path.join(root, "pkg")) == [] and os.listdir(os.path.join(root, "data")) == []
+          and os.listdir(os.path.join(root, "settings")) == [],
+          "a wipe on a state that does not read takes every package, its data and every settings file: %s, settings %s"
+          % (r, os.listdir(os.path.join(root, "settings"))))
 
 
 if __name__ == "__main__":

@@ -28,7 +28,15 @@
  *     starts over, and its predecessor version may go. One that ends
  *     SUPER_QUARANTINE_CRASHES times inside SUPER_QUARANTINE_WINDOW_S
  *     without getting that far is quarantined, and stays so until the
- *     operator says otherwise. A start that fails is a crash.
+ *     operator says otherwise. A start that fails for the package's own
+ *     reason (its files, its manifest, its exec) is a crash; one that fails
+ *     for the machine's (SUPER_START_NOT_READY: a state that does not read,
+ *     the deny rules, the cgroup tree, a full /data, a name the resolver
+ *     does not answer) counts against nobody, and is tried again after the
+ *     same backoff. One whose names are still being looked up
+ *     (SUPER_START_PENDING) is tried again SUPER_PENDING_S later, its
+ *     backoff and the stagger untouched. A service is healthy only on the
+ *     install it was started from.
  *   A quarantine, whatever set it, is written where it outlives a restart.
  *     One whose write fails holds all the same: the service stays
  *     quarantined and the write is asked for again each tick, until it
@@ -60,6 +68,7 @@
 #define SUPER_MAX_RUNNING           4
 #define SUPER_STAGGER_S             5.0
 #define SUPER_HEALTHY_S             60.0
+#define SUPER_PENDING_S             1.0     /* a start whose names are being looked up, tried again after this */
 #define SUPER_BACKOFF_MIN_S         1.0
 #define SUPER_BACKOFF_MAX_S         30.0
 #define SUPER_QUARANTINE_CRASHES    5
@@ -120,8 +129,16 @@ typedef struct {
     const char *off_reason;             /* why enabled is 0, for the status file */
 } super_inputs_t;
 
+/* start's answer when the machine, not the package, is why it did not start. */
+#define SUPER_START_NOT_READY ((pid_t)-2)
+/* start's answer while what it needs is on its way (its names' lookups):
+ * nothing is counted, the stagger is not spent, and it is tried again
+ * SUPER_PENDING_S later. */
+#define SUPER_START_PENDING ((pid_t)-3)
+
 typedef struct {
-    pid_t (*start)(void *ctx, svc_t *s, char *err, size_t elen);    /* the pid, or -1 */
+    pid_t (*start)(void *ctx, svc_t *s, char *err, size_t elen);    /* the pid, -1, SUPER_START_NOT_READY, or
+                                                                     * SUPER_START_PENDING */
     void (*stop)(void *ctx, svc_t *s);                              /* kill, and take its group and its rules away */
     int (*freeze)(void *ctx, svc_t *s, int on);
     int (*job_limits)(void *ctx, svc_t *s, int on);
@@ -180,5 +197,10 @@ int super_take_aside(super_t *sv, const char *id, unsigned long long lifts, cons
 
 int super_running(const super_t *sv);
 const char *super_state_name(svc_state_t s);
+
+/* Whether a service answers its M-codes now: running, with the job_time.run
+ * grant, and not frozen (a service whose job-time limits did not take is
+ * frozen instead, and a frozen service's M-code is refused). */
+int super_answers_mcodes(const svc_t *s);
 
 #endif

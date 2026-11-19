@@ -22,6 +22,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <time.h>
 #include <unistd.h>
 
 #define KEY_EXT_OFFICIAL  "/etc/forgefirm/keys/ext/forgefirm-ext.pub"
@@ -33,12 +34,14 @@ static int fail(char *err, size_t elen, const char *fmt, ...)
 
 static int fail(char *err, size_t elen, const char *fmt, ...)
 {
+    int saved = errno;                                  /* the caller may still ask what failed */
     if (err && elen) {
         va_list ap;
         va_start(ap, fmt);
         vsnprintf(err, elen, fmt, ap);
         va_end(ap);
     }
+    errno = saved;
     return -1;
 }
 
@@ -109,6 +112,83 @@ static int root_dirs(const ext_env_t *env, char *err, size_t elen)
     return 0;
 }
 
+/* Everything under dirfd handed to uid:gid, through descriptors and never
+ * through a link: a symbolic link is re-owned itself and not followed,
+ * and a directory is opened O_NOFOLLOW from its parent's descriptor. */
+static int reown_at(int dirfd, uid_t uid, gid_t gid, int depth)
+{
+    if (depth > EXT_DATA_DEPTH_MAX) {
+        errno = ELOOP;
+        return -1;
+    }
+    int dup = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR *d = dup >= 0 ? fdopendir(dup) : NULL;
+    if (!d) {
+        if (dup >= 0)
+            close(dup);
+        return -1;
+    }
+    int rc = 0;
+    struct dirent *e;
+    while (rc == 0 && (e = readdir(d)) != NULL) {
+        struct stat st;
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        if (fstatat(dirfd, e->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0
+            || fchownat(dirfd, e->d_name, uid, gid, AT_SYMLINK_NOFOLLOW) != 0) {
+            rc = -1;
+        } else if (S_ISDIR(st.st_mode)) {
+            int sub = openat(dirfd, e->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            rc = sub < 0 ? -1 : reown_at(sub, uid, gid, depth + 1);
+            if (sub >= 0)
+                close(sub);
+        }
+    }
+    int saved = errno;
+    closedir(d);
+    errno = saved;
+    return rc;
+}
+
+int ext_data_own(const char *datadir, uid_t uid, gid_t gid, char *err, size_t elen)
+{
+    struct stat st;
+    if (mkdir(datadir, 0770) != 0 && errno != EEXIST)
+        return fail(err, elen, "cannot make %s: %s", datadir, strerror(errno));
+    int fd = open(datadir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        int saved = errno;
+        if (fd >= 0)
+            close(fd);
+        return fail(err, elen, "cannot open %s: %s", datadir, strerror(saved));
+    }
+    /* Kept from an install under another account (or from before the
+     * directory was root's): every entry is handed to this one. */
+    if (st.st_uid != 0 || st.st_gid != gid) {
+        if (reown_at(fd, uid, gid, 0) != 0) {
+            int saved = errno;
+            close(fd);
+            return fail(err, elen, "cannot hand what %s holds to its account: %s", datadir, strerror(saved));
+        }
+    }
+    int ok = fchown(fd, 0, gid) == 0 && fchmod(fd, 0770) == 0;
+    /* Its TMPDIR, the same way. Whatever the package left there that is
+     * not a directory is its own and goes. */
+    if (ok && fstatat(fd, "tmp", &st, AT_SYMLINK_NOFOLLOW) == 0 && !S_ISDIR(st.st_mode))
+        ok = unlinkat(fd, "tmp", 0) == 0;
+    if (ok && mkdirat(fd, "tmp", 0770) != 0 && errno != EEXIST)
+        ok = 0;
+    int tfd = ok ? openat(fd, "tmp", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
+    ok = tfd >= 0 && fchown(tfd, 0, gid) == 0 && fchmod(tfd, 0770) == 0;
+    int saved = errno;
+    if (tfd >= 0)
+        close(tfd);
+    close(fd);
+    if (!ok)
+        return fail(err, elen, "cannot hand %s to its account: %s", datadir, strerror(saved));
+    return 0;
+}
+
 int ext_root_prepare(const ext_env_t *env, char *err, size_t elen)
 {
     if (root_dirs(env, err, elen) != 0)
@@ -142,7 +222,9 @@ int ext_root_reachable(const ext_env_t *env, char *err, size_t elen)
     return 0;
 }
 
-int ext_lock(const ext_env_t *env, char *err, size_t elen)
+/* The root's lock, waited for, or with wait 0 refused at once while a
+ * command holds it (errno EWOULDBLOCK). */
+static int lock_root(const ext_env_t *env, int wait, char *err, size_t elen)
 {
     char p[300];
     if (!env->root || strlen(env->root) > EXT_ROOT_MAX)
@@ -151,12 +233,22 @@ int ext_lock(const ext_env_t *env, char *err, size_t elen)
     int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0)
         return fail(err, elen, "cannot open %s: %s", p, strerror(errno));
-    if (flock(fd, LOCK_EX) != 0) {
+    if (flock(fd, wait ? LOCK_EX : LOCK_EX | LOCK_NB) != 0) {
         int saved = errno;
         close(fd);
-        return fail(err, elen, "cannot lock %s: %s", p, strerror(saved));
+        if (saved == EWOULDBLOCK)
+            fail(err, elen, "the extension root is held by a command (an install, a removal): not now");
+        else
+            fail(err, elen, "cannot lock %s: %s", p, strerror(saved));
+        errno = saved;
+        return -1;
     }
     return fd;
+}
+
+int ext_lock(const ext_env_t *env, char *err, size_t elen)
+{
+    return lock_root(env, 1, err, elen);
 }
 
 void ext_unlock(int lock)
@@ -222,6 +314,19 @@ int ext_ui_html(const ext_env_t *env, const char *id, char **html, size_t *len, 
     *html = buf;
     *len = got;
     return 0;
+}
+
+int ext_reach(const manifest_t *m, const state_pkg_t *p, const char *out[EXT_DESTS_MAX], int *own)
+{
+    int n = 0;
+    for (int i = 0; i < m->ncaps && n < EXT_DESTS_MAX; i++)
+        if (strncmp(m->caps[i], "net.outbound:", 13) == 0)
+            out[n++] = m->caps[i] + 13;
+    if (own)
+        *own = n;
+    for (int i = 0; manifest_has_cap(m, "net.outbound.operator") && i < p->ndests && n < EXT_DESTS_MAX; i++)
+        out[n++] = p->dests[i];
+    return n;
 }
 
 int ext_manifest_of(const ext_env_t *env, const char *id, manifest_t *m, char *err, size_t elen)
@@ -399,6 +504,18 @@ static int judge_ui(const char *tree, const manifest_t *m, char *err, size_t ele
                     (long long)st.st_size, EXT_UI_MAX);
     if (have && st.st_size == 0)
         return fail(err, elen, "%s is empty", EXT_UI_FILE);
+    /* A page with a NUL in it would never be served (ext_ui_html takes it
+     * for no text), so it does not install either. */
+    if (have) {
+        FILE *f = fopen(p, "re");
+        int c, nul = 0;
+        while (f && (c = getc(f)) != EOF && !nul)
+            nul = c == 0;
+        if (f)
+            fclose(f);
+        if (!f || nul)
+            return fail(err, elen, f ? "%s holds a NUL" : "%s cannot be read", EXT_UI_FILE);
+    }
     return 0;
 }
 
@@ -420,22 +537,22 @@ static int judge_exec(const char *tree, const manifest_t *m, char *err, size_t e
  * On success the staging directory (staging/tree, staging/files) is the
  * caller's to commit or remove; on failure it is gone. */
 static int stage(const ext_env_t *env, const char *file, state_t *st, install_result_t *res,
-                 char *staging, size_t slen, char *err, size_t elen)
+                 char *staging, size_t slen, int *hold, char *err, size_t elen)
 {
     char payload[400], tree[400], list[400], mf[400];
 
     memset(res, 0, sizeof(*res));
+    *hold = -1;
     if (root_dirs(env, err, elen) != 0 || state_load(env->root, st, err, elen) != 0)
         return -1;
-    snprintf(staging, slen, "%.255s/tmp/in.XXXXXX", env->root);
-    if (!mkdtemp(staging))
-        return fail(err, elen, "cannot make a staging directory: %s", strerror(errno));
+    if ((*hold = ext_staging_make(env, "in", staging, slen, err, elen)) < 0)
+        return -1;
     snprintf(payload, sizeof(payload), "%.280s/payload.tar.gz", staging);
     snprintf(tree, sizeof(tree), "%.280s/tree", staging);
     snprintf(list, sizeof(list), "%.280s/files", staging);
     snprintf(mf, sizeof(mf), "%.280s/tree/manifest.json", staging);
     int rc = pkg_open(&env->trust, file, payload, &res->info, err, elen);
-    if (rc == 0 && mkdir(tree, 0755) != 0)
+    if (rc == 0 && (mkdir(tree, 0755) != 0 || chmod(tree, 0755) != 0))
         rc = fail(err, elen, "cannot make a staging directory: %s", strerror(errno));
     if (rc == 0)
         rc = pkg_unpack(payload, tree, list, &res->tree, err, elen);
@@ -465,20 +582,27 @@ static int stage(const ext_env_t *env, const char *file, state_t *st, install_re
     if (rc == 0)
         rc = judge(env, st, res, err, elen);
     unlink(payload);
-    if (rc != 0)
+    if (rc != 0) {
         pkg_rmtree(staging);
+        close(*hold);
+        *hold = -1;
+    }
     return rc;
 }
 
 int ext_inspect(const ext_env_t *env, const char *file, install_result_t *res, char *err, size_t elen)
 {
     char staging[288];
+    int hold = -1;
     state_t *st = calloc(1, sizeof(*st));
     if (!st)
         return fail(err, elen, "out of memory");
-    int rc = ext_root_prepare(env, err, elen) == 0 ? stage(env, file, st, res, staging, sizeof(staging), err, elen) : -1;
-    if (rc == 0)
+    int rc = ext_root_prepare(env, err, elen) == 0
+                 ? stage(env, file, st, res, staging, sizeof(staging), &hold, err, elen) : -1;
+    if (rc == 0) {
         pkg_rmtree(staging);
+        close(hold);
+    }
     free(st);
     return rc;
 }
@@ -533,6 +657,134 @@ static void drop_version(const char *pkgdir, const char *version)
  * pointed at is one: a name that is no version, or too long to be read
  * whole, is said and left where it is. 0, or -1 with the reason when the
  * lock cannot be taken. */
+/* Under the lock, with the state read: a tree under pkg/ that no record
+ * names (an install cut between its rename and its state write, or a
+ * version orphaned after it) goes, and so does whatever in a recorded
+ * package's directory is neither its version nor its predecessor. An
+ * install holds the lock from its rename to its state write, so nothing
+ * here is one under way. */
+/* Is name the tree of version v, or its file list? */
+static int is_version_entry(const char *name, const char *v)
+{
+    size_t lv = strlen(v);
+    return lv && strncmp(name, v, lv) == 0 && (name[lv] == '\0' || strcmp(name + lv, ".files") == 0);
+}
+
+static void sweep_unrecorded(const ext_env_t *env, const state_t *st)
+{
+    char dir[300], p[700];
+    snprintf(dir, sizeof(dir), "%.255s/pkg", env->root);
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        const state_pkg_t *rec = NULL;
+        for (int i = 0; i < st->n && !rec; i++)
+            if (strcmp(st->pkgs[i].id, e->d_name) == 0)
+                rec = &st->pkgs[i];
+        snprintf(p, sizeof(p), "%s/%.255s", dir, e->d_name);
+        if (!rec) {
+            /* Only what an install makes: a directory named by a package id. */
+            if (manifest_id_ok(e->d_name)) {
+                fflog(LOG_WARNING, "%s: no package of the state's: removed", p);
+                pkg_rmtree(p);
+            }
+            continue;
+        }
+        DIR *v = opendir(p);
+        struct dirent *f;
+        while (v && (f = readdir(v)) != NULL) {
+            /* A version's tree or its list, as an install makes them, and
+             * neither the record's version nor its predecessor. A name that
+             * is no version is not an install's and is left. */
+            char ver[64];
+            size_t len = strlen(f->d_name);
+            snprintf(ver, sizeof(ver), "%.*s", (int)(len > 6 && strcmp(f->d_name + len - 6, ".files") == 0 ? len - 6 : len),
+                     f->d_name);
+            /* The record's own two are kept by their names, whole: a
+             * version may itself end in ".files". */
+            if (is_version_entry(f->d_name, rec->version) || is_version_entry(f->d_name, rec->previous)
+                || !(manifest_version_ok(f->d_name) || manifest_version_ok(ver)))
+                continue;
+            char q[1000];
+            snprintf(q, sizeof(q), "%s/%.255s", p, f->d_name);
+            fflog(LOG_WARNING, "%s: neither %s's version nor its predecessor: removed", q, rec->id);
+            pkg_rmtree(q);
+        }
+        if (v)
+            closedir(v);
+    }
+    if (d)
+        closedir(d);
+}
+
+/* What an inspect, an install or an index fetch stages, under tmp/: made
+ * here and locked (flock) for as long as the caller holds the descriptor
+ * this returns, so that a sweep can tell one under way from one a killed
+ * process left. The descriptor, or -1 with the reason. */
+int ext_staging_make(const ext_env_t *env, const char *prefix, char *out, size_t olen, char *err, size_t elen)
+{
+    snprintf(out, olen, "%.255s/tmp/%.16s.XXXXXX", env->root, prefix);
+    if (!mkdtemp(out))
+        return fail(err, elen, "cannot make a staging directory: %s", strerror(errno));
+    int fd = open(out, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int saved = errno;
+        if (fd >= 0)
+            close(fd);
+        pkg_rmtree(out);
+        return fail(err, elen, "cannot lock a staging directory: %s", strerror(saved));
+    }
+    return fd;
+}
+
+/* Under the root's lock: what is under tmp/ and locked by nobody was left
+ * by a process that ended before it could remove it (forgectrl's kill, a
+ * power cut). One made a moment ago, between its mkdtemp and its lock, is
+ * left for the next sweep. */
+static void sweep_staging(const ext_env_t *env)
+{
+    char dir[300], p[600];
+    snprintf(dir, sizeof(dir), "%.255s/tmp", env->root);
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    time_t now = time(NULL);
+    while (d && (e = readdir(d)) != NULL) {
+        struct stat st;
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        snprintf(p, sizeof(p), "%s/%.255s", dir, e->d_name);
+        if (lstat(p, &st) != 0 || now - st.st_mtime < EXT_STAGING_GRACE_S)
+            continue;
+        int fd = S_ISDIR(st.st_mode) ? open(p, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) : -1;
+        if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            close(fd);
+            continue;                                   /* under way */
+        }
+        fflog(LOG_WARNING, "%s: left by a process that did not finish: removed", p);
+        pkg_rmtree(p);
+        if (fd >= 0)
+            close(fd);
+    }
+    if (d)
+        closedir(d);
+}
+
+/* The index is swapped in by two renames (index -> index.old, index.next
+ * -> index). Cut between them, the root has index.old and no index: the
+ * old one is what this machine keeps, and it is put back. */
+static void restore_index(const ext_env_t *env)
+{
+    char dir[300], old[300];
+    snprintf(dir, sizeof(dir), "%.255s/index", env->root);
+    snprintf(old, sizeof(old), "%.255s/index.old", env->root);
+    if (access(dir, F_OK) != 0 && errno == ENOENT && access(old, F_OK) == 0) {
+        if (rename(old, dir) == 0)
+            fflog(LOG_WARNING, "%s: the index's swap was cut short: the index this machine kept is put back", dir);
+    }
+}
+
 static int repair_current(const ext_env_t *env, char *err, size_t elen)
 {
     char pkgdir[340], link[400], cur[64];
@@ -564,6 +816,11 @@ static int repair_current(const ext_env_t *env, char *err, size_t elen)
             else if (cur[0] && strcmp(cur, p->previous) != 0)
                 drop_version(pkgdir, cur);
         }
+        sweep_unrecorded(env, st);
+    }
+    if (lock >= 0) {
+        sweep_staging(env);
+        restore_index(env);
     }
     ext_unlock(lock);
     free(st);
@@ -603,7 +860,7 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
 {
     char staging[288], pkgdir[340], from[400], to[400], datadir[340], missing[400] = "";
     char kept[33] = "", kept_prev[33] = "";             /* the record's version and predecessor before this install */
-    int rc = -1, turned = 0;
+    int rc = -1, turned = 0, hold = -1;
     state_t *st = calloc(1, sizeof(*st));
     if (!st)
         return fail(err, elen, "out of memory");
@@ -616,7 +873,7 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
         free(st);
         return -1;
     }
-    if (stage(env, file, st, res, staging, sizeof(staging), err, elen) != 0) {
+    if (stage(env, file, st, res, staging, sizeof(staging), &hold, err, elen) != 0) {
         ext_unlock(lock);
         free(st);
         return -1;
@@ -665,7 +922,7 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
      * install that fails after `current` turned turns it back
      * (turn_back()), and deletes nothing the state still names. */
     snprintf(pkgdir, sizeof(pkgdir), "%.255s/pkg/%.63s", env->root, m->id);
-    if (mkdir(pkgdir, 0755) != 0 && errno != EEXIST) {
+    if ((mkdir(pkgdir, 0755) != 0 && errno != EEXIST) || chmod(pkgdir, 0755) != 0) {
         fail(err, elen, "cannot make %s: %s", pkgdir, strerror(errno));
         goto out;
     }
@@ -709,13 +966,12 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
         p->ndests = 0;                                  /* a version that does not ask keeps none of them */
     if (p->slot >= 0) {
         snprintf(datadir, sizeof(datadir), "%.255s/data/%.63s", env->root, m->id);
-        if (mkdir(datadir, 0700) != 0 && errno != EEXIST) {
+        if (geteuid() == 0) {
+            uid_t acct = (uid_t)(STATE_POOL_UID + p->slot);
+            if (ext_data_own(datadir, acct, (gid_t)acct, err, elen) != 0)
+                goto out;
+        } else if ((mkdir(datadir, 0770) != 0 && errno != EEXIST) || chmod(datadir, 0770) != 0) {
             fail(err, elen, "cannot make %s: %s", datadir, strerror(errno));
-            goto out;
-        }
-        if (geteuid() == 0 && (chown(datadir, (uid_t)(STATE_POOL_UID + p->slot), (gid_t)(STATE_POOL_UID + p->slot)) != 0
-                               || chmod(datadir, 0700) != 0)) {
-            fail(err, elen, "cannot hand %s to ffx%d: %s", datadir, p->slot, strerror(errno));
             goto out;
         }
     }
@@ -726,6 +982,7 @@ out:
     if (rc != 0 && turned)
         turn_back(pkgdir, m->version, kept, kept_prev, err, elen);
     pkg_rmtree(staging);
+    close(hold);
     ext_unlock(lock);
     free(st);
     return rc;
@@ -784,65 +1041,90 @@ int ext_wipe(const ext_env_t *env, int *packages, int *keys, char *err, size_t e
         free(st);
         return -1;
     }
+    /* A state that does not read names nothing, and a wipe needs nothing
+     * from it: everything under the root goes all the same. */
+    int n = 0;
+    char ids[STATE_MAX_PKGS][64];
     if (state_load(env->root, st, err, elen) == 0) {
-        rc = 0;
-        /* The state is emptied and written first, so that nothing is ever
-         * started from a tree that is half gone: a host reading the state
-         * between the write and the last unlink finds no package at all. */
-        int n = st->n;
-        char ids[STATE_MAX_PKGS][64];
+        n = st->n;
         for (int i = 0; i < n; i++)
             snprintf(ids[i], sizeof(ids[i]), "%s", st->pkgs[i].id);
-        st->n = 0;
-        rc = state_save(env->root, st, err, elen);
-        if (rc == 0 && ext_required_holds_sync(env, st) != 0)
-            rc = fail(err, elen, "the required holds under %s could not be emptied", env->root);
-        for (int i = 0; i < n && rc == 0; i++) {
+    } else {
+        fflog(LOG_WARNING, "wipe: the state does not read (%s): everything under %s goes", err, env->root);
+    }
+    memset(st, 0, sizeof(*st));
+    rc = 0;
+    char first[600] = "";
+#define WIPE_FAIL(...) do { rc = -1; if (!first[0]) snprintf(first, sizeof(first), __VA_ARGS__); } while (0)
+    /* The owner's keys first, whatever comes after: a key the last owner
+     * added would go on making their packages read as community rather
+     * than as unverified, and removing one takes no space and starts
+     * nothing, so even a /data that takes no more writes loses them. */
+    DIR *d = env->trust.owner_keys_dir ? opendir(env->trust.owner_keys_dir) : NULL;
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            size_t len = strlen(e->d_name);
+            if (e->d_name[0] == '.' || len < 5 || strcmp(e->d_name + len - 4, ".pub") != 0)
+                continue;
+            snprintf(p, sizeof(p), "%.255s/%.128s", env->trust.owner_keys_dir, e->d_name);
+            if (unlink(p) == 0)
+                nkey++;
+            else if (errno != ENOENT)
+                WIPE_FAIL("cannot remove %.400s: %.150s", p, strerror(errno));
+        }
+        closedir(d);
+    }
+    /* Then the state, emptied and written, so that nothing is ever started
+     * from a tree that is half gone: a host reading the state between the
+     * write and the last unlink finds no package at all. A state that
+     * cannot be written stops the wipe there, the keys gone. Past it, every
+     * step is taken whatever the one before it did, and the first failure
+     * is what is said. */
+    int saved_rc = rc;
+    rc = state_save(env->root, st, err, elen);
+    if (rc == 0) {
+        rc = saved_rc;
+        if (ext_required_holds_sync(env, st) != 0)
+            WIPE_FAIL("the required holds under %s could not be emptied", env->root);
+        for (int i = 0; i < n; i++) {
+            int ok = 1;
             settings_forget(env->root, ids[i]);
             snprintf(p, sizeof(p), "%.255s/pkg/%.63s", env->root, ids[i]);
-            if (pkg_rmtree(p) != 0)
-                rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
+            if (pkg_rmtree(p) != 0) {
+                ok = 0;
+                WIPE_FAIL("cannot remove %.400s: %.150s", p, strerror(errno));
+            }
             snprintf(p, sizeof(p), "%.255s/data/%.63s", env->root, ids[i]);
-            if (rc == 0 && pkg_rmtree(p) != 0)
-                rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
-            if (rc == 0)
-                npkg++;
+            if (pkg_rmtree(p) != 0) {
+                ok = 0;
+                WIPE_FAIL("cannot remove %.400s: %.150s", p, strerror(errno));
+            }
+            npkg += ok;
         }
-        /* Whatever else is under data/. A package removed with its data
-         * kept leaves a directory the state no longer names, and it holds
-         * exactly what this is here to take. The directory holds nothing
-         * but per-package data, so everything in it goes. */
-        snprintf(p, sizeof(p), "%.255s/data", env->root);
-        DIR *dd = rc == 0 ? opendir(p) : NULL;
-        if (dd) {
+        /* Whatever else is under pkg/, data/ and settings/: a tree an
+         * install left before its state write, a package removed with its
+         * data kept, a state that did not read. Each holds nothing but
+         * per-package files, so everything in it goes. */
+        static const char *const sweep[] = { "pkg", "data", SETTINGS_DIR };
+        for (size_t k = 0; k < sizeof(sweep) / sizeof(sweep[0]); k++) {
+            snprintf(p, sizeof(p), "%.255s/%s", env->root, sweep[k]);
+            DIR *dd = opendir(p);
             struct dirent *e;
-            while ((e = readdir(dd)) != NULL) {
+            while (dd && (e = readdir(dd)) != NULL) {
                 char left[400];
                 if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
                     continue;
-                snprintf(left, sizeof(left), "%.255s/data/%.120s", env->root, e->d_name);
+                snprintf(left, sizeof(left), "%.255s/%s/%.120s", env->root, sweep[k], e->d_name);
                 if (pkg_rmtree(left) != 0)
-                    rc = fail(err, elen, "cannot remove %s: %s", left, strerror(errno));
+                    WIPE_FAIL("cannot remove %.400s: %.150s", left, strerror(errno));
             }
-            closedir(dd);
+            if (dd)
+                closedir(dd);
         }
-        /* The owner's keys. A key the last owner added would go on making
-         * their packages read as community rather than as unverified. */
-        DIR *d = rc == 0 && env->trust.owner_keys_dir ? opendir(env->trust.owner_keys_dir) : NULL;
-        if (d) {
-            struct dirent *e;
-            while ((e = readdir(d)) != NULL) {
-                size_t len = strlen(e->d_name);
-                if (e->d_name[0] == '.' || len < 5 || strcmp(e->d_name + len - 4, ".pub") != 0)
-                    continue;
-                snprintf(p, sizeof(p), "%.255s/%.128s", env->trust.owner_keys_dir, e->d_name);
-                if (unlink(p) == 0)
-                    nkey++;
-                else if (errno != ENOENT)
-                    rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
-            }
-            closedir(d);
-        }
+#undef WIPE_FAIL
+        if (rc != 0 && err && elen)
+            snprintf(err, elen, "%.*s", (int)elen - 1, first);
     }
     ext_unlock(lock);
     free(st);
@@ -896,7 +1178,9 @@ int ext_required_holds_sync(const ext_env_t *env, const state_t *st)
 
 /* With `still`, the change is made only to a record that `still` accepts
  * as it reads under the lock, and 1 is returned, with nothing written,
- * for one it refuses or for a package that is not installed. */
+ * for one it refuses or for a package that is not installed. The daemon
+ * is the one caller, and its turn never waits on a command's lock: one
+ * that is held is -1 with errno EWOULDBLOCK, for the next turn. */
 static int change(const ext_env_t *env, const char *id, int drop_previous, int quarantined,
                   int (*still)(const state_pkg_t *p, void *arg), void *arg, char *err, size_t elen)
 {
@@ -904,7 +1188,12 @@ static int change(const ext_env_t *env, const char *id, int drop_previous, int q
     state_t *st = calloc(1, sizeof(*st));
     if (!st)
         return fail(err, elen, "out of memory");
-    int lock = ext_lock(env, err, elen), rc = -1;
+    int lock = lock_root(env, 0, err, elen), rc = -1, saved = errno;
+    if (lock < 0) {
+        free(st);
+        errno = saved;
+        return -1;
+    }
     if (lock >= 0 && state_load(env->root, st, err, elen) == 0) {
         state_pkg_t *p = state_find(st, id);
         if (!p) {
@@ -929,9 +1218,19 @@ static int change(const ext_env_t *env, const char *id, int drop_previous, int q
     return rc;
 }
 
-int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen)
+static int names_previous(const state_pkg_t *p, void *arg)
 {
-    return change(env, id, 1, -1, NULL, NULL, err, elen);
+    const char *const *want = arg;                      /* the predecessor, and the install's stamp */
+    return strcmp(p->previous, want[0]) == 0 && strcmp(p->stamp, want[1]) == 0;
+}
+
+int ext_drop_previous(const ext_env_t *env, const char *id, const char *previous, const char *stamp, char *err,
+                      size_t elen)
+{
+    if (!previous || !previous[0])
+        return 1;
+    const char *want[] = { previous, stamp ? stamp : "" };
+    return change(env, id, 1, -1, names_previous, want, err, elen);
 }
 
 int ext_quarantine_if(const ext_env_t *env, const char *id, int (*still)(const state_pkg_t *p, void *arg), void *arg,
@@ -961,6 +1260,21 @@ int ext_key_add(const ext_env_t *env, const char *name, const char *text, size_t
     snprintf(tmp, sizeof(tmp), "%.255s/keys/.%.48s.pub.new", env->root, name);
     if (access(path, F_OK) == 0)
         return fail(err, elen, "a key called %s is already here", name);
+    /* The verifier reads PKG_MAX_KEYS of them: one past that would be
+     * listed and trusted for nothing. */
+    char dir[300];
+    snprintf(dir, sizeof(dir), "%.255s/keys", env->root);
+    DIR *d = opendir(dir);
+    int have = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+        have += e->d_name[0] != '.' && len > 4 && strcmp(e->d_name + len - 4, ".pub") == 0;
+    }
+    if (d)
+        closedir(d);
+    if (have >= PKG_MAX_KEYS)
+        return fail(err, elen, "the owner has added %d keys, and that is the limit: remove one first", have);
     int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
     if (fd < 0)
         return fail(err, elen, "cannot write %s: %s", tmp, strerror(errno));

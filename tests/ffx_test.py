@@ -106,6 +106,16 @@ FIXTURES = [
     ("a page that does not ask for ui", with_(), {"ui/index.html": "<!doctype html><p>page</p>",
                                                   "__words__": "this package has a ui/index.html and does not ask for ui"}),
     ("an entry point that is not there", with_(service={"exec": "bin/other.py"}), {}),
+    ("a page that holds a NUL", with_(runtime="ui", service=None, capabilities=["ui"]),
+     {"ui/index.html": "<!doctype html><p>a\0b</p>", "__words__": "ui/index.html holds a NUL"}),
+    ("a shell service that answers an M-code", with_(runtime="shell", service={"exec": "bin/run.sh"},
+                                                     capabilities=["job_time.run", "mcode:160"]),
+     {"__words__": 'capability "mcode:160" is asked on the call socket, which a shell service cannot answer: '
+                   'runtime python or native'}),
+    ("an outbound address in a form that is not the canonical dotted quad", with_(capabilities=["net.outbound:010.1.2.3:80"]),
+     {}),
+    ("more directories than a payload holds", with_(), {"__dirs__": "4097",
+                                                         "__words__": "the payload holds more than 4096 directory entries"}),
 ]
 
 
@@ -126,6 +136,8 @@ def build(top, name, manifest, extra):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         open(p, "w").write("import os\n" if p.endswith(".py") else "#!/bin/sh\n")
         os.chmod(p, 0o755)
+    for k in range(int(extra.get("__dirs__", "0"))):
+        os.makedirs(os.path.join(d, "many", "%04d" % k))
     for rel, text in extra.items():
         if rel.startswith("__"):
             continue
@@ -348,6 +360,16 @@ def main():
         else:
             print("  note: no arm-linux-gnueabihf-gcc here: the ARM binaries are not tried")
 
+        print("ffx's version order and reserved namespace are the host's (src/manifest.c, manifest_test)")
+        for a, b, want in (("1.0.0-rc.10", "1.0.0-rc.9", 1), ("1.0.0-alpha", "1.0.0-alpha.1", -1), ("1.0.0-1", "1.0.0-alpha", -1),
+                           ("1.0.0-ab", "1.0.0-abc", -1), ("1.0.0-beta.2", "1.0.0-beta.11", -1), ("1.0.0-rc.1", "1.0.0-rc.1", 0),
+                           ("1.0.0", "1.0.0-rc.1", 1)):
+            check(ffx.version_cmp(a, b) == want, "%s against %s: %d, expected %d", a, b, ffx.version_cmp(a, b), want)
+        check(not any(ffx.version_ok(v) for v in ("1.0.0-rc.", "1.0.0-rc.1.", "1.0.0-rc..1", "1.0.0-.", "1.0.0-rc.01"))
+              and ffx.version_ok("1.0.0-rc.0") and ffx.version_ok("1.0.0-0a"), "pre-release identifiers")
+        check(ffx.official_ns("org.openglow") and ffx.official_ns("org.forgefirm") and ffx.official_ns("org.forgefirm.x")
+              and not ffx.official_ns("org.openglowfan.x"), "the reserved namespace")
+
         print("ffx lint against forgeext inspect, fixture by fixture")
         for name, manifest, extra in FIXTURES:
             d = build(top, name, manifest, extra)
@@ -563,7 +585,7 @@ def main():
             undo()
             check(rc == 1 and words in said and not os.path.exists(out), "%s: refused, and nothing written: %s", what, said)
         rc, said = index_build(out, version="2026.9")
-        check(rc == 1 and "YYYY.MMDD.N" in said, "an index version that is none: %s", said)
+        check(rc == 1 and "YYYY.MDD.N" in said, "an index version that is none: %s", said)
 
         i1, i2 = os.path.join(top, "i1.ffi"), os.path.join(top, "i2.ffi")
         for o in (i1, i2):

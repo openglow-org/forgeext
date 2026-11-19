@@ -16,6 +16,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <sodium.h>
@@ -632,16 +633,31 @@ static int clean_path(const char *in, char *out, size_t olen)
 static int make_dirs(int dirfd, const char *path, int whole)
 {
     char p[PKG_MAX_PATH + 1];
+    struct stat st;
     snprintf(p, sizeof(p), "%s", path);
     size_t len = strlen(p);
+    if (!whole) {
+        char *slash = strrchr(p, '/');
+        if (!slash)
+            return 0;                                   /* a file at the top: nothing to make */
+        *slash = '\0';
+        len = strlen(p);
+        whole = 1;                                      /* what is left is the file's directory, all of it */
+    }
+    /* A directory made already (an entry repeated, or a file's directory
+     * made for the one before it) costs one look, not one per prefix. */
+    if (fstatat(dirfd, p, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode))
+        return 0;
     for (size_t i = 1; i <= len; i++) {
         if (p[i] != '/' && !(p[i] == '\0' && whole))
             continue;
         char keep = p[i];
         p[i] = '\0';
-        struct stat st;
+        /* 0755 whatever the umask of whoever runs this: the service's
+         * account reads the tree through every one of its directories. */
         if ((mkdirat(dirfd, p, 0755) != 0 && errno != EEXIST)
-            || fstatat(dirfd, p, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(st.st_mode))
+            || fstatat(dirfd, p, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(st.st_mode)
+            || ((st.st_mode & 07777) != 0755 && fchmodat(dirfd, p, 0755, 0) != 0))
             return -1;
         p[i] = keep;
     }
@@ -652,7 +668,7 @@ int pkg_unpack(const char *payload, const char *dest, const char *list_path,
                pkg_tree_t *tree, char *err, size_t elen)
 {
     listed_t *list = NULL;
-    int nlist = 0, rc = -1, dirfd = -1;
+    int nlist = 0, ndirs = 0, rc = -1, dirfd = -1;
     pkg_tree_t t = { 0, 0, 0 };
     struct archive *a = NULL;
 
@@ -688,8 +704,18 @@ int pkg_unpack(const char *payload, const char *dest, const char *list_path,
             fail(err, elen, "the payload holds a link (\"%.80s\"): a package is files and directories", path);
             goto out;
         }
+        /* Every entry counts, a directory repeated included, and so does
+         * what the headers alone unpack to: neither is the files' data. */
+        if (archive_filter_bytes(a, 0) > PKG_MAX_UNPACKED + PKG_MAX_HEADERS) {
+            fail(err, elen, "the payload's tar stream is larger than %lld MiB", (PKG_MAX_UNPACKED + PKG_MAX_HEADERS) >> 20);
+            goto out;
+        }
         mode_t type = archive_entry_filetype(e);
         if (type == AE_IFDIR) {
+            if (path[0] && ++ndirs > PKG_MAX_DIRS) {    /* the root's own entry makes nothing; the stream's bound holds it */
+                fail(err, elen, "the payload holds more than %d directory entries", PKG_MAX_DIRS);
+                goto out;
+            }
             if (path[0] && make_dirs(dirfd, path, 1) != 0) {
                 fail(err, elen, "cannot make directory \"%.80s\"", path);
                 goto out;
@@ -892,38 +918,154 @@ int pkg_tree_check(const char *dir, const char *list_path, char *err, size_t ele
 
 /* ---- removal ------------------------------------------------------------------ */
 
-static int rm_at(int dirfd, const char *name, int depth)
+/* One level of a removal under way: the directory's device and inode as it
+ * was entered, its name in its parent, and the names under it that could
+ * not be removed. */
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+    char name[NAME_MAX + 1];
+    char (*skip)[NAME_MAX + 1];
+    int nskip;
+} rm_level_t;
+
+static int rm_skipped(const rm_level_t *l, const char *name)
 {
-    struct stat st;
-    if (fstatat(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
-        return errno == ENOENT ? 0 : -1;
-    if (!S_ISDIR(st.st_mode))
-        return unlinkat(dirfd, name, 0);
-    if (depth > 64)
-        return -1;
-    int fd = openat(dirfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0)
-        return -1;
-    DIR *d = fdopendir(fd);
-    if (!d) {
-        close(fd);
-        return -1;
-    }
-    int rc = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
-            continue;
-        if (rm_at(fd, e->d_name, depth + 1) != 0)
-            rc = -1;
-    }
-    closedir(d);
-    if (unlinkat(dirfd, name, AT_REMOVEDIR) != 0)
-        rc = -1;
-    return rc;
+    for (int i = 0; i < l->nskip; i++)
+        if (strcmp(l->skip[i], name) == 0)
+            return 1;
+    return 0;
 }
 
+static void rm_skip(rm_level_t *l, const char *name)
+{
+    void *more = realloc(l->skip, sizeof(*l->skip) * (size_t)(l->nskip + 1));
+    if (!more)
+        return;                                         /* it is said as a failure all the same */
+    l->skip = more;
+    snprintf(l->skip[l->nskip++], sizeof(l->skip[0]), "%s", name);
+}
+
+/* No bound on the depth, and a constant number of descriptors whatever it
+ * is: a package's data is the package's to nest, and a tree that cannot
+ * be removed is a wipe that fails. Down by openat(O_NOFOLLOW) from the
+ * directory held, back up by ".." checked against the device and inode
+ * remembered on the way down, so that a directory moved meanwhile ends the
+ * removal rather than leading it anywhere else. A link is removed, never
+ * followed. What cannot be removed is passed over, the rest goes, and the
+ * result says so (errno the first failure's). */
 int pkg_rmtree(const char *dir)
 {
-    return rm_at(AT_FDCWD, dir, 0);
+    struct stat st;
+    if (lstat(dir, &st) != 0)
+        return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode))
+        return unlink(dir);
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        if (fd >= 0)
+            close(fd);
+        return -1;
+    }
+    rm_level_t *lv = calloc(1, sizeof(*lv));
+    if (!lv) {
+        close(fd);
+        errno = ENOMEM;
+        return -1;
+    }
+    int n = 1, cap = 1, rc = 0, first = 0;
+    lv[0].dev = st.st_dev;
+    lv[0].ino = st.st_ino;
+#define RM_FAIL() do { if (!rc) first = errno; rc = -1; } while (0)
+    for (;;) {
+        char down[NAME_MAX + 1] = "";
+        int dup_fd = dup(fd);
+        DIR *d = dup_fd >= 0 ? fdopendir(dup_fd) : NULL;
+        if (!d) {
+            if (dup_fd >= 0)
+                close(dup_fd);
+            RM_FAIL();
+            break;
+        }
+        rewinddir(d);                                   /* the duplicate shares the held descriptor's offset */
+        struct dirent *e;
+        while (!down[0] && (e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0 || rm_skipped(&lv[n - 1], e->d_name))
+                continue;
+            struct stat es;
+            if (fstatat(fd, e->d_name, &es, AT_SYMLINK_NOFOLLOW) != 0) {
+                if (errno != ENOENT) {
+                    RM_FAIL();
+                    rm_skip(&lv[n - 1], e->d_name);
+                }
+            } else if (S_ISDIR(es.st_mode)) {
+                snprintf(down, sizeof(down), "%s", e->d_name);
+            } else if (unlinkat(fd, e->d_name, 0) != 0 && errno != ENOENT) {
+                RM_FAIL();
+                rm_skip(&lv[n - 1], e->d_name);
+            }
+        }
+        closedir(d);
+        if (down[0]) {
+            int child = openat(fd, down, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            struct stat cs;
+            if (child < 0 || fstat(child, &cs) != 0) {
+                RM_FAIL();
+                rm_skip(&lv[n - 1], down);
+                if (child >= 0)
+                    close(child);
+                continue;
+            }
+            if (n == cap) {
+                rm_level_t *more = realloc(lv, sizeof(*lv) * (size_t)(cap * 2));
+                if (!more) {
+                    close(child);
+                    errno = ENOMEM;
+                    RM_FAIL();
+                    break;
+                }
+                lv = more;
+                cap *= 2;
+            }
+            memset(&lv[n], 0, sizeof(lv[n]));
+            lv[n].dev = cs.st_dev;
+            lv[n].ino = cs.st_ino;
+            snprintf(lv[n].name, sizeof(lv[n].name), "%s", down);
+            n++;
+            close(fd);
+            fd = child;
+            continue;
+        }
+        if (n == 1)
+            break;                                      /* the top holds nothing it can lose any more */
+        int up = openat(fd, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        struct stat us;
+        if (up < 0 || fstat(up, &us) != 0 || us.st_dev != lv[n - 2].dev || us.st_ino != lv[n - 2].ino) {
+            if (up >= 0)
+                close(up);
+            errno = ESTALE;                             /* moved under the removal: it goes no further */
+            RM_FAIL();
+            break;
+        }
+        close(fd);
+        fd = up;
+        n--;
+        free(lv[n].skip);
+        if (unlinkat(fd, lv[n].name, AT_REMOVEDIR) != 0 && errno != ENOENT) {
+            RM_FAIL();
+            rm_skip(&lv[n - 1], lv[n].name);
+        }
+    }
+#undef RM_FAIL
+    close(fd);
+    for (int i = 0; i < n; i++)
+        free(lv[i].skip);
+    free(lv);
+    if (rc == 0 && rmdir(dir) != 0 && errno != ENOENT) {
+        first = errno;
+        rc = -1;
+    }
+    if (rc != 0)
+        errno = first;
+    return rc;
 }

@@ -30,19 +30,38 @@
  * install or an enable, as the sync reads it or as the write finds it)
  * lets the service out, and a destination the operator names does not.
  * A quarantine kept outside the state is taken up for a service that is
- * not running, and refused for one that is.
+ * not running, and refused for one that is. A start whose names are being
+ * looked up is put off a moment, with nothing counted, no backoff grown
+ * and the stagger not spent. A service is healthy only on the install it
+ * was started from. The status file takes what the host writes whole, at
+ * any size. And the removals of predecessors the root's lock put off are
+ * kept one per package, the latest predecessor and its install's stamp,
+ * until a try ends another way; a removal takes the predecessor only of
+ * the install it was put off for (ext_drop_previous over a root of the
+ * test's): a record a later install wrote, or one that names another
+ * predecessor, keeps its own. The healthy mark takes a predecessor only
+ * from the record the service was started from.
  */
 #include "../src/super.h"
+#include "../src/install.h"
+#include "../src/run.h"
+#include "../src/state.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#define STAMP_A "aaaaaaaaaaaaaaaa"          /* two installs' stamps */
+#define STAMP_B "bbbbbbbbbbbbbbbb"
 
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
 
 static struct {
     int starts, stops, freezes, thaws, limits_on, limits_off, quarantines, healthies;
-    int fail_start, fail_freeze, fail_limits;
+    int fail_start, not_ready_start, pending_start, fail_freeze, fail_limits;
     int write_rc, rewrites;             /* what the quarantine's write answers, and how often it was asked again */
     pid_t next_pid;
     char last_started[64], last_quarantined[64], last_why[160];
@@ -54,6 +73,14 @@ static pid_t op_start(void *ctx, svc_t *s, char *err, size_t elen)
     if (w.fail_start) {
         snprintf(err, elen, "exec: No such file or directory");
         return -1;
+    }
+    if (w.not_ready_start) {
+        snprintf(err, elen, "cannot resolve peer.test: the resolver did not answer");
+        return SUPER_START_NOT_READY;
+    }
+    if (w.pending_start && strcmp(s->id, "org.example.named") == 0) {
+        snprintf(err, elen, "looking up peer.test");
+        return SUPER_START_PENDING;
     }
     w.starts++;
     snprintf(w.last_started, sizeof(w.last_started), "%s", s->id);
@@ -254,6 +281,163 @@ int main(void)
     CHECK(a->state == SVC_QUARANTINED && w.quarantines == 1 && strstr(a->reason, "did not start"),
           "five failed starts: %s, %s", super_state_name(a->state), a->reason);
 
+    /* a start the machine was not ready for counts against nobody: it
+     * waits out the same backoff and is tried again, however often */
+    fresh();
+    a = add("org.example.a", 0);
+    w.not_ready_start = 1;
+    now = 100;
+    for (int i = 0; i < 3 * SUPER_QUARANTINE_CRASHES; i++) {
+        super_tick(&sv, &READY, now);
+        now = (a->next_start > now ? a->next_start : now) + SUPER_STAGGER_S;
+    }
+    CHECK(a->state == SVC_BACKOFF && a->ncrashes == 0 && w.quarantines == 0 && strstr(a->reason, "not ready")
+          && a->backoff_s == SUPER_BACKOFF_MAX_S, "fifteen starts the machine was not ready for: %s, %d counted, %s",
+          super_state_name(a->state), a->ncrashes, a->reason);
+    w.not_ready_start = 0;
+    super_tick(&sv, &READY, now);
+    CHECK(a->state == SVC_RUNNING, "ready again, it did not start: %s", super_state_name(a->state));
+
+    /* a start whose names are being looked up is put off a moment, never
+     * waited for: nothing is counted, no backoff grows, and the stagger is
+     * not spent, so another service starts on the next tick */
+    fresh();
+    a = add("org.example.named", 0);
+    b = add("org.example.b", 1);
+    w.pending_start = 1;
+    super_tick(&sv, &READY, 100);
+    CHECK(a->state == SVC_BACKOFF && a->next_start == 100 + SUPER_PENDING_S && a->ncrashes == 0 && a->backoff_s == 0
+          && strstr(a->reason, "looking up peer.test") && w.starts == 0,
+          "a start put off for its lookups: %s, again at %.1f, %d counted, backoff %.0f, %s", super_state_name(a->state),
+          a->next_start, a->ncrashes, a->backoff_s, a->reason);
+    super_tick(&sv, &READY, 100.5);
+    CHECK(b->state == SVC_RUNNING && w.starts == 1, "the stagger was spent on it: the other is %s",
+          super_state_name(b->state));
+    for (double t2 = 101; t2 < 140; t2 += 1)
+        super_tick(&sv, &READY, t2);
+    CHECK(a->ncrashes == 0 && w.quarantines == 0 && a->backoff_s == 0, "forty seconds of lookups counted %d, backoff %.0f",
+          a->ncrashes, a->backoff_s);
+    w.pending_start = 0;
+    super_tick(&sv, &READY, 141);
+    CHECK(a->state == SVC_RUNNING, "answered, it did not start: %s", super_state_name(a->state));
+
+    /* healthy is the install it was started from: one installed anew inside
+     * a window runs on from its old tree, and that tree is not the
+     * predecessor of a version that has run healthy */
+    fresh();
+    a = add("org.example.a", 0);
+    sync_one(a, 1, 0, 1);
+    super_tick(&sv, &READY, 100);
+    sync_one(a, 1, 0, 2);
+    super_tick(&sv, &ARMED, 101);
+    super_tick(&sv, &ARMED, 100 + SUPER_HEALTHY_S + 1);
+    CHECK(a->state == SVC_RUNNING && w.healthies == 0 && !a->healthy,
+          "a service on its old install was healthy inside the window: told %d times", w.healthies);
+    super_tick(&sv, &READY, 100 + SUPER_HEALTHY_S + 2);
+    CHECK(a->state == SVC_RUNNING && a->conf_started == 2 && w.stops == 1 && w.starts == 2 && w.healthies == 0,
+          "the window closed: started again on its new install (%s, %d stops, %d starts), told %d times",
+          super_state_name(a->state), w.stops, w.starts, w.healthies);
+
+    /* status.json at any size: what the host writes for its services goes
+     * whole into the file, however long */
+    {
+        char dir[] = "/tmp/super_test.XXXXXX";
+        static char text[65536 + 2], back[65536 + 64];
+        CHECK(mkdtemp(dir) != NULL, "a directory for the status file");
+        memset(text, 'x', sizeof(text) - 2);
+        text[0] = '{';
+        text[sizeof(text) - 2] = '}';
+        text[sizeof(text) - 1] = '\0';
+        char path[64];
+        snprintf(path, sizeof(path), "%s/status.json", dir);
+        int rc = run_status_file(dir, text);
+        FILE *f = fopen(path, "r");
+        size_t got = f ? fread(back, 1, sizeof(back), f) : 0;
+        if (f)
+            fclose(f);
+        CHECK(rc == 0 && got == strlen(text) + 1 && memcmp(back, text, strlen(text)) == 0 && back[got - 1] == '\n',
+              "a status of %zu bytes written whole: rc %d, %zu bytes back", strlen(text), rc, got);
+        unlink(path);
+        rmdir(dir);
+    }
+
+    /* the removals the root's lock put off: one per package, the latest
+     * predecessor in place of an earlier one, taken out by a try that ends
+     * any other way, and none past the bound */
+    {
+        run_drop_t due[4];
+        int n = 0;
+        memset(due, 0, sizeof(due));
+        run_drop_due(due, &n, 3, "org.example.a", "1.0.0", STAMP_A, 1);
+        run_drop_due(due, &n, 3, "org.example.b", "1.0.0", STAMP_A, 1);
+        run_drop_due(due, &n, 3, "org.example.a", "2.0.0", STAMP_B, 1);
+        CHECK(n == 2 && strcmp(due[0].id, "org.example.a") == 0 && strcmp(due[0].previous, "2.0.0") == 0
+              && strcmp(due[0].stamp, STAMP_B) == 0,
+              "put off twice for one package: %d entries, the first %s %s of install %s", n, due[0].id, due[0].previous,
+              due[0].stamp);
+        run_drop_due(due, &n, 3, "org.example.a", "2.0.0", STAMP_B, 0);
+        CHECK(n == 1 && strcmp(due[0].id, "org.example.b") == 0, "removed: %d entries, the first %s", n, due[0].id);
+        run_drop_due(due, &n, 3, "org.example.c", "1.0.0", STAMP_A, 1);
+        run_drop_due(due, &n, 3, "org.example.d", "1.0.0", STAMP_A, 1);
+        run_drop_due(due, &n, 3, "org.example.e", "1.0.0", STAMP_A, 1);
+        CHECK(n == 3 && due[3].id[0] == '\0', "a full book takes no more: %d entries", n);
+    }
+
+    /* a removal put off is one install's: a record a later install wrote
+     * keeps its predecessor, the same version though it names, and so does
+     * a record that names another; the install's own predecessor goes */
+    {
+        char root[] = "/tmp/forgeext-super-drop.XXXXXX", tree[96], path[128], err[200] = "";
+        static state_t st;
+        struct stat sb;
+        ext_env_t env;
+        ext_env_defaults(&env);
+        env.root = mkdtemp(root);
+        snprintf(tree, sizeof(tree), "%s/pkg/org.example.p/1.0.0", root);
+        snprintf(path, sizeof(path), "mkdir -p %s", tree);
+        memset(&st, 0, sizeof(st));
+        state_pkg_t *p = state_add(&st, "org.example.p");
+        snprintf(p->version, sizeof(p->version), "2.0.0");
+        snprintf(p->previous, sizeof(p->previous), "1.0.0");
+        snprintf(p->stamp, sizeof(p->stamp), STAMP_B);
+        p->tier = TIER_UNVERIFIED;
+        p->slot = -1;
+        CHECK(env.root && system(path) == 0 && state_save(root, &st, err, sizeof(err)) == 0, "a root with a record: %s", err);
+        int rc = ext_drop_previous(&env, "org.example.p", "1.0.0", STAMP_A, err, sizeof(err));
+        CHECK(rc == 1 && stat(tree, &sb) == 0 && state_load(root, &st, err, sizeof(err)) == 0
+              && strcmp(st.pkgs[0].previous, "1.0.0") == 0,
+              "put off for an earlier install of the same version over the same predecessor: nothing goes -> %d", rc);
+        rc = ext_drop_previous(&env, "org.example.p", "0.9.0", STAMP_B, err, sizeof(err));
+        CHECK(rc == 1 && stat(tree, &sb) == 0, "put off for a predecessor the record no longer names: nothing goes -> %d", rc);
+        rc = ext_drop_previous(&env, "org.example.p", "1.0.0", STAMP_B, err, sizeof(err));
+        CHECK(rc == 0 && stat(tree, &sb) != 0 && state_load(root, &st, err, sizeof(err)) == 0
+              && st.pkgs[0].previous[0] == '\0',
+              "the install's own predecessor goes, and the record forgets it -> %d (%s)", rc, err);
+        snprintf(path, sizeof(path), "rm -rf %s", root);
+        if (system(path) != 0)
+            fails++;
+    }
+
+    /* the healthy mark takes a predecessor only from the record the
+     * service was started from: a record an install wrote since names the
+     * version still running, and gives none */
+    {
+        static state_t st;
+        memset(&st, 0, sizeof(st));
+        state_pkg_t *p = state_add(&st, "org.example.p");
+        snprintf(p->version, sizeof(p->version), "2.0.0");
+        snprintf(p->previous, sizeof(p->previous), "1.0.0");
+        snprintf(p->stamp, sizeof(p->stamp), STAMP_A);
+        unsigned long long started = run_conf_digest(p);
+        const state_pkg_t *got = run_healthy_record(&st, "org.example.p", started);
+        CHECK(got == p, "the record the service was started from gives its predecessor");
+        snprintf(p->version, sizeof(p->version), "3.0.0");
+        snprintf(p->previous, sizeof(p->previous), "2.0.0");
+        snprintf(p->stamp, sizeof(p->stamp), STAMP_B);
+        got = run_healthy_record(&st, "org.example.p", started);
+        CHECK(got == NULL, "a record installed since the start gives no predecessor: %s", got ? got->previous : "none");
+    }
+
     /* stopped without a crash */
     fresh();
     a = add("org.example.a", 0);
@@ -346,8 +530,10 @@ int main(void)
     a = add("org.example.a", 0);
     a->job_time = 1;
     super_tick(&sv, &READY, 100);
+    CHECK(super_answers_mcodes(a), "a running service with the grant does not answer its M-codes");
     w.fail_limits = 1;
     super_tick(&sv, &ARMED, 110);
+    CHECK(!super_answers_mcodes(a), "frozen in place of its limits, it is still listed as answering its M-codes");
     CHECK(a->state == SVC_RUNNING && a->frozen && !a->job_limited && w.freezes == 1 && w.quarantines == 0,
           "limits that failed did not fall back to the freeze: frozen %d, %d freezes, %d quarantined", a->frozen,
           w.freezes, w.quarantines);

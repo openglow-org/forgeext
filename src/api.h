@@ -29,6 +29,8 @@
  *   POST /v0/motion/cancel     ends a jog this package started (motion.jog)
  *   POST /v0/motion/job        {"program": "<a file of its own data>"}: run it (motion.job, granted)
  *   POST /v0/motion/job/abort  end the running job (motion.job, granted)
+ *   GET  /v0/sender            its claim on the Grbl sender, as forgectrl has it (sender.keep_out, granted)
+ *   POST /v0/sender            {"out": bool}: keep the sender out, or let it back in (sender.keep_out, granted)
  *
  * A program is named, not sent: the request reader takes 4 KiB of body
  * and a program is not that, so a package writes it into its own data

@@ -74,7 +74,7 @@ CAPS = {
     "job_time.run": (False, True, True), "ui": (False, False, True), "ui.background": (False, True, True),
     "sender.keep_out": (False, True, True),
     "wizard": (False, False, True),
-    "net.outbound": (True, False, True), "net.outbound.operator": (False, False, True), "net.listen": (True, False, True),
+    "net.outbound": (True, False, True), "net.outbound.operator": (False, False, True), "net.listen": (True, True, True),
     "storage": (True, False, True),
     "mcode": (True, False, True),
 }
@@ -87,6 +87,7 @@ MAX_CAPS, MAX_ARGS, MAX_LIST, MAX_SETTINGS = 32, 16, 16, 16
 SETTING_NAME_MAX, SETTING_LABEL_MAX, SETTING_TEXT_MAX, SETTING_CHOICE_MAX, SETTING_CHOICES_MAX = 33, 49, 129, 33, 6
 UI_FILE, UI_MAX = "ui/index.html", 512 * 1024
 PAYLOAD_MAX, FILE_MAX, FILES_MAX, DEPTH_MAX, PATH_MAX = 64 << 20, 32 << 20, 4096, 16, 192
+DIRS_MAX = 4096
 
 
 class Refused(Exception):
@@ -149,6 +150,10 @@ def version_split(v):
         return nums, None
     if v[p] != "-" or p + 1 == len(v) or not re.fullmatch(r"[A-Za-z0-9.-]+", v[p + 1:]):
         return None
+    # dot-separated identifiers, none empty, a numeric one with no leading zero (as src/manifest.c has it)
+    for ident in v[p + 1:].split("."):
+        if not ident or (ident.isdigit() and len(ident) > 1 and ident[0] == "0"):
+            return None
     return nums, v[p + 1:]
 
 
@@ -166,7 +171,19 @@ def version_cmp(a, b):
         return 1
     if pb is None:
         return -1
-    return (pa > pb) - (pa < pb)
+    # Semantic Versioning's order of pre-release tags, as the host has it (src/manifest.c).
+    ia, ib = pa.split("."), pb.split(".")
+    for x, y in zip(ia, ib):
+        dx, dy = x.isdigit() or x == "", y.isdigit() or y == ""
+        if dx and dy:
+            c = (len(x) > len(y)) - (len(x) < len(y)) or (x > y) - (x < y)
+        elif dx or dy:
+            c = -1 if dx else 1
+        else:
+            c = (x > y) - (x < y)
+        if c:
+            return c
+    return (len(ia) > len(ib)) - (len(ia) < len(ib))
 
 
 def _text(root, key, required, size):
@@ -229,6 +246,10 @@ def _outbound(arg):
             return None
         host, port = arg[:colon], arg[colon + 1:]
         if not _dns_name_ok(host):
+            return None
+        # digits and dots are an IPv4 address, in its one canonical form only
+        if re.fullmatch(r"[0-9.]+", host) and not (re.fullmatch(r"(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}", host)
+                                                    and all(int(x) <= 255 for x in host.split("."))):
             return None
     if not re.fullmatch(r"[1-9][0-9]{0,8}", port) or not 1 <= int(port) <= 65535:
         return None
@@ -474,6 +495,10 @@ def judge_manifest(raw):
             raise Refused('capability "%s" is answered while a job runs, which takes job_time.run: ask for it too' % c)
     if "ui.background" in have and "ui" not in have:
         raise Refused('capability "ui.background" keeps a page running, which takes ui: ask for it too')
+    for c in have:
+        if runtime == "shell" and (c.startswith("mcode:") or c == "wizard"):
+            raise Refused('capability "%s" is asked on the call socket, which a shell service cannot answer: '
+                          'runtime python or native' % c)
     if "conflicts" in root:
         lst = root["conflicts"]
         if not isinstance(lst, list) or len(lst) > MAX_LIST:
@@ -526,6 +551,8 @@ def payload_files(d):
         dirs[:] = [x for x in dirs if x != "__pycache__"]
     if sum(1 for x in out if not x[2]) > FILES_MAX:
         raise Refused("the payload holds more than %d files" % FILES_MAX)
+    if sum(1 for x in out if x[2]) > DIRS_MAX:
+        raise Refused("the payload holds more than %d directory entries" % DIRS_MAX)
     if total > PAYLOAD_MAX:
         raise Refused("the payload is larger than %d MiB unpacked" % (PAYLOAD_MAX >> 20))
     return out
@@ -704,7 +731,7 @@ def lint(d, quiet=False):
     if repo:
         warnings.append("%s holds %s: that is the package's repository, not the package as it ships. "
                         "make stage lays that out in build/pkg; lint and pack build/pkg" % (d, ", ".join(repo)))
-    if m["id"].startswith(("org.openglow.", "org.forgefirm.")):
+    if official_ns(m["id"]):
         warnings.append("%s is in the official namespace: only an archive signed with the OpenGlow extension key "
                         "installs under it" % m["id"])
     return m, warnings, files
@@ -811,6 +838,13 @@ INDEX_MAX_PKGS, INDEX_MAX_VERSIONS, INDEX_MAX_WITHDRAWN, INDEX_MAX_CAPS = 512, 1
 INDEX_MAX_BYTES = 1024 * 1024
 ARCHIVE_MAX = 32 << 20
 OFFICIAL_NS = ("org.openglow.", "org.forgefirm.")
+
+
+def official_ns(id_):
+    """OpenGlow's namespace, as the host has it (src/manifest.c): the two names, and everything under them."""
+    return id_.startswith(OFFICIAL_NS) or id_ in ("org.openglow", "org.forgefirm")
+
+
 RECORD_KEYS = ("id", "version", "name", "author", "description", "license", "homepage", "api", "capabilities",
                "core", "url", "sha256", "size")
 
@@ -893,10 +927,10 @@ def _index_text_ok(o, key, required, most):
 
 def _index_key_ok(o, id_):
     k = o.get("key")
-    if id_.startswith(OFFICIAL_NS) and "key" in o:
+    if official_ns(id_) and "key" in o:
         raise Refused("%s is in OpenGlow's namespace: only the OpenGlow extension key signs it, and the index "
                       "endorses no key for it" % id_)
-    if not id_.startswith(OFFICIAL_NS) and (not isinstance(k, str) or not 40 <= _bytes(k) <= 64 or "\n" in k):
+    if not official_ns(id_) and (not isinstance(k, str) or not 40 <= _bytes(k) <= 64 or "\n" in k):
         raise Refused("%s: the index names its author's public key, as fwup writes it" % id_)
 
 
@@ -1010,7 +1044,7 @@ def cmd_index_record(a):
     m = archive_manifest(a.file)
     if meta.get("meta-version") != m["version"]:
         raise Refused("the archive says version %s and its manifest says %s" % (meta.get("meta-version"), m["version"]))
-    official = m["id"].startswith(OFFICIAL_NS)
+    official = official_ns(m["id"])
     if official and a.key:
         raise Refused("%s is in OpenGlow's namespace: the index endorses no author key for it" % m["id"])
     pub = a.official_key if official else a.key
@@ -1057,7 +1091,7 @@ def catalog_doc(d):
         base = os.path.join(pdir, id_)
         if not os.path.isdir(base) or not id_ok(id_):
             raise Refused("packages/%s is not a package's directory, named for its id" % id_)
-        official = id_.startswith(OFFICIAL_NS)
+        official = official_ns(id_)
         names = sorted(os.listdir(base))
         key = None
         if "key.pub" in names:
@@ -1129,7 +1163,7 @@ def catalog_doc(d):
 def cmd_index_build(a):
     """The signed index of a catalog directory, the same bytes for the same catalog every time."""
     if not version_ok(a.version):
-        raise Refused("the index's version is MAJOR.MINOR.PATCH, as YYYY.MMDD.N")
+        raise Refused("the index's version is MAJOR.MINOR.PATCH, as YYYY.MDD.N (the month times 100 plus the day, unpadded)")
     doc = catalog_doc(a.catalog)
     text = (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode()
     if len(text) > INDEX_MAX_BYTES:
@@ -1440,8 +1474,8 @@ def main(argv=None):
     q.set_defaults(fn=cmd_index_record)
     q = isub.add_parser("build", help="the signed index of a catalog directory")
     q.add_argument("catalog", help="the catalog: packages/<id>/key.pub, <version>.json, withdrawn.json")
-    q.add_argument("--version", required=True, help="the index's own version, YYYY.MMDD.N: a machine never keeps "
-                   "one older than the index it has")
+    q.add_argument("--version", required=True, help="the index's own version, YYYY.MDD.N (the month times 100 plus "
+                   "the day, unpadded: 2026.928.1): a machine never keeps one older than the index it has")
     q.add_argument("--key", help="the OpenGlow extension key's private half: no machine keeps an index signed otherwise")
     q.add_argument("--out", required=True)
     q.set_defaults(fn=cmd_index_build)

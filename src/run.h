@@ -25,6 +25,7 @@
 #define RUN_JOB_CPU_PCT     3                   /* inside one, for a service the operator lets run through it */
 #define RUN_MEMORY_BYTES    (48LL * 1024 * 1024)
 #define RUN_PIDS            32
+#define RUN_SHUTDOWN_GRACE_S 1.0                /* ext.shutdown's time to be read, on the machine */
 
 typedef struct {
     ext_env_t ext;
@@ -39,11 +40,45 @@ typedef struct {
     const char *call_dir;                       /* one call socket per running service that has a page */
     int landlock_fs_only;                       /* a kernel older than landlock's TCP rules (tests on a host) */
     int ticks;                                  /* stop after this many seconds; 0 runs until a signal */
+    double shutdown_grace_s;                    /* ext.shutdown's time to be read when extensions go off or safe
+                                                 * mode begins, the turns running through it: RUN_SHUTDOWN_GRACE_S;
+                                                 * a host test holds it open longer. The host's own stop always
+                                                 * waits RUN_SHUTDOWN_GRACE_S */
 } run_cfg_t;
 
 void run_cfg_defaults(run_cfg_t *cfg);
 
 /* Runs until SIGTERM or SIGINT, then stops every service. The exit status. */
 int run_daemon(const run_cfg_t *cfg);
+
+/* <run_dir>/status.json written whole with text, at any size, by a rename
+ * from a file beside it: a reader sees the last whole word or this one. 0,
+ * or -1 with the file as it was. */
+int run_status_file(const char *run_dir, const char *text);
+
+/* A predecessor whose removal the root's lock put off: the one the record
+ * named, and the stamp of the install that ran healthy. */
+typedef struct {
+    char id[64], previous[33], stamp[17];
+} run_drop_t;
+
+/* The removals put off, after a try at id's predecessor previous for the
+ * install stamped stamp: a try the root's lock put off (busy) keeps one
+ * entry for the package, the latest in place of an earlier one; a try
+ * that ends any other way takes the package's entry out. *n entries in
+ * due, at most max. */
+void run_drop_due(run_drop_t due[], int *n, int max, const char *id, const char *previous, const char *stamp, int busy);
+
+/* What a service runs with, as the supervisor compares it (svc_t's
+ * conf_wanted and conf_started): its install and the operator's
+ * destinations. */
+unsigned long long run_conf_digest(const state_pkg_t *p);
+
+/* The record whose predecessor goes when id's service has run healthy:
+ * id's in st, when it names a predecessor and is still what the service
+ * was started from (started, its conf_started). NULL otherwise: a record
+ * written since that start is of an install that has not run, and the
+ * predecessor it names is the version still running. */
+const state_pkg_t *run_healthy_record(state_t *st, const char *id, unsigned long long started);
 
 #endif

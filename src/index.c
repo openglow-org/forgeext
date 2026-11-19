@@ -257,9 +257,9 @@ int index_install(const ext_env_t *env, const char *file, int *npkgs, char *vers
     trust.endorsed_dir = NULL;
     if (ext_root_prepare(env, err, elen) != 0)          /* the catalog can be the first thing a root holds */
         return -1;
-    snprintf(work, sizeof(work), "%.255s/tmp/index.XXXXXX", env->root);
-    if (!mkdtemp(work))
-        return fail(err, elen, "cannot make a work directory: %s", strerror(errno));
+    int hold = ext_staging_make(env, "index", work, sizeof(work), err, elen);
+    if (hold < 0)
+        return -1;
     snprintf(payload, sizeof(payload), "%s/payload.tar.gz", work);
     snprintf(tree, sizeof(tree), "%s/tree", work);
     snprintf(list, sizeof(list), "%s/files", work);
@@ -380,6 +380,7 @@ out:
     json_decref(kept);
     json_decref(doc);
     pkg_rmtree(work);
+    close(hold);
     return rc;
 }
 

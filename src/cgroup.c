@@ -106,6 +106,11 @@ int cg_ready(const char *parent, char *err, size_t elen)
         if (!found)
             return fail(err, elen, "%s does not hand the %s controller down", parent, want[i]);
     }
+    /* On one core a group's share is its weight beside the machine's own
+     * daemons, and a service's SCHED_IDLE counts only inside the group: the
+     * parent is an idle group, or the packages compete with forgectrl. */
+    if (get(parent, NULL, "cpu.idle", text, sizeof(text)) != 0 || atoi(text) != 1)
+        return fail(err, elen, "%s is not an idle group (cpu.idle is not 1)", parent);
     return 0;
 }
 

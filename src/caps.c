@@ -6,6 +6,7 @@
  */
 #include "caps.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +33,7 @@ static const cap_def_t defs[] = {
     { "wizard",         0, 0, 1, "add a check of its own to the Setup page" },
     { "net.outbound",   1, 0, 1, "connect to" },
     { "net.outbound.operator", 0, 0, 1, "connect to the destinations the operator names for it" },
-    { "net.listen",     1, 0, 1, "listen on port" },
+    { "net.listen",     1, 1, 1, "listen on port" },
     { "storage",        1, 0, 1, "keep data on the machine, in MiB up to" },
     { "mcode",          1, 0, 1, "answer the M-code, holding the job until it does" },
 };
@@ -143,6 +144,15 @@ int caps_outbound_parse(const char *arg, char *host, size_t hlen, int *port)
         host[n] = '\0';
         if (!dns_name_ok(host))
             return -1;
+        /* Digits and dots are an IPv4 address, and only in its one
+         * canonical form: the C library would read an octal or a short
+         * form as some other address than the one the operator saw. */
+        if (strspn(host, "0123456789.") == n) {
+            struct in_addr a;
+            char canon[INET_ADDRSTRLEN];
+            if (inet_pton(AF_INET, host, &a) != 1 || !inet_ntop(AF_INET, &a, canon, sizeof(canon)) || strcmp(canon, host) != 0)
+                return -1;
+        }
         p = colon + 1;
     }
     long v;

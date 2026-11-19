@@ -8,15 +8,26 @@
  * every way of declaring one wrong, and a default a package's own schema
  * would refuse. The store, against a real directory: defaults before
  * anybody sets anything, a patch applied whole or not at all, a value
- * the schema no longer takes passed over, and the file's mode.
+ * the schema no longer takes passed over, and the file's mode; a change
+ * waiting on the package's lock keeps the other writer's value; and
+ * writes the disk refuses, before their temporary file and after it,
+ * leave no descriptor open and no lock held.
  */
 #include "../src/manifest.h"
 #include "../src/settings.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int fails;
@@ -24,6 +35,19 @@ static int fails;
                               fflush(stdout); } } while (0)
 
 static char root[128];
+
+/* The descriptors this process holds now. */
+static int open_fds(void)
+{
+    int n = 0;
+    DIR *d = opendir("/proc/self/fd");
+    struct dirent *e;
+    while (d && (e = readdir(d)) != NULL)
+        n += e->d_name[0] != '.';
+    if (d)
+        closedir(d);
+    return n;
+}
 
 /* A manifest with the settings block given, parsed. 0 on success. */
 static int parse_with(const char *settings_json, manifest_t *m, char *err, size_t elen)
@@ -47,6 +71,53 @@ static const char *GOOD =
  * bool, and without it jansson takes only an array or an object - which
  * would hand every case below a NULL and refuse it for the wrong
  * reason, the good ones and the bad ones alike. */
+static json_t *obj(const char *text);
+
+enum { REFUSE_FULL, REFUSE_NO_ENTRY };
+
+/* Fifty writes the disk refuses, in a child with a deadline: each leaves
+ * no descriptor open, and none keeps the package's lock from the next one
+ * (a lock left held makes the next write wait for it, and the alarm ends
+ * the child). 0 when all fifty were refused and the descriptor table is
+ * as it was, 1 when not, 128 plus the signal that ended the child. */
+static int refused_writes(const manifest_t *m, int how)
+{
+    char dir[200];
+    snprintf(dir, sizeof(dir), "%s/%s", root, SETTINGS_DIR);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(30);
+        struct rlimit was, rl;
+        getrlimit(RLIMIT_FSIZE, &was);
+        rl = was;
+        if (how == REFUSE_FULL) {
+            rl.rlim_cur = 0;
+            signal(SIGXFSZ, SIG_IGN);
+            if (setrlimit(RLIMIT_FSIZE, &rl) != 0)
+                _exit(3);
+        } else if (chmod(dir, 0500) != 0) {
+            _exit(3);
+        }
+        char err[400];
+        int before = open_fds(), refused = 0;
+        for (int i = 0; i < 50; i++) {
+            json_t *patch = obj("{\"threshold\": 20}");
+            refused += settings_write(root, "org.example.s", m, patch, err, sizeof(err)) != 0;
+            json_decref(patch);
+        }
+        setrlimit(RLIMIT_FSIZE, &was);                  /* for the words below, which go to a file */
+        printf("  %d of 50 refused (%s): %d descriptors, %d before\n", refused, err, open_fds(), before);
+        fflush(stdout);
+        _exit(refused == 50 && open_fds() == before ? 0 : 1);
+    }
+    int st = -1;
+    if (pid > 0)
+        waitpid(pid, &st, 0);
+    chmod(dir, 0700);
+    return pid < 0 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
+}
+
 static json_t *obj(const char *text)
 {
     return json_loads(text, JSON_DECODE_ANY, NULL);
@@ -57,8 +128,12 @@ int main(void)
     manifest_t m;
     char err[400];
 
-    snprintf(root, sizeof(root), "/tmp/ffx-settings-test.%d", (int)getpid());
-    mkdir(root, 0700);
+    /* A root of this run's own: a killed run's is never taken up again. */
+    snprintf(root, sizeof(root), "/tmp/ffx-settings-test.XXXXXX");
+    if (!mkdtemp(root)) {
+        printf("FAIL: no directory for the test: %s\n", strerror(errno));
+        return 1;
+    }
 
     /* ---- the schema ---- */
     CHECK(parse_with(NULL, &m, err, sizeof(err)) == 0 && m.nsettings == 0,
@@ -183,6 +258,78 @@ int main(void)
           && !strcmp(json_string_value(json_object_get(now, "when")), "never"),
           "a second patch kept what the first one set: %s", json_dumps(now, JSON_COMPACT));
     json_decref(now);
+
+    /* Two writers, the broker and the command line: each read, change and
+     * write is made under the package's own lock, through a temporary
+     * file of its own. A writer that holds the lock holds the other off
+     * until it lets go; and a name another writer's temporary file once
+     * had is no obstacle. */
+    {
+        char lockp[640], stale[640], store[600];
+        snprintf(store, sizeof(store), "%s/%s/org.example.s.json", root, SETTINGS_DIR);
+        snprintf(lockp, sizeof(lockp), "%.600s.lock", store);
+        snprintf(stale, sizeof(stale), "%.600s.new", store);
+        CHECK(mkdir(stale, 0700) == 0, "a directory where a fixed temporary name would go");
+        int lk = open(lockp, O_RDWR | O_CREAT, 0600);
+        CHECK(lk >= 0 && flock(lk, LOCK_EX) == 0, "the test holds the package's lock");
+        int pfd[2];
+        CHECK(pipe(pfd) == 0, "a pipe");
+        pid_t child = fork();
+        if (child == 0) {
+            json_t *p3 = obj("{\"threshold\": 30}");
+            char e3[200];
+            int rc = settings_write(root, "org.example.s", &m, p3, e3, sizeof(e3));
+            if (write(pfd[1], rc == 0 ? "y" : "n", 1) != 1)
+                _exit(2);
+            _exit(rc == 0 ? 0 : 1);
+        }
+        struct pollfd pw = { .fd = pfd[0], .events = POLLIN };
+        CHECK(poll(&pw, 1, 1000) == 0, "a write went ahead while another held the package's lock");
+        /* The holder changes the file before it lets go: the waiting
+         * write reads it under the lock, after this, and keeps it. */
+        FILE *sf = fopen(store, "w");
+        CHECK(sf && fputs("{\"loud\": true, \"threshold\": 70, \"webhook\": \"\", \"when\": \"start\"}\n", sf) >= 0,
+              "the holder's own write");
+        if (sf)
+            fclose(sf);
+        flock(lk, LOCK_UN);
+        char said = 0;
+        CHECK(poll(&pw, 1, 5000) == 1 && read(pfd[0], &said, 1) == 1 && said == 'y',
+              "let go, the waiting write did not finish, or failed (%c)", said ? said : '-');
+        waitpid(child, NULL, 0);
+        close(lk);
+        close(pfd[0]);
+        close(pfd[1]);
+        now = settings_read(root, "org.example.s", &m);
+        CHECK(json_number_value(json_object_get(now, "threshold")) == 30
+              && !strcmp(json_string_value(json_object_get(now, "when")), "start"),
+              "the write after the wait kept what the holder wrote before it let go: %s", json_dumps(now, JSON_COMPACT));
+        json_decref(now);
+        rmdir(stale);
+        patch = obj("{\"threshold\": 70, \"when\": \"never\"}");    /* back as the cases below expect them */
+        CHECK(settings_write(root, "org.example.s", &m, patch, err, sizeof(err)) == 0, "the threshold back: %s", err);
+        json_decref(patch);
+    }
+
+    /* A write the disk refuses leaves no descriptor open and its lock let
+     * go: the broker's thread may be refused this way at a package's rate,
+     * for as long as the disk stays full. Refused once the temporary file
+     * is written (a full /data, here RLIMIT_FSIZE 0), and before it can be
+     * made (no room for a new entry, here a settings directory the account
+     * may not write in; root writes there all the same). */
+    {
+        int rc = refused_writes(&m, REFUSE_FULL);
+        CHECK(rc == 0, "50 writes refused at a full disk: %s", rc == 1 ? "a descriptor left open"
+              : rc == 128 + SIGALRM ? "a lock left held: the next write waited for it" : "the child could not run");
+        if (geteuid() != 0) {
+            rc = refused_writes(&m, REFUSE_NO_ENTRY);
+            CHECK(rc == 0, "50 writes refused before their temporary file: %s", rc == 1 ? "a descriptor left open"
+                  : rc == 128 + SIGALRM ? "a lock left held: the next write waited for it" : "the child could not run");
+        } else {
+            printf("note: as root the settings directory takes a new entry whatever its mode; the refusal before the "
+                   "temporary file is the unprivileged run's\n");
+        }
+    }
 
     {   /* The file is the host's alone. */
         char p[256];

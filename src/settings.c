@@ -11,9 +11,12 @@
 #include "settings.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -139,27 +142,58 @@ int settings_write(const char *root, const char *id, const manifest_t *m, json_t
         if (setting_value_ok(t, v, why, sizeof(why)) != 0)
             return say(err, elen, "%s", why);
     }
+    snprintf(dir, sizeof(dir), "%.255s/%s", root, SETTINGS_DIR);
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+        return say(err, elen, "cannot make %s: %s", dir, strerror(errno));
+    store_path(root, id, p, sizeof(p));
+    /* Two writers reach one package's settings, the broker for its service
+     * and the command line for its page and the operator: each read,
+     * change and write is made whole under a lock of that package's own
+     * (never the root's, which an install holds for minutes), through a
+     * temporary file of its own. */
+    char lockp[420];
+    snprintf(lockp, sizeof(lockp), "%.400s.lock", p);
+    int lk = open(lockp, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lk < 0 || flock(lk, LOCK_EX) != 0) {
+        int saved = errno;
+        if (lk >= 0)
+            close(lk);
+        return say(err, elen, "cannot lock %s: %s", lockp, strerror(saved));
+    }
     json_t *next = settings_read(root, id, m);
     json_object_foreach(patch, key, v)
         json_object_set(next, key, v);
-
-    snprintf(dir, sizeof(dir), "%.255s/%s", root, SETTINGS_DIR);
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
-        json_decref(next);
-        return say(err, elen, "cannot make %s: %s", dir, strerror(errno));
-    }
-    store_path(root, id, p, sizeof(p));
-    snprintf(tmp, sizeof(tmp), "%.400s.new", p);
+    snprintf(tmp, sizeof(tmp), "%.400s.XXXXXX", p);
     /* Written whole and renamed: a reader never sees half a file, and a
      * host that dies mid-write leaves the old values standing. */
-    int rc = json_dump_file(next, tmp, JSON_INDENT(1) | JSON_SORT_KEYS);
+    int fd = mkostemp(tmp, O_CLOEXEC);
+    int rc = fd < 0 ? -1 : json_dumpfd(next, fd, JSON_INDENT(1) | JSON_SORT_KEYS);
+    int saved = errno;
     json_decref(next);
-    if (rc != 0)
-        return say(err, elen, "cannot write %s: %s", tmp, strerror(errno));
-    if (chmod(tmp, 0600) != 0 || rename(tmp, p) != 0) {
-        unlink(tmp);
-        return say(err, elen, "cannot put %s in place: %s", p, strerror(errno));
+    if (fd >= 0) {
+        /* Closed whatever the write and the mode answered: the broker's
+         * thread asks this up to its rate a second, and a descriptor left
+         * open at each refusal would empty the host's table. */
+        int bad = rc != 0 || fchmod(fd, 0600) != 0;
+        saved = bad ? errno : saved;
+        if (close(fd) != 0 && !bad) {
+            bad = 1;
+            saved = errno;
+        }
+        if (bad) {
+            unlink(tmp);
+            close(lk);
+            return say(err, elen, "cannot write %s: %s", tmp, strerror(saved));
+        }
     }
+    if (fd < 0 || rename(tmp, p) != 0) {
+        saved = fd < 0 ? saved : errno;
+        if (fd >= 0)
+            unlink(tmp);
+        close(lk);
+        return say(err, elen, "cannot put %s in place: %s", p, strerror(saved));
+    }
+    close(lk);
     return 0;
 }
 
@@ -192,7 +226,9 @@ json_t *settings_schema_json(const manifest_t *m)
 
 void settings_forget(const char *root, const char *id)
 {
-    char p[400];
+    char p[400], lockp[420];
     store_path(root, id, p, sizeof(p));
     unlink(p);
+    snprintf(lockp, sizeof(lockp), "%.400s.lock", p);
+    unlink(lockp);
 }

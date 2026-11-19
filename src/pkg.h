@@ -31,6 +31,8 @@
 #define PKG_MAX_UNPACKED     (64LL * 1024 * 1024)   /* every file of the payload together */
 #define PKG_MAX_FILE         (32LL * 1024 * 1024)
 #define PKG_MAX_FILES        4096
+#define PKG_MAX_DIRS         4096                   /* directory entries, each one, a repeat included */
+#define PKG_MAX_HEADERS      (8LL * 1024 * 1024)    /* what the tar stream may hold past its files' data */
 #define PKG_MAX_DEPTH        16
 #define PKG_MAX_PATH         192
 #define PKG_MAX_META         (64 * 1024)

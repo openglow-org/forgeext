@@ -14,9 +14,9 @@ jobs:
   native:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0, pinned by commit
       - name: Checkout forgefirm (the image's deny rules, which the network allowlist is tested against)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0, pinned by commit
         with:
           repository: openglow-org/forgefirm
           ref: ${{ (github.ref_name == 'next' || github.base_ref == 'next') && 'next' || '' }}
@@ -28,6 +28,8 @@ jobs:
       - name: fwup 1.16.0 (the version the image carries)
         run: |
           curl -fsSL -o /tmp/fwup.deb https://github.com/fwup-home/fwup/releases/download/v1.16.0/fwup_1.16.0_amd64.deb
+          # The package as it was when this checksum was taken, or nothing: a release asset can be replaced.
+          echo "6751e26cc2089cdf3dbefabd9cd2e6d703977bf0c3360c584e05caeab019879b  /tmp/fwup.deb" | sha256sum -c -
           sudo dpkg -i /tmp/fwup.deb
           fwup --version
       - name: Configure
@@ -52,14 +54,19 @@ jobs:
         run: ./build/api_test
       - name: "evfeed_test (the ring the machine's events are held in, the reader that falls behind, and the feeder's, fwup's and nft's timeouts with the wall clock stepped)"
         run: ./build/evfeed_test
+      - name: "lookups_test (the answers table the allowlist's names are looked up in, over a stand-in resolver and a fake clock: an answer's 30 s, a full table, a lookup let go at 60 s and its late answer discarded, no second lookup of a name under way, the cap on lookups inside the resolver; and a route table read for the prefixes it holds as on-link)"
+        run: ./build/lookups_test
       - name: settings_test (a package's own settings against the schema its manifest declares)
         run: ./build/settings_test
       - name: quota_test (what a package's data directory holds, against what it asked for)
         run: ./build/quota_test
+      - name: quota_test as root (a file unlinked and kept mapped, and the bound on the mappings, which only root reads)
+        run: sudo ./build/quota_test
       - name: sandbox_test (a real child under the launcher, seen from inside and from outside)
         run: |
-          # 77 is the test's "could not run here": on this runner that is a failure.
-          sudo ./build/sandbox_test
+          # 77 is the test's "could not run here": on this runner that is a failure, and so is a kernel whose
+          # landlock has no TCP rules (ABI 4): the test would pass while proving less.
+          sudo FFX_MIN_LANDLOCK_ABI=4 ./build/sandbox_test
       - name: netrules_test (net-check, net-allow, net-revoke against the image's rule file, with a peer namespace)
         run: |
           sudo FORGEEXT=build/forgeext FFX_RULES=forgefirm-rules/meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files/ffx.nft \
@@ -87,9 +94,9 @@ jobs:
   holds-wire:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0, pinned by commit
       - name: Checkout forgectrl (the reader of the hold files, and its holds_wire_test)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0, pinned by commit
         with:
           repository: openglow-org/forgectrl
           ref: ${{ (github.ref_name == 'next' || github.base_ref == 'next') && 'next' || '' }}

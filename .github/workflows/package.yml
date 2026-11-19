@@ -181,7 +181,7 @@ jobs:
           VERSION: ${{ steps.pkg.outputs.version }}
         run: |
           url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/$ID-$VERSION.ffx"
-          case "$ID" in org.openglow.*|org.forgefirm.*) who=--official-key ;; *) who=--key ;; esac
+          case "$ID" in org.openglow|org.forgefirm|org.openglow.*|org.forgefirm.*) who=--official-key ;; *) who=--key ;; esac
           python3 -B "$FFX" index record "$RUNNER_TEMP/out/$ID-$VERSION.ffx" --url "$url" "$who" "$PUB" \
             --out "$RUNNER_TEMP/out/$VERSION.json"
       - name: Published as release v<version>

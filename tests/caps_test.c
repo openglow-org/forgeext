@@ -63,10 +63,10 @@ int main(void)
     int needs = 0;
     for (size_t i = 0; i < caps_count(); i++)
         needs += caps_at(i)->explicit_grant;
-    CHECK(needs == 6, "%d capabilities need the operator's grant, expected 6", needs);
+    CHECK(needs == 7, "%d capabilities need the operator's grant, expected 7", needs);
     CHECK(caps_needs_grant("hold") && caps_needs_grant("job_time.run") && caps_needs_grant("motion.job")
-          && caps_needs_grant("motion.offsets") && caps_needs_grant("ui.background") && caps_needs_grant("sender.keep_out"),
-          "one of the six does not need a grant");
+          && caps_needs_grant("motion.offsets") && caps_needs_grant("ui.background") && caps_needs_grant("sender.keep_out")
+          && caps_needs_grant("net.listen:8123"), "one of the seven does not need a grant");
     CHECK(refused_with("sender.keep_out:1", "takes no argument"), "sender.keep_out:1 -> %s", why);
     CHECK(!caps_needs_grant("ui"), "a page of its own needs a grant");
     CHECK(refused_with("ui.background:1", "takes no argument"), "ui.background:1 -> %s", why);
@@ -90,6 +90,9 @@ int main(void)
     CHECK(refused_with("net.outbound:exa mple.org:443", "no space"), "a space -> %s", why);
     CHECK(refused_with("net.outbound:-bad.example:443", "host:port"), "a label starting with - -> %s", why);
     CHECK(refused_with("net.outbound:*:443", "host:port"), "a wildcard -> %s", why);
+    CHECK(refused_with("net.outbound:010.1.2.3:80", "host:port") && refused_with("net.outbound:10.1.2:80", "host:port")
+          && refused_with("net.outbound:167772161:80", "host:port") && refused_with("net.outbound:10.1.2.256:80", "host:port"),
+          "an IPv4 address in a form that is not the canonical dotted quad -> %s", why);
     CHECK(refused_with("net.outbound:localhost:23", "the machine itself"), "localhost -> %s", why);
     CHECK(refused_with("net.outbound:127.0.0.1:443", "the machine itself"), "127.0.0.1 -> %s", why);
     CHECK(refused_with("net.outbound:[::1]:80", "the machine itself"), "::1 -> %s", why);

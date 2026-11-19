@@ -95,9 +95,11 @@ int manifest_id_ok(const char *id)
     return label > 0 && id[len - 1] != '-' && labels >= 2;
 }
 
+/* OpenGlow's namespace: the two names themselves, and everything under them. */
 int manifest_id_reserved(const char *id)
 {
-    return id && (strncmp(id, "org.openglow.", 13) == 0 || strncmp(id, "org.forgefirm.", 14) == 0);
+    return id && (strncmp(id, "org.openglow.", 13) == 0 || strncmp(id, "org.forgefirm.", 14) == 0
+                  || strcmp(id, "org.openglow") == 0 || strcmp(id, "org.forgefirm") == 0);
 }
 
 /* One dotted number of a version: digits, no leading zero. Advances *p. */
@@ -131,9 +133,20 @@ static int version_split(const char *v, long n[3], const char **pre)
         return 0;
     if (*p != '-' || !p[1])
         return -1;
-    for (const char *q = p + 1; *q; q++)
-        if (!(isalnum((unsigned char)*q) || *q == '.' || *q == '-'))
+    /* Dot-separated identifiers, none empty, each of letters, digits and
+     * hyphens; one of digits alone has no leading zero (Semantic
+     * Versioning's pre-release). */
+    for (const char *q = p + 1;;) {
+        size_t len = strcspn(q, "."), digits = strspn(q, "0123456789");
+        if (len == 0 || (digits >= len && len > 1 && q[0] == '0'))
             return -1;
+        for (size_t i = 0; i < len; i++)
+            if (!(isalnum((unsigned char)q[i]) || q[i] == '-'))
+                return -1;
+        if (!q[len])
+            break;
+        q += len + 1;
+    }
     *pre = p + 1;
     return 0;
 }
@@ -167,7 +180,28 @@ int manifest_version_cmp(const char *a, const char *b)
         return 1;
     if (!pb)
         return -1;
-    return strcmp(pa, pb);
+    /* Semantic Versioning's order of pre-release tags: dot-separated
+     * identifiers in turn, a numeric one as a number and below any that is
+     * not, and the shorter list first when every one before agrees. */
+    while (*pa && *pb) {
+        size_t la = strcspn(pa, "."), lb = strcspn(pb, ".");
+        int da = strspn(pa, "0123456789") >= la, db = strspn(pb, "0123456789") >= lb;
+        int c;
+        if (da && db)
+            c = la != lb ? (la < lb ? -1 : 1) : strncmp(pa, pb, la);  /* digits only: the longer is the larger */
+        else if (da || db)
+            c = da ? -1 : 1;
+        else {
+            c = strncmp(pa, pb, la < lb ? la : lb);
+            if (c == 0 && la != lb)
+                c = la < lb ? -1 : 1;
+        }
+        if (c != 0)
+            return c < 0 ? -1 : 1;
+        pa += la + (pa[la] == '.');
+        pb += lb + (pb[lb] == '.');
+    }
+    return *pa ? 1 : *pb ? -1 : 0;
 }
 
 /* A display string: present, a JSON string, no control character, and
@@ -392,6 +426,12 @@ static int take_caps(json_t *root, manifest_t *m, char *err, size_t elen)
                                    "ask for it too", m->caps[i]);
     if (manifest_has_cap(m, "ui.background") && !manifest_has_cap(m, "ui"))
         return fail(err, elen, "capability \"ui.background\" keeps a page running, which takes ui: ask for it too");
+    /* An M-code and a Setup check are asked on the call socket, which a
+     * shell service has no way to answer. */
+    for (int i = 0; m->runtime == RUNTIME_SHELL && i < m->ncaps; i++)
+        if (strncmp(m->caps[i], "mcode:", 6) == 0 || strcmp(m->caps[i], "wizard") == 0)
+            return fail(err, elen, "capability \"%s\" is asked on the call socket, which a shell service cannot answer: "
+                                   "runtime python or native", m->caps[i]);
     return 0;
 }
 

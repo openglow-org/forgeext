@@ -56,10 +56,10 @@ static int usage(void)
             "  index                              the index this host keeps, judged against this firmware\n"
             "  run [--conf <file>] [--safe-file <file>] [--forgectrl <ip>:<port>] [--cg-parent <dir>]\n"
             "      [--run-dir <dir>] [--holds-dir <dir>] [--api-dir <dir>] [--call-dir <dir>] [--landlock-fs-only]\n"
-            "      [--ticks <n>]\n"
+            "      [--ticks <n>] [--shutdown-grace <s>]\n"
             "                                     the daemon: run what is installed and enabled, in the sandbox\n"
             "  net-check                          is the image's deny table loaded, and the image's\n"
-            "  net-allow <uid> [--listen <port>] [--dns] [<host>:<port>]...\n"
+            "  net-allow <uid> [--listen <port>] [--dns] [<host>:<port>]... [--typed <host>:<port>...]\n"
             "                                     give a pool account its way through (what a service start does)\n"
             "  net-revoke <uid>                   and take it away\n"
             "options:\n"
@@ -253,6 +253,14 @@ static int cmd_list(const ext_env_t *env, const char *only, int check)
                 if (!caps_needs_grant(m.caps[c]) || state_granted(p, m.caps[c]))
                     json_array_append_new(eff, json_string(m.caps[c]));
             json_object_set_new(j, "effective", eff);
+            /* Where its service may connect, capped as its start caps it:
+             * the list GET /v0/self serves, which the page's bridge passes on. */
+            const char *where[EXT_DESTS_MAX];
+            int nwhere = ext_reach(&m, p, where, NULL);
+            json_t *reach = json_array();
+            for (int d = 0; d < nwhere; d++)
+                json_array_append_new(reach, json_string(where[d]));
+            json_object_set_new(j, "reach", reach);
         } else {
             json_object_set_new(j, "manifest_error", json_string(err));
         }
@@ -383,6 +391,13 @@ int main(int argc, char **argv)
                 rc.call_dir = val;
             } else if (strcmp(opt, "--ticks") == 0) {
                 rc.ticks = atoi(val);
+            } else if (strcmp(opt, "--shutdown-grace") == 0) {
+                /* A host test's, to look inside the grace: never shorter
+                 * than the machine's own, and bounded. */
+                char *end;
+                rc.shutdown_grace_s = strtod(val, &end);
+                if (*end || !(rc.shutdown_grace_s >= RUN_SHUTDOWN_GRACE_S && rc.shutdown_grace_s <= 30))
+                    return usage();
             } else if (strcmp(opt, "--forgectrl") == 0) {
                 const char *colon = strrchr(val, ':');
                 if (!colon || (size_t)(colon - val) >= sizeof(host))
@@ -403,7 +418,7 @@ int main(int argc, char **argv)
         return answer(json_object(), 1);
     }
     if ((strcmp(cmd, "net-allow") == 0 || strcmp(cmd, "net-revoke") == 0) && i < argc) {
-        int allow = strcmp(cmd, "net-allow") == 0, listen_port = 0, dns = 0, n = 0;
+        int allow = strcmp(cmd, "net-allow") == 0, listen_port = 0, dns = 0, n = 0, typed = 0;
         uid_t uid = (uid_t)atoi(argv[i++]);
         static net_dest_t dests[NET_MAX_DESTS];
         for (; allow && i < argc; i++) {
@@ -411,15 +426,18 @@ int main(int argc, char **argv)
                 dns = 1;
             } else if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
                 listen_port = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--typed") == 0) {
+                typed = 1;                              /* the destinations after it are the operator's */
             } else if (n < NET_MAX_DESTS && caps_outbound_parse(argv[i], dests[n].host, sizeof(dests[n].host), &dests[n].port) == 0) {
-                n++;
+                dests[n++].typed = typed;
             } else {
                 return refuse("a destination is host:port, the host a lowercase DNS name, an IPv4 address, or an "
                               "IPv6 address in brackets");
             }
         }
         if (net_base_ok(&net, err, sizeof(err)) != 0
-            || (allow ? net_allow(&net, uid, dests, n, listen_port, dns, err, sizeof(err))
+            || (allow ? net_lookups_wait(dests, n, err, sizeof(err)) != 0
+                            || net_allow(&net, uid, dests, n, listen_port, dns, err, sizeof(err))
                       : net_revoke(&net, uid, err, sizeof(err))) != 0)
             return refuse(err);
         return answer(json_object(), 1);

@@ -50,7 +50,20 @@ install(TARGETS forgeext RUNTIME DESTINATION bin)
 # Host tests: one binary each, exit 0 on a pass. tests/install_test.py
 # drives the built forgeext against real archives made with fwup.
 # sandbox_test needs root and cgroup v2 (it exits 77 without).
-foreach(t caps_test manifest_test version_test state_test super_test holdkeep_test httpreq_test api_test evfeed_test settings_test quota_test sandbox_test)
+foreach(t caps_test manifest_test version_test state_test super_test holdkeep_test httpreq_test api_test evfeed_test lookups_test settings_test quota_test sandbox_test)
   add_executable(${t} tests/${t}.c)
   target_link_libraries(${t} forgeext_core)
+  # CI runs each test by name: one built here and never named in the
+  # workflow would build and never run, so the configure refuses it.
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/.github/workflows/build.yml ci_text)
+  string(FIND "${ci_text}" "./build/${t}\n" at)
+  if(at EQUAL -1)
+    message(FATAL_ERROR "${t} has no step in .github/workflows/build.yml whose run: line ends with ./build/${t}")
+  endif()
 endforeach()
+
+# install_test's hook for the removal's races: preloaded into the command
+# line it drives, never into anything the image carries.
+add_library(race_hook MODULE tests/race_hook.c)
+set_target_properties(race_hook PROPERTIES PREFIX "")
+target_link_libraries(race_hook ${CMAKE_DL_LIBS})

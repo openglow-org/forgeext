@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -240,7 +241,97 @@ static const int denied[] = {
 #ifdef __NR_pidfd_getfd
     __NR_pidfd_getfd,
 #endif
+    /* SysV IPC: an object outlives the service that made it, outside its
+     * cgroup's memory limit and readable by whoever holds the account next. */
+#ifdef __NR_ipc
+    __NR_ipc,
+#endif
+#ifdef __NR_shmget
+    __NR_shmget,
+#endif
+#ifdef __NR_shmat
+    __NR_shmat,
+#endif
+#ifdef __NR_shmdt
+    __NR_shmdt,
+#endif
+#ifdef __NR_shmctl
+    __NR_shmctl,
+#endif
+#ifdef __NR_msgget
+    __NR_msgget,
+#endif
+#ifdef __NR_msgsnd
+    __NR_msgsnd,
+#endif
+#ifdef __NR_msgrcv
+    __NR_msgrcv,
+#endif
+#ifdef __NR_msgctl
+    __NR_msgctl,
+#endif
+#ifdef __NR_semget
+    __NR_semget,
+#endif
+#ifdef __NR_semop
+    __NR_semop,
+#endif
+#ifdef __NR_semtimedop
+    __NR_semtimedop,
+#endif
+#ifdef __NR_semtimedop_time64
+    __NR_semtimedop_time64,
+#endif
+#ifdef __NR_semctl
+    __NR_semctl,
+#endif
+    /* The I/O class is set to idle before the exec; an unprivileged process
+     * may raise its own class back to best-effort. */
+#ifdef __NR_ioprio_set
+    __NR_ioprio_set,
+#endif
+    /* Code that is no file of the package's tree. */
+#ifdef __NR_memfd_create
+    __NR_memfd_create,
+#endif
+#ifdef __NR_execveat
+    __NR_execveat,
+#endif
+    /* Kernel AIO: each request carries an I/O class of its own, set past
+     * the process's. Nothing a package runs uses it (the C library's POSIX
+     * AIO is threads). */
+#ifdef __NR_io_setup
+    __NR_io_setup,
+#endif
+#ifdef __NR_io_destroy
+    __NR_io_destroy,
+#endif
+#ifdef __NR_io_submit
+    __NR_io_submit,
+#endif
+#ifdef __NR_io_cancel
+    __NR_io_cancel,
+#endif
+#ifdef __NR_io_getevents
+    __NR_io_getevents,
+#endif
+#ifdef __NR_io_pgetevents
+    __NR_io_pgetevents,
+#endif
+#ifdef __NR_io_pgetevents_time64
+    __NR_io_pgetevents_time64,
+#endif
 };
+
+/* clone()'s namespace flags, any of which asks for a namespace of its own
+ * (CLONE_NEWTIME is not among them: in clone()'s flags that bit is the
+ * exit signal's). The filter reads the low 32 bits of the first argument,
+ * which hold every flag clone() takes, on each little-endian target this
+ * builds for. */
+#define CLONE_NEW_ANY 0x7e020000U   /* NEWNS, NEWCGROUP, NEWUTS, NEWIPC, NEWUSER, NEWPID, NEWNET */
+_Static_assert(CLONE_NEW_ANY == (CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER
+                                 | CLONE_NEWPID | CLONE_NEWNET), "the namespace flags");
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the filter reads clone()'s flags from the low word");
 
 #if defined(__arm__)
 #define NATIVE_AUDIT_ARCH AUDIT_ARCH_ARM
@@ -252,7 +343,8 @@ static const int denied[] = {
 #error "no seccomp architecture for this build"
 #endif
 
-#define RET_EPERM (SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA))
+#define RET_EPERM  (SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA))
+#define RET_ENOSYS (SECCOMP_RET_ERRNO | (ENOSYS & SECCOMP_RET_DATA))
 
 static int filter_build(struct sock_filter *f, unsigned short *n)
 {
@@ -270,6 +362,22 @@ static int filter_build(struct sock_filter *f, unsigned short *n)
         PUT(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, (unsigned)denied[i]);
         PUT(BPF_RET | BPF_K, 0, 0, RET_EPERM);
     }
+#ifdef __NR_clone3
+    /* clone3() passes its flags in memory the filter cannot read. ENOSYS,
+     * not EPERM: on ENOSYS the C library falls back to clone(), whose flags
+     * it can. */
+    PUT(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, __NR_clone3);
+    PUT(BPF_RET | BPF_K, 0, 0, RET_ENOSYS);
+#endif
+#ifdef __NR_clone
+    /* clone(): a process or a thread, and never a namespace (unshare and
+     * setns are refused above). */
+    PUT(BPF_JMP | BPF_JEQ | BPF_K, 0, 4, __NR_clone);
+    PUT(BPF_LD | BPF_W | BPF_ABS, 0, 0, offsetof(struct seccomp_data, args[0]));
+    PUT(BPF_JMP | BPF_JSET | BPF_K, 0, 1, CLONE_NEW_ANY);
+    PUT(BPF_RET | BPF_K, 0, 0, RET_EPERM);
+    PUT(BPF_RET | BPF_K, 0, 0, SECCOMP_RET_ALLOW);
+#endif
 #ifdef __NR_socket
     /* socket(): the Unix, IPv4, and IPv6 families and no other (netlink,
      * packet, and the rest are not an extension's to open). */
@@ -295,10 +403,11 @@ static int filter_build(struct sock_filter *f, unsigned short *n)
  * at the fork is held forever here. strerror() is not one of them -
  * glibc's may format into a buffer it allocates - so the reentrant form
  * writes into one of ours. */
-static void die(int err_fd, const char *step, int saved)
+static void die(int err_fd, int machine, const char *step, int saved)
 {
     char msg[160], buf[96];
     size_t n = 0;
+    msg[n++] = machine ? 'm' : 'p';                     /* whose step: the parent reads it first */
     for (const char *p = step; *p && n < sizeof(msg) - 40; p++)
         msg[n++] = *p;
     const char *why = saved ? strerror_r(saved, buf, sizeof(buf)) : "";
@@ -314,6 +423,9 @@ static void die(int err_fd, const char *step, int saved)
     _exit(126);
 }
 
+/* One path's rule: 0 (a path that is not there and not required too), -1
+ * with errno when the path will not open, -2 with errno when the kernel
+ * will not take the rule. */
 static int ll_allow(int ruleset, const char *path, uint64_t access, int required)
 {
     int fd = open(path, O_PATH | O_CLOEXEC);
@@ -327,16 +439,33 @@ static int ll_allow(int ruleset, const char *path, uint64_t access, int required
     int saved = errno;
     close(fd);
     errno = saved;
-    return rc == 0 ? 0 : -1;
+    return rc == 0 ? 0 : -2;
+}
+
+/* Does a failed step on the package's own directories (an open, the
+ * change of directory) come of something the machine is short of - memory,
+ * descriptors, the disk - and not of the directory? The same errors
+ * op_start reads as the machine's when it hands the data directory over.
+ * The exec is not judged by this: its every failure counts against the
+ * package, a shortage of the machine's at that moment included. */
+static int machine_errno(int e)
+{
+    return e == ENOSPC || e == EROFS || e == EIO || e == EDQUOT || e == ENOMEM || e == EMFILE || e == ENFILE;
 }
 
 /* The ruleset, built while still root (every path opens) and applied after
  * the account change. -1 with errno, or the ruleset's descriptor; -2 when
- * the kernel has no landlock and none is demanded. */
-static int ll_build(const prepared_t *p)
+ * the kernel has no landlock and none is demanded. *machine says whose
+ * step failed: the package's when its package or data directory will not
+ * open for a reason of its own, the machine's for the rest (the ruleset,
+ * the system's, the devices' and the host's paths, any rule the kernel
+ * will not take, the ports, and an open that fails for what the machine is
+ * short of). */
+static int ll_build(const prepared_t *p, int *machine)
 {
     const sandbox_cfg_t *c = p->cfg;
     int abi = p->abi;
+    *machine = 1;
     if (abi < 1)
         return (c->need & SANDBOX_NEED_LANDLOCK_FS) ? -1 : -2;
     if (abi < 4 && (c->need & SANDBOX_NEED_LANDLOCK_NET)) {
@@ -377,7 +506,13 @@ static int ll_build(const prepared_t *p)
         ok = ll_allow(rs, devices[i], LL_FS_READ_FILE | LL_FS_WRITE_FILE, 0) == 0;
     for (int i = 0; i < SANDBOX_MAX_PATHS && c->extra_ro[i] && ok; i++)
         ok = ll_allow(rs, c->extra_ro[i], LL_READ, 0) == 0;
-    ok = ok && ll_allow(rs, c->pkg_dir, LL_RX, 1) == 0 && ll_allow(rs, c->data_dir, own, 1) == 0;
+    if (ok) {
+        int mine = ll_allow(rs, c->pkg_dir, LL_RX, 1);
+        if (mine == 0)
+            mine = ll_allow(rs, c->data_dir, own, 1);
+        ok = mine == 0;
+        *machine = mine != -1 || machine_errno(errno);
+    }
     if (ok && abi >= 4) {
         for (int i = 0; i < SANDBOX_MAX_PORTS && c->connect_ports[i] && ok; i++) {
             struct ll_net_port_attr port = { LL_NET_CONNECT_TCP, (uint64_t)c->connect_ports[i] };
@@ -401,6 +536,45 @@ static int ll_build(const prepared_t *p)
 #define IOPRIO_CLASS_IDLE 3
 #endif
 
+/* The /dev of a service's own mount namespace: these four, bound from the
+ * machine's, and nothing else. */
+static const char *const dev_nodes[] = { "/dev/null", "/dev/zero", "/dev/urandom", "/dev/random", NULL };
+/* As the machine's /dev has them: they lead to the process's own
+ * descriptors and nowhere else, and landlock judges what they reach. */
+static const char *const dev_links[][2] = {
+    { "/dev/fd", "/proc/self/fd" }, { "/dev/stdin", "/proc/self/fd/0" }, { "/dev/stdout", "/proc/self/fd/1" },
+    { "/dev/stderr", "/proc/self/fd/2" }, { "", "" },
+};
+#define DEV_NODES 4
+
+/* "/proc/self/fd/<fd>" into out, without stdio (this runs in the child). */
+static void fd_path(char out[32], int fd)
+{
+    static const char head[] = "/proc/self/fd/";
+    char digits[12];
+    int n = 0;
+    do
+        digits[n++] = (char)('0' + fd % 10);
+    while ((fd /= 10) > 0 && n < 11);
+    size_t k = 0;
+    for (; head[k]; k++)
+        out[k] = head[k];
+    while (n > 0)
+        out[k++] = digits[--n];
+    out[k] = '\0';
+}
+
+void sandbox_signals_default(void)
+{
+    sigset_t none;
+    sigemptyset(&none);
+    sigprocmask(SIG_SETMASK, &none, NULL);
+    struct sigaction dfl = { .sa_handler = SIG_DFL };
+    for (int sig = 1; sig < NSIG; sig++)
+        if (sig != SIGKILL && sig != SIGSTOP)
+            sigaction(sig, &dfl, NULL);                 /* an exec keeps an ignored signal ignored */
+}
+
 static void child(const prepared_t *p)
 {
     const sandbox_cfg_t *c = p->cfg;
@@ -417,34 +591,70 @@ static void child(const prepared_t *p)
         _exit(125);
 
     if (setsid() < 0)
-        die(err_fd, "setsid", errno);
+        die(err_fd, 1, "setsid", errno);
     int null = open("/dev/null", O_RDONLY);
     if (null < 0 || dup2(null, 0) < 0 || dup2(c->log_fd, 1) < 0 || dup2(c->log_fd, 2) < 0)
-        die(err_fd, "stdio", errno);
+        die(err_fd, 1, "stdio", errno);
+
+    /* A mount namespace of its own, whose /dev is a tmpfs holding the four
+     * nodes landlock grants and nothing else: no log daemon's socket, now
+     * or made again later in the machine's /dev. Landlock does not judge a
+     * send to a pathname socket, and the log daemon files a datagram under
+     * whatever program name and severity it carries, and keeps every
+     * descriptor passed with one. Its output is its log, through the pipe.
+     * Nothing mounted here reaches the machine's own namespace (and the
+     * filter refuses the service mount), while the machine's unmounts
+     * reach this one (its root is shared: forgefirm-sandbox). */
+    if (unshare(CLONE_NEWNS) != 0 || mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL) != 0)
+        die(err_fd, 1, "mount namespace", errno);
+    int keep[DEV_NODES];
+    for (int i = 0; i < DEV_NODES; i++)
+        if ((keep[i] = open(dev_nodes[i], O_PATH | O_CLOEXEC)) < 0)
+            die(err_fd, 1, "the service's /dev", errno);
+    if (mount("ffx-dev", "/dev", "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755,size=16k,nr_inodes=16") != 0)
+        die(err_fd, 1, "the service's /dev", errno);
+    for (int i = 0; i < DEV_NODES; i++) {
+        char from[32];
+        int made = open(dev_nodes[i], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (made < 0)
+            die(err_fd, 1, "the service's /dev", errno);
+        close(made);
+        fd_path(from, keep[i]);
+        if (mount(from, dev_nodes[i], NULL, MS_BIND, NULL) != 0)
+            die(err_fd, 1, "the service's /dev", errno);
+        close(keep[i]);
+    }
+    for (int i = 0; dev_links[i][0][0]; i++)
+        if (symlink(dev_links[i][1], dev_links[i][0]) != 0)
+            die(err_fd, 1, "the service's /dev", errno);
 
     int adj = open("/proc/self/oom_score_adj", O_WRONLY);
     if (adj < 0 || write(adj, "900", 3) != 3)
-        die(err_fd, "oom_score_adj", errno);
+        die(err_fd, 1, "oom_score_adj", errno);
     close(adj);
 
     struct sched_param sp = { 0 };
     if (sched_setscheduler(0, SCHED_IDLE, &sp) != 0)
-        die(err_fd, "SCHED_IDLE", errno);
+        die(err_fd, 1, "SCHED_IDLE", errno);
     if (setpriority(PRIO_PROCESS, 0, 19) != 0)
-        die(err_fd, "nice 19", errno);
+        die(err_fd, 1, "nice 19", errno);
     if (syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, IOPRIO_CLASS_IDLE << 13) != 0)
-        die(err_fd, "I/O class idle", errno);
+        die(err_fd, 1, "I/O class idle", errno);
 
+    /* RLIMIT_NICE and RLIMIT_RTPRIO at 0 keep it in SCHED_IDLE at nice 19:
+     * leaving either takes one of them above 0. */
     const struct { int what; rlim_t lim; const char *name; } limits[] = {
         { RLIMIT_CORE, 0, "RLIMIT_CORE" },
         { RLIMIT_NOFILE, 256, "RLIMIT_NOFILE" },
         { RLIMIT_NPROC, 64, "RLIMIT_NPROC" },
         { RLIMIT_AS, (rlim_t)1 << 30, "RLIMIT_AS" },
+        { RLIMIT_NICE, 0, "RLIMIT_NICE" },
+        { RLIMIT_RTPRIO, 0, "RLIMIT_RTPRIO" },
     };
     for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
         struct rlimit rl = { limits[i].lim, limits[i].lim };
         if (setrlimit(limits[i].what, &rl) != 0)
-            die(err_fd, limits[i].name, errno);
+            die(err_fd, 1, limits[i].name, errno);
     }
 
     /* Every descriptor but stdio, the word back to the parent, and the
@@ -452,44 +662,46 @@ static void child(const prepared_t *p)
      * of the way first, so that neither move lands on the other. */
     int call = -1;
     if (c->call_fd > 0 && (call = fcntl(c->call_fd, F_DUPFD_CLOEXEC, 10)) < 0)
-        die(err_fd, "descriptors", errno);
+        die(err_fd, 1, "descriptors", errno);
     if (err_fd != 3) {
         if (dup2(err_fd, 3) < 0)
-            die(err_fd, "descriptors", errno);
+            die(err_fd, 1, "descriptors", errno);
         err_fd = 3;
     }
     if (call >= 0 && dup2(call, 4) < 0)             /* dup2 leaves 4 open across the exec */
-        die(err_fd, "descriptors", errno);
+        die(err_fd, 1, "descriptors", errno);
     if (fcntl(err_fd, F_SETFD, FD_CLOEXEC) != 0 || syscall(SYS_close_range, call >= 0 ? 5U : 4U, ~0U, 0U) != 0)
-        die(err_fd, "descriptors", errno);
+        die(err_fd, 1, "descriptors", errno);
 
-    int ruleset = ll_build(p);
+    int machine_step;
+    int ruleset = ll_build(p, &machine_step);
     if (ruleset == -1)
-        die(err_fd, "landlock rules", errno);
+        die(err_fd, machine_step, "landlock rules", errno);
 
     if (chdir(c->data_dir) != 0)
-        die(err_fd, "the data directory", errno);
+        die(err_fd, machine_errno(errno), "the data directory", errno);
     if (setgroups(0, NULL) != 0 || setresgid(c->gid, c->gid, c->gid) != 0 || setresuid(c->uid, c->uid, c->uid) != 0)
-        die(err_fd, "the account", errno);
+        die(err_fd, 1, "the account", errno);
     uid_t ru, eu, su;
     gid_t rg, eg, sg;
     if (getresuid(&ru, &eu, &su) != 0 || getresgid(&rg, &eg, &sg) != 0 || ru != c->uid || eu != c->uid || su != c->uid
         || rg != c->gid || eg != c->gid || sg != c->gid || (c->uid != 0 && setuid(0) == 0))
-        die(err_fd, "the account did not take", 0);
+        die(err_fd, 1, "the account did not take", 0);
 
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
-        die(err_fd, "no_new_privs", errno);
+        die(err_fd, 1, "no_new_privs", errno);
     if (ruleset >= 0) {
         if (syscall(__NR_landlock_restrict_self, ruleset, 0) != 0)
-            die(err_fd, "landlock", errno);
+            die(err_fd, 1, "landlock", errno);
         close(ruleset);
     }
     struct sock_fprog prog = { .len = p->nfilter, .filter = (struct sock_filter *)p->filter };
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) != 0)
-        die(err_fd, "seccomp", errno);
+        die(err_fd, 1, "seccomp", errno);
 
+    sandbox_signals_default();
     execve(c->argv[0], (char *const *)c->argv, p->envp);
-    die(err_fd, "exec", errno);
+    die(err_fd, 0, "exec", errno);
 }
 
 /* ---- the parent ------------------------------------------------------------- */
@@ -506,6 +718,42 @@ static int fail(char *err, size_t elen, const char *fmt, ...)
         va_end(ap);
     }
     return -1;
+}
+
+int sandbox_root_shared(char *err, size_t elen)
+{
+    FILE *f = fopen("/proc/self/mountinfo", "re");
+    char line[1024];
+    int found = 0, shared = 0;
+    /* The last mount on / is the one that is seen; its optional fields,
+     * between the mount options and the "-", carry its peer group. */
+    while (f && fgets(line, sizeof(line), f)) {
+        char *field[6] = { 0 }, *save = NULL, *tok = strtok_r(line, " ", &save);
+        int k = 0;
+        for (; tok && k < 6; k++, tok = k < 6 ? strtok_r(NULL, " ", &save) : tok)
+            field[k] = tok;
+        if (k < 6 || strcmp(field[4], "/") != 0)
+            continue;
+        found = 1;
+        shared = 0;
+        for (tok = strtok_r(NULL, " ", &save); tok && strcmp(tok, "-") != 0; tok = strtok_r(NULL, " ", &save))
+            shared |= strncmp(tok, "shared:", 7) == 0;
+    }
+    if (f)
+        fclose(f);
+    if (!found)
+        return fail(err, elen, "the root mount is not in /proc/self/mountinfo");
+    if (!shared)
+        return fail(err, elen, "the root mount is not shared (mount --make-rshared /): a service would keep the "
+                               "machine's mounts after the machine lets them go");
+    return 0;
+}
+
+/* What fails on this side of the fork, the machine's and not the package's. */
+static int not_ready(int rc)
+{
+    (void)rc;
+    return SANDBOX_NOT_READY;
 }
 
 static int env_add(prepared_t *p, int *n, const char *fmt, ...)
@@ -539,9 +787,9 @@ pid_t sandbox_spawn(const sandbox_cfg_t *cfg, char *err, size_t elen)
     p->cfg = cfg;
     p->abi = sandbox_landlock_abi();
     if (p->abi < 1 && (cfg->need & SANDBOX_NEED_LANDLOCK_FS))
-        return fail(err, elen, "this kernel has no landlock");
+        return not_ready(fail(err, elen, "this kernel has no landlock"));
     if (p->abi < 4 && (cfg->need & SANDBOX_NEED_LANDLOCK_NET))
-        return fail(err, elen, "this kernel's landlock (ABI %d) has no TCP rules", p->abi);
+        return not_ready(fail(err, elen, "this kernel's landlock (ABI %d) has no TCP rules", p->abi));
     if (filter_build(p->filter, &p->nfilter) != 0)
         return fail(err, elen, "the seccomp filter does not fit");
     if (env_add(p, &n, "PATH=/usr/bin:/bin") || env_add(p, &n, "LANG=C") || env_add(p, &n, "HOME=%s", cfg->data_dir)
@@ -559,7 +807,7 @@ pid_t sandbox_spawn(const sandbox_cfg_t *cfg, char *err, size_t elen)
             close(go[0]);
             close(go[1]);
         }
-        return fail(err, elen, "cannot make a pipe: %s", strerror(saved));
+        return not_ready(fail(err, elen, "cannot make a pipe: %s", strerror(saved)));
     }
     p->go_fd = go[0];
     p->err_fd = ep[1];
@@ -570,7 +818,7 @@ pid_t sandbox_spawn(const sandbox_cfg_t *cfg, char *err, size_t elen)
         close(go[1]);
         close(ep[0]);
         close(ep[1]);
-        return fail(err, elen, "cannot fork: %s", strerror(saved));
+        return not_ready(fail(err, elen, "cannot fork: %s", strerror(saved)));
     }
     if (pid == 0) {
         close(go[1]);
@@ -598,8 +846,12 @@ pid_t sandbox_spawn(const sandbox_cfg_t *cfg, char *err, size_t elen)
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
         if (!in_group)
-            return fail(err, elen, "cannot put the service into its group: %s", strerror(saved));
-        return fail(err, elen, "the service did not start: %s", word);
+            return not_ready(fail(err, elen, "cannot put the service into its group: %s", strerror(saved)));
+        /* The child's first byte says whose step failed: the machine's
+         * steps are no fault of the package's and count against nobody. */
+        if (word[0] == 'm')
+            return not_ready(fail(err, elen, "the service could not be set up: %s", word + 1));
+        return fail(err, elen, "the service did not start: %s", word + (word[0] == 'p'));
     }
     return pid;
 }

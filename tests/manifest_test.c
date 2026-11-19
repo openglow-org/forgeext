@@ -20,6 +20,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { fails++; printf("FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
@@ -32,6 +34,28 @@ static int parses(const char *text)
     return manifest_parse(text, strlen(text), &m, err, sizeof(err)) == 0;
 }
 
+/* A manifest parsed in a child of its own, so that a parse that writes
+ * past an array (a bound raised, the fortified build's abort) is this
+ * test's failure, said, and not its end: PARSE_TAKEN with the bound's whole
+ * count of arguments (args set) or capabilities, PARSE_REFUSED in words,
+ * or anything else. */
+#define PARSE_TAKEN   20
+#define PARSE_REFUSED 10
+static int parse_apart(const char *text, const char *words, int args)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        int took = manifest_parse(text, strlen(text), &m, err, sizeof(err)) == 0;
+        if (took)
+            _exit((args ? m.nargs == MANIFEST_MAX_ARGS : m.ncaps == MANIFEST_MAX_CAPS) ? PARSE_TAKEN : 1);
+        _exit(strstr(err, words) ? PARSE_REFUSED : 2);
+    }
+    int status = 0;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status))
+        return -1;
+    return WEXITSTATUS(status);
+}
+
 static int refused_with(const char *text, const char *words)
 {
     return manifest_parse(text, strlen(text), &m, err, sizeof(err)) != 0 && strstr(err, words) != NULL;
@@ -42,6 +66,7 @@ static int refused_with(const char *text, const char *words)
 #define BASE_HEAD "{\"manifest\":1,\"id\":\"org.example.notify\",\"name\":\"Notify\",\"version\":\"1.2.3\"," \
                   "\"author\":\"Someone\",\"license\":\"MIT\",\"api\":\"0.1\","
 #define SERVICE   "\"runtime\":\"python\",\"service\":{\"exec\":\"bin/run.py\",\"args\":[\"--quiet\"]},"
+#define SERVICE_SH "\"runtime\":\"shell\",\"service\":{\"exec\":\"bin/run.sh\"},"
 
 int main(void)
 {
@@ -154,8 +179,43 @@ int main(void)
           && manifest_version_cmp("1.10.0", "1.9.9") > 0 && manifest_version_cmp("2.0.0-rc1", "2.0.0") < 0
           && manifest_version_cmp("2.0.0", "2.0.0-rc1") > 0 && manifest_version_cmp("2.0.0-a", "2.0.0-b") < 0,
           "version order");
+    /* Pre-release identifiers in turn, a numeric one by its value and
+     * below any that is not, the shorter list first. */
+    CHECK(manifest_version_cmp("1.0.0-rc.10", "1.0.0-rc.9") > 0 && manifest_version_cmp("1.0.0-alpha", "1.0.0-alpha.1") < 0
+          && manifest_version_cmp("1.0.0-1", "1.0.0-alpha") < 0 && manifest_version_cmp("1.0.0-beta.2", "1.0.0-beta.11") < 0
+          && manifest_version_cmp("1.0.0-rc.1", "1.0.0-rc.1") == 0 && manifest_version_cmp("1.0.0-ab", "1.0.0-abc") < 0
+          && manifest_version_cmp("1.0.0-abc", "1.0.0-ab") > 0, "pre-release order");
+    /* An empty identifier, and a numeric one with a leading zero, are no
+     * pre-release (a trailing dot is an empty identifier). */
+    CHECK(!manifest_version_ok("1.0.0-rc.") && !manifest_version_ok("1.0.0-rc.1.") && !manifest_version_ok("1.0.0-rc..1")
+          && !manifest_version_ok("1.0.0-.") && !manifest_version_ok("1.0.0-rc.01") && manifest_version_ok("1.0.0-rc.0")
+          && manifest_version_ok("1.0.0-0a") && manifest_version_ok("1.0.0-rc.10"), "pre-release identifiers");
     CHECK(manifest_id_reserved("org.openglow.align") && manifest_id_reserved("org.forgefirm.x")
+          && manifest_id_reserved("org.openglow") && manifest_id_reserved("org.forgefirm")
           && !manifest_id_reserved("org.openglowfan.x") && !manifest_id_reserved("com.example.x"), "the reserved namespace");
+    /* The bounds before each copy into a fixed array: 16 arguments and 32
+     * capabilities taken, one more of either refused. */
+    for (int extra = 0; extra < 2; extra++) {
+        char big[8192];
+        size_t o = (size_t)snprintf(big, sizeof(big), BASE_HEAD "\"runtime\":\"python\",\"service\":{\"exec\":\"bin/run.py\","
+                                    "\"args\":[");
+        for (int i = 0; i < MANIFEST_MAX_ARGS + extra; i++)
+            o += (size_t)snprintf(big + o, sizeof(big) - o, "%s\"a%d\"", i ? "," : "", i);
+        snprintf(big + o, sizeof(big) - o, "]},\"capabilities\":[]}");
+        int took = parse_apart(big, "at most 16", 1);
+        CHECK(took == (extra ? PARSE_REFUSED : PARSE_TAKEN), "%d arguments -> %s", MANIFEST_MAX_ARGS + extra,
+              took == PARSE_TAKEN ? "taken" : took == PARSE_REFUSED ? "refused" : "neither, or the parser ended");
+        o = (size_t)snprintf(big, sizeof(big), BASE_HEAD SERVICE "\"capabilities\":[");
+        for (int i = 0; i < MANIFEST_MAX_CAPS + extra; i++)
+            o += (size_t)snprintf(big + o, sizeof(big) - o, "%s\"net.outbound:h%d.example:443\"", i ? "," : "", i);
+        snprintf(big + o, sizeof(big) - o, "]}");
+        took = parse_apart(big, "at most 32", 0);
+        CHECK(took == (extra ? PARSE_REFUSED : PARSE_TAKEN), "%d capabilities -> %s", MANIFEST_MAX_CAPS + extra,
+              took == PARSE_TAKEN ? "taken" : took == PARSE_REFUSED ? "refused" : "neither, or the parser ended");
+    }
+    CHECK(refused_with(BASE_HEAD SERVICE_SH "\"capabilities\":[\"job_time.run\",\"mcode:160\"]}", "a shell service cannot answer")
+          && refused_with(BASE_HEAD SERVICE_SH "\"capabilities\":[\"wizard\"]}", "a shell service cannot answer"),
+          "an M-code or a Setup check for a shell service -> %s", err);
 
     /* /etc/forgefirm-version holds "v0.0.6" on a release image: the "v" is
      * the file's form and the version has to be read out of it, or a

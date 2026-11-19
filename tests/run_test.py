@@ -65,11 +65,44 @@ lifted from the script and expanded as the script expands it): a SIGKILL of
 the host takes its services with it at once, and the wrapper starts the host
 again, which starts the service again under a new pid. This needs Landlock's
 network rules (ABI 4 or newer), which the host is not told to do without.
+A stray TERM of the host is no stop: the wrapper starts it again.
+
+Besides: a package's data directory is root's and its account's group's,
+0770, which the package cannot open to another account; its data kept
+across a removal and installed again into another account is handed to that
+account entry by entry, a link left in it not followed. The dialer's second
+destination has the stand-in forgectrl's port, so landlock lets it dial
+that port at 127.0.0.1 and the image's table is what refuses it. One
+package's five silent connections to its socket: the fifth is closed at
+once, and another package is answered meanwhile. A service that closes its
+output costs the host no CPU. A command that holds the root's lock holds up
+nothing of the host's turn. Inside the shutdown grace (4 s here, 1 s on the
+machine) an armed window, or one that cannot be read, freezes what is left
+running before it is stopped; the host's own stop waits the machine's 1 s
+whatever its grace, and --shutdown-grace takes nothing below 1 s or past
+30 s. The M-code of the one with the grant is listed while it runs, and not
+while it is frozen in place of job-time limits that cannot be set. A stop
+whose process outlives its group's kill holds up nothing of the turn. A
+predecessor's removal that the root's lock put off is taken up once the
+lock is let go. A root
+mount that is not shared (this namespace's, as unshare leaves it) is a
+machine not ready, until the test makes it shared. A start whose name is
+being looked up is put off, the turn going on, and a name the resolver
+never answers is then a start the machine is not ready for, never
+counted; so is a full /data; a LAN name in a manifest is refused, and the
+same name the operator types is taken; a tree changed by hand is a start
+that fails for the package's own reason, and is counted. A listener opens
+only while the operator's grant is in the record, read at each start. The
+init script itself (its four paths moved under the test, a stand-in for
+the host) finds a running wrapper at a second start, has a stray TERM of
+the host answered by a respawn, and sends TERM to a host whose wrapper is
+gone; the relay of that wrapper, which outlives it, is ended by the test.
 
 Needs root, cgroup v2, nft, ip, nsenter, unshare, fwup (FWUP), the built
 forgeext (FORGEEXT), and the rule file (FFX_RULES). Exits 77 without them.
 """
 import ctypes
+import errno
 import fcntl
 import http.server
 import json
@@ -96,7 +129,9 @@ RULES = os.environ.get("FFX_RULES") or os.path.join(HERE, "..", "..", "forgefirm
                                                     "forgefirm-sandbox", "files", "ffx.nft")
 MKFFX = os.path.join(HERE, "..", "tools", "mkffx.sh")
 CG_PARENT = "/sys/fs/cgroup/forgeext-run-test"
-HERE_ADDR, PEER_ADDR = "10.99.2.1", "10.99.2.2"
+# Two documentation networks, routed to each other over the veth pair: the peer is on no subnet of the host's own,
+# which a destination named by DNS must not lead into.
+HERE_ADDR, PEER_ADDR = "203.0.113.1", "198.51.100.2"
 SKIP = 77
 
 PEER = r'''
@@ -106,6 +141,8 @@ sys.stdin.readline()
 s = socket.socket()
 s.bind(("%s", 0))
 s.listen(128)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.bind(("%s", 53))          # the namespace's resolver: it takes every query and answers none
 def take():
     while True:
         c, _ = s.accept()
@@ -113,7 +150,7 @@ def take():
 threading.Thread(target=take, daemon=True).start()
 print(s.getsockname()[1], flush=True)
 sys.stdin.readline()
-''' % PEER_ADDR
+''' % (PEER_ADDR, PEER_ADDR)
 
 # What a service needs to talk to the host: one request per connection to the socket named in FFX_API.
 API_CLIENT = r'''
@@ -371,6 +408,28 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def relays(under):
+    """The pids whose standard input is a file under `under`: the init wrapper's logger relays, which hold the
+    wrapper's fifo open for reading and writing and so never see its end."""
+    pids = []
+    for d in os.listdir("/proc"):
+        try:
+            if d.isdigit() and os.readlink("/proc/%s/fd/0" % d).startswith(under + "/"):
+                pids.append(int(d))
+        except OSError:
+            pass
+    return pids
+
+
+def kill_relays(under):
+    for pid in relays(under):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return True
+
+
 def wait_for(cond, seconds, poll=0.25):
     end = time.time() + seconds
     while time.time() < end:
@@ -445,14 +504,21 @@ def main():
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     hosts = os.path.join(top, "hosts")
     with open(hosts, "w") as f:
-        f.write("127.0.0.1 localhost\n%s peer.test\n" % PEER_ADDR)
+        f.write("127.0.0.1 localhost\n%s peer.test\n192.168.1.20 broker.lan\n" % PEER_ADDR)
     subprocess.run(["mount", "--bind", hosts, "/etc/hosts"], check=True)
+    # The peer is the namespace's one resolver, and answers nothing: a name not in hosts is never answered.
+    resolv = os.path.join(top, "resolv.conf")
+    with open(resolv, "w") as f:
+        f.write("nameserver %s\n" % PEER_ADDR)
+    subprocess.run(["mount", "--bind", resolv, os.path.realpath("/etc/resolv.conf")], check=True)
     peer = subprocess.Popen(["unshare", "-n", sys.executable, "-u", "-c", PEER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     peer.stdout.readline()
     ns = ["nsenter", "-t", str(peer.pid), "-n"]
     for cmd in (["ip", "link", "add", "ffxr0", "type", "veth", "peer", "name", "ffxr1"], ["ip", "link", "set", "ffxr1", "netns", str(peer.pid)],
                 ["ip", "addr", "add", HERE_ADDR + "/24", "dev", "ffxr0"], ["ip", "link", "set", "ffxr0", "up"],
-                ns + ["ip", "addr", "add", PEER_ADDR + "/24", "dev", "ffxr1"], ns + ["ip", "link", "set", "ffxr1", "up"]):
+                ns + ["ip", "addr", "add", PEER_ADDR + "/24", "dev", "ffxr1"], ns + ["ip", "link", "set", "ffxr1", "up"],
+                ["ip", "route", "add", PEER_ADDR.rsplit(".", 1)[0] + ".0/24", "dev", "ffxr0"],
+                ns + ["ip", "route", "add", HERE_ADDR.rsplit(".", 1)[0] + ".0/24", "dev", "ffxr1"]):
         subprocess.run(cmd, check=True, capture_output=True)
     peer.stdin.write("go\n")
     peer.stdin.flush()
@@ -466,6 +532,8 @@ def main():
     os.makedirs(CG_PARENT, exist_ok=True)
     with open(CG_PARENT + "/cgroup.subtree_control", "w") as f:
         f.write("+cpu +memory +pids")
+    with open(CG_PARENT + "/cpu.idle", "w") as f:       # an idle group, as the image's ffx is
+        f.write("1")
 
     def fx(*args):
         p = subprocess.run([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "--no-reserve"] + list(args),
@@ -475,11 +543,11 @@ def main():
         except ValueError:
             return {"ok": None, "error": p.stdout[:200] + p.stderr[:200]}
 
-    def package(id_, runtime, files, caps=(), grants=(), args=()):
+    def package(id_, runtime, files, caps=(), grants=(), args=(), version="1.0.0"):
         d = os.path.join(top, "src-" + id_)
-        os.makedirs(os.path.join(d, "bin"))
+        os.makedirs(os.path.join(d, "bin"), exist_ok=True)
         exe = "bin/run.py" if runtime == "python" else "bin/run.sh"
-        m = {"manifest": 1, "id": id_, "name": id_, "version": "1.0.0", "author": "Test", "license": "MIT", "api": "0.1",
+        m = {"manifest": 1, "id": id_, "name": id_, "version": version, "author": "Test", "license": "MIT", "api": "0.1",
              "runtime": runtime, "service": {"exec": exe, "args": list(args)}, "capabilities": list(caps)}
         with open(os.path.join(d, "manifest.json"), "w") as f:
             f.write(json.dumps(m, indent=1) + "\n")
@@ -493,13 +561,76 @@ def main():
 
     print("four packages")
     package("org.example.beat", "shell", "#!/bin/sh\nwhile true; do echo beat; sleep 1; done\n", caps=["hold"], grants=["hold"])
-    package("org.example.dial", "python", DIAL, caps=["net.outbound:peer.test:%d" % pport], args=["peer.test", str(pport), str(fport)])
-    package("org.example.jobtime", "python", JOBTIME, caps=["job_time.run", "machine.read", "hold", "motion.job"],
+    # Its second destination has the stand-in forgectrl's port: landlock lets it dial that port anywhere, 127.0.0.1
+    # included, and the image's table is what refuses the machine.
+    package("org.example.dial", "python", DIAL, caps=["net.outbound:peer.test:%d" % pport, "net.outbound:peer.test:%d" % fport],
+            args=["peer.test", str(pport), str(fport)])
+    package("org.example.jobtime", "python", JOBTIME, caps=["job_time.run", "machine.read", "hold", "motion.job", "mcode:170"],
             grants=["job_time.run", "hold", "motion.job"])
     package("org.example.crash", "shell", "#!/bin/sh\necho about to end\nexit 3\n", caps=["hold"], grants=["hold"])
 
+    print("the shutdown grace a host test may hold open: never below the machine's 1 s, never past 30 s")
+    for v, refused in (("0.5", True), ("30.5", True), ("nan", True), ("4x", True), ("1", False), ("30", False)):
+        # A value taken gets as far as the daemon, which stops at once: there is no cgroup parent under this root.
+        rc_ = subprocess.run([FORGEEXT, "--root", os.path.join(top, "grace-root"), "run", "--cg-parent",
+                              os.path.join(top, "no-cgroup"), "--run-dir", os.path.join(top, "grace-run"),
+                              "--shutdown-grace", v], capture_output=True).returncode
+        check((rc_ == 2) == refused, "--shutdown-grace %s -> exit %d (2 is the usage's)", v, rc_)
+
+    print("a package's data directory is root's and its group's, 0770, and kept data follows it to another account")
+
+    def slot_of(id_):
+        return json.load(open(os.path.join(root, "state.json")))["packages"][id_]["slot"]
+
+    def as_account(uid, fn):
+        """fn() run as a pool account: 'ok', or the errno's name."""
+        r, w_ = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            word = "ok"
+            try:
+                os.setgroups([])
+                os.setgid(uid)
+                os.setuid(uid)
+                fn()
+            except OSError as e:
+                word = errno.errorcode.get(e.errno, str(e.errno))
+            os.write(w_, word.encode())
+            os._exit(0)
+        os.close(w_)
+        word = os.read(r, 64).decode()
+        os.close(r)
+        os.waitpid(pid, 0)
+        return word
+
+    kid, taker = "org.example.kept", "org.example.taker"
+    package(kid, "shell", "#!/bin/sh\nexit 0\n")
+    kdata, k1 = os.path.join(root, "data", kid), 800 + slot_of(kid)
+    st_ = os.stat(kdata)
+    check((st_.st_uid, st_.st_gid, stat.S_IMODE(st_.st_mode)) == (0, k1, 0o770),
+          "installed: root's, its account's group, 0770: %d:%d %o", st_.st_uid, st_.st_gid, stat.S_IMODE(st_.st_mode))
+    check(as_account(k1, lambda: os.chmod(kdata, 0o711)) == "EPERM" and as_account(k1 + 1, lambda: os.listdir(kdata)) == "EACCES",
+          "the package cannot open its directory to another account, and another account cannot walk into it")
+    # What its service would leave: a file, a directory, and a link to a file of the machine's.
+    as_account(k1, lambda: (os.makedirs(os.path.join(kdata, "sub")), open(os.path.join(kdata, "sub", "f"), "w").close(),
+                            os.symlink("/etc/hostname", os.path.join(kdata, "link"))))
+    check(fx("remove", kid, "--keep-data").get("ok") is True and os.path.isdir(kdata), "removed, its data kept")
+    package(taker, "shell", "#!/bin/sh\nexit 0\n")
+    package(kid, "shell", "#!/bin/sh\nexit 0\n")
+    k2 = 800 + slot_of(kid)
+    owners = {os.path.relpath(os.path.join(d, n), kdata): (os.lstat(os.path.join(d, n)).st_uid, os.lstat(os.path.join(d, n)).st_gid)
+              for d, ds, fs in os.walk(kdata) for n in ds + fs if os.path.join(d, n) != os.path.join(kdata, "tmp")}
+    check(slot_of(taker) + 800 == k1 and k2 != k1 and owners and set(owners.values()) == {(k2, k2)}
+          and os.stat(kdata).st_gid == k2 and os.stat("/etc/hostname").st_uid == 0,
+          "installed again in another account (%d, its old one %d taken): every entry is the new account's, and the link "
+          "was not followed: %s", k2, k1, owners)
+    for id_ in (kid, taker):
+        check(fx("remove", id_).get("ok") is True, "%s removed", id_)
+
     print("a hold is the operator's to mark, and only where there is one")
     holds_dir, marks, api_dir = os.path.join(top, "holds"), os.path.join(root, "required-holds"), os.path.join(top, "api")
+    call_dir = os.path.join(top, "call")
     r = fx("hold", "org.example.dial", "required")
     check(r.get("ok") is False and "has no hold" in r.get("error", ""), "no grant, no hold to mark: %s", r.get("error"))
     r = fx("hold", "org.example.crash", "required")
@@ -509,9 +640,9 @@ def main():
     # decides on this and the service sees the same answer at GET /v0/self,
     # so the two are checked against each other below.
     eff = {x["id"]: sorted(x.get("effective") or []) for x in fx("list").get("packages", [])}
-    check(eff.get("org.example.jobtime") == ["hold", "job_time.run", "machine.read", "motion.job"],
+    check(eff.get("org.example.jobtime") == ["hold", "job_time.run", "machine.read", "mcode:170", "motion.job"],
           "what jobtime may use: %s", eff.get("org.example.jobtime"))
-    check(eff.get("org.example.dial") == ["net.outbound:peer.test:%d" % pport],
+    check(eff.get("org.example.dial") == sorted(["net.outbound:peer.test:%d" % pport, "net.outbound:peer.test:%d" % fport]),
           "what dial may use: %s", eff.get("org.example.dial"))
     listed = {x["id"]: x.get("hold") for x in fx("list").get("packages", [])}
     check(listed == {"org.example.beat": "advisory", "org.example.dial": None, "org.example.jobtime": "advisory",
@@ -541,11 +672,13 @@ def main():
 
     daemon_env = dict(os.environ, FFLOG_STDERR="1", FFLOG_SOCK="/nonexistent", FORGEEXT_HOST_TOKEN_FILE=token_file)
 
-    def start_daemon():
+    def start_daemon(grace=False):
+        """The host; with grace, its shutdown grace held open 4 s for the cases that look inside it, and for the
+        host's own stop, which must not take it (the machine's grace is 1 s, which the first daemon keeps)."""
         return subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "run", "--conf", conf, "--safe-file", safe,
                                  "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir,
-                                 "--holds-dir", holds_dir, "--api-dir", api_dir]
-                                + (["--landlock-fs-only"] if abi < 4 else []),
+                                 "--holds-dir", holds_dir, "--api-dir", api_dir, "--call-dir", call_dir]
+                                + (["--shutdown-grace", "4"] if grace else []) + (["--landlock-fs-only"] if abi < 4 else []),
                                 stderr=log, stdout=log, env=daemon_env)
 
     daemon = start_daemon()
@@ -607,6 +740,17 @@ def main():
         check(wait_for(lambda: "motion is unverified" in status().get("not_ready", ""), 10), "walkable again: %s",
               status().get("not_ready"))
 
+        print("a root mount that is not shared: the machine is not ready")
+        # This namespace's mounts are private, as unshare leaves them: a service's namespace would keep a copy of
+        # every one of them after it is unmounted. The image makes its root shared before any service starts.
+        facts["motion"] = "verified"
+        check(wait_for(lambda: "root mount is not shared" in status().get("not_ready", ""), 10) and not running(),
+              "this namespace's root is private: %s", status().get("not_ready"))
+        subprocess.run(["mount", "--make-rshared", "/"], check=True)
+        facts["motion"] = "unverified"
+        check(wait_for(lambda: "motion is unverified" in status().get("not_ready", ""), 10), "shared: %s",
+              status().get("not_ready"))
+
         print("ready: one at a time, each in its own account and group")
         t0 = time.time()
         facts["motion"] = "verified"
@@ -625,19 +769,86 @@ def main():
                   and "Seccomp:\t2" in st and ("/%s" % id_) in open("/proc/%d/cgroup" % pid).read(),
                   "%s runs as %s, confined, in its group", id_, s.get("account"))
         check(wait_for(lambda: logged("ext org.example.beat: beat"), 10), "the heartbeat's output is in the log under its name")
-        check(wait_for(lambda: logged("ext org.example.dial: dial peer ok, machine errno"), 15),
+        check(wait_for(lambda: logged("ext org.example.dial: dial peer ok, machine errno %d" % errno.ECONNREFUSED), 15),
               "the dialer reaches its declared destination and not the machine")
         check(cg("org.example.beat", "cpu.max").split() == ["25000", "100000"] and cg("org.example.beat", "pids.max").strip() == "32"
               and cg("org.example.beat", "memory.max").strip() == str(48 << 20),
               "its limits: cpu.max %s pids.max %s memory.max %s", cg("org.example.beat", "cpu.max").strip(),
               cg("org.example.beat", "pids.max").strip(), cg("org.example.beat", "memory.max").strip())
 
+        print("a stop whose process outlives its group's kill holds up nothing of the turn")
+        # The heartbeat's main process moved out of its group, as a task the kill does not reach would be: the
+        # disable stops the service, its group goes, and the turn goes on without waiting for the process to end.
+        bpid = svc("org.example.beat").get("pid", 0)
+        side = CG_PARENT + "-side"
+        os.makedirs(side, exist_ok=True)
+        with open(side + "/cgroup.procs", "w") as f:
+            f.write(str(bpid))
+        os.kill(bpid, signal.SIGSTOP)                   # asleep, it writes nothing that its closed pipe could end it for
+        check(fx("disable", "org.example.beat").get("ok") is True, "the heartbeat disabled")
+        went = wait_for(lambda: svc("org.example.beat").get("state") not in (None, "running"), 20)
+        lived = os.path.exists("/proc/%d" % bpid)
+        try:
+            os.kill(bpid, signal.SIGKILL)
+        except OSError:
+            pass
+        # Reaped by the host's loop, with nothing left to match it; the side group goes once the kill has emptied it.
+        wait_for(lambda: not open(side + "/cgroup.procs").read().strip(), 10, poll=0.1)
+        try:
+            os.rmdir(side)
+        except OSError:
+            pass
+        check(went and lived, "the turn went on past a stop whose process outlived its group: %s (alive then: %s)",
+              svc("org.example.beat"), lived)
+        check(fx("enable", "org.example.beat").get("ok") is True and wait_for(
+              lambda: svc("org.example.beat").get("state") == "running", 40), "enabled, the heartbeat runs again")
+
         print("the API socket: a package's one way to the machine, and the broker behind it")
         jid = "ext org.example.jobtime: "
         check(wait_for(lambda: logged(jid + "api burst"), 40), "the service with the API's use has been through its calls")
-        check(",".join(eff["org.example.jobtime"]) == "hold,job_time.run,machine.read,motion.job",
+        # Its share of the broker: one package holds at most 4 of the 16 connections. Five opened from the heartbeat's
+        # account and left silent: the fifth is closed at once, and another package is answered meanwhile.
+        buid, duid = (800 + int(svc(i)["account"][3:]) for i in ("org.example.beat", "org.example.dial"))
+        r_, w_ = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(r_)
+            os.setgroups([])
+            os.setgid(buid)
+            os.setuid(buid)
+            conns = []
+            for _ in range(5):
+                c = socket.socket(socket.AF_UNIX)
+                c.connect(os.path.join(api_dir, "org.example.beat.sock"))
+                conns.append(c)
+            conns[4].settimeout(2)
+            try:
+                closed = conns[4].recv(1) == b""
+            except OSError:
+                closed = False
+            os.write(w_, b"1" if closed else b"0")
+            time.sleep(3)                               # the four stay open, silent, while the other package is asked
+            os._exit(0)
+        os.close(w_)
+        fifth = os.read(r_, 1)
+        os.close(r_)
+
+        def self_of_dial():
+            # The dialer's own rate is untouched here, where jobtime's burst has just spent jobtime's.
+            c = socket.socket(socket.AF_UNIX)
+            c.settimeout(3)
+            c.connect(os.path.join(api_dir, "org.example.dial.sock"))
+            c.sendall(b"GET /v0/self HTTP/1.1\r\nHost: forgeext\r\n\r\n")
+            if not c.recv(64).startswith(b"HTTP/1.1 200"):
+                raise OSError(errno.EPROTO, "not answered")
+
+        other = as_account(duid, self_of_dial)
+        os.waitpid(child, 0)
+        check(fifth == b"1" and other == "ok", "five silent connections from one package: the fifth closed at once (%s), "
+              "and another package answered meanwhile (%s)", fifth, other)
+        check(",".join(eff["org.example.jobtime"]) == "hold,job_time.run,machine.read,mcode:170,motion.job",
               "the list and the socket must answer alike, and the list says %s", eff["org.example.jobtime"])
-        check(logged(jid + "api self 200 org.example.jobtime 0.1 hold,job_time.run,machine.read,motion.job"),
+        check(logged(jid + "api self 200 org.example.jobtime 0.1 hold,job_time.run,machine.read,mcode:170,motion.job"),
               "GET /v0/self: who it is, the API's version, and what it may use (the grants it got, the capabilities that need none)")
         check(logged(jid + "api mode 200 grbl verified"), "GET /v0/machine/mode: forgectrl's answer, relayed")
         check(logged(jid + "api nowhere 404") and logged(jid + "api bad hold 400"), "a path the API does not have, and a hold in no form")
@@ -648,7 +859,7 @@ def main():
         check(logged("org.example.jobtime: it raised its hold: through the job"), "the host's log says who raised what")
         burst = [l for l in open(log_path).read().splitlines() if jid + "api burst" in l]
         ok, limited = (int(burst[0].split("api burst ")[1].split()[0]), int(burst[0].split(" ok ")[1].split()[0])) if burst else (0, 0)
-        check(ok + limited == 60 and 1 <= limited and ok <= 30, "sixty requests at once: %d answered, %d told to slow down", ok, limited)
+        check(ok + limited == 60 and 1 <= limited and ok <= 30, "sixty requests in a row: %d answered, %d told to slow down", ok, limited)
         check(logged("ext org.example.dial: api without the capabilities: mode 403 hold 403 raise 403"),
               "a package that holds neither capability gets 403 three times")
 
@@ -684,8 +895,8 @@ def main():
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(3)
         c.connect(sock)
-        c.sendall(b"GET /v0/self HTTP/1.1\r\n\r\n")
-        try:
+        try:                                            # the host may close it before the request is even sent
+            c.sendall(b"GET /v0/self HTTP/1.1\r\n\r\n")
             got = c.recv(4096)
         except OSError:
             got = b""
@@ -732,6 +943,23 @@ def main():
         check(wait_for(lambda: not svc("org.example.beat").get("frozen") and "frozen 0" in cg("org.example.beat", "cgroup.events"), 6)
               and cg("org.example.jobtime", "cpu.max").split() == ["25000", "100000"] and len(running()) >= before,
               "disarmed: thawed, and the grant's limits lifted")
+        # status.json names an M-code only for a service that answers it: running, with the grant, and not frozen.
+        # Its group's cpu.max read-only for one window: the grant's job-time limits cannot be set, the freeze stands
+        # in their place, and its code leaves the list until the window closes.
+        listed = any(c.get("code") == 170 and c.get("id") == "org.example.jobtime" for c in status().get("mcodes", []))
+        jcpu, ro = os.path.join(CG_PARENT, "org.example.jobtime", "cpu.max"), os.path.join(top, "cpu.max.ro")
+        with open(ro, "w") as f:
+            f.write(open(jcpu).read())
+        subprocess.run(["mount", "--bind", ro, jcpu], check=True)
+        subprocess.run(["mount", "-o", "remount,bind,ro", jcpu], check=True)
+        facts["armed"] = True
+        unlisted = wait_for(lambda: svc("org.example.jobtime").get("frozen") and status().get("mcodes") == [], 8)
+        facts["armed"] = False
+        thawed = wait_for(lambda: not svc("org.example.jobtime").get("frozen"), 8)
+        subprocess.run(["umount", jcpu], check=True)
+        check(listed and unlisted and thawed and wait_for(lambda: any(c.get("code") == 170 for c in status().get("mcodes", [])), 5),
+              "the M-code of the one with the grant is listed, not while it is frozen in place of its limits, and again "
+              "after: %s", status().get("mcodes"))
         facts["down"] = True
         check(wait_for(lambda: svc("org.example.beat").get("frozen"), 8) and status().get("armed") is None,
               "forgectrl stops answering: frozen, the window unknown")
@@ -847,9 +1075,22 @@ def main():
 
         print("over its storage quota: set aside, and back once its data is cleared and it is enabled")
         sid = "org.example.store"
-        package(sid, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["storage:1", "net.outbound.operator"])
+        # It closes its standard output and error at once and runs on: the host lets the pipe go at its end rather
+        # than waking at every poll on the hang-up, and its own CPU time shows which.
+        package(sid, "shell", "#!/bin/sh\nprintf 'its last words, no newline\\007'\nexec >/dev/null 2>&1\n"
+                "while true; do sleep 1; done\n", caps=["storage:1", "net.outbound.operator"])
         check(wait_for(lambda: svc(sid).get("state") == "running", 40), "it runs: %s", svc(sid))
         spid = svc(sid).get("pid", 0)
+
+        def cpu_s(pid):
+            f = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()
+            return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
+
+        c0 = cpu_s(daemon.pid)
+        time.sleep(3)
+        check(cpu_s(daemon.pid) - c0 < 0.5 and logged("ext %s: its last words, no newline?" % sid),
+              "a service with its output closed: its last words logged as text, and the host spent %.2f s of CPU in 3 s",
+              cpu_s(daemon.pid) - c0)
         # Just after a measurement, so that the next one, 10 s on, comes after the 2 MiB is there.
         check(wait_for(lambda: walks and time.monotonic() < walks[-1] + 5, 15, poll=0.1), "the host measures")
         blocker = os.path.join(root, "state.json.new")
@@ -907,19 +1148,22 @@ def main():
         check(r.get("ok") is True and wait_for(lambda: svc(sid).get("state") == "running" and svc(sid)["pid"] != spid, 20),
               "its data cleared and enabled again, it runs again: %s %s", r.get("error", ""), svc(sid))
 
-        print("a data directory the host cannot measure is set aside too, and back once it can be")
+        print("a data directory the host cannot measure is set aside too, and back once it can be; a command holding "
+              "the root's lock meanwhile holds up nothing of the host's turn")
         at = mark()
-        os.mkdir(blocker)
+        held_lock = open(os.path.join(root, "lock"), "a")
+        fcntl.flock(held_lock, fcntl.LOCK_EX)           # as an install holds it, through fwup, for as long as it takes
         os.makedirs(os.path.join(root, "data", sid, *["d"] * 18))  # deeper than the 16 directories the host walks
         q = wait_for(lambda: svc(sid).get("state") == "quarantined" and svc(sid), 45, poll=1)
         check(q and "could not be measured" in q.get("reason", "") and wait_for(lambda: since(at, "could not be written"), 5),
-              "18 directories deep: set aside, in words that say why, and unwritten: %s", q or svc(sid))
+              "18 directories deep, the root's lock held by another: set aside, in words that say why, and unwritten, "
+              "the host's turn not waiting on the lock: %s", q or svc(sid))
         # The operator clears it, then enables it, before the host's next turn: the enable lifts the quarantine the
         # host has not written, and the host does not write it over the enable.
         at = mark()
+        held_lock.close()
         paused = pause_clear_of_lock()
         try:
-            os.rmdir(blocker)
             shutil.rmtree(os.path.join(root, "data", sid, "d"))
             r = fx("enable", sid) if paused else {"error": "the host held the lock"}
         finally:
@@ -1022,7 +1266,7 @@ def main():
         with open(state_path, "w") as f:
             f.write("not a state\n")
         at = mark()
-        daemon = start_daemon()
+        daemon = start_daemon(grace=True)               # it runs through the cases inside the shutdown grace below
         check(wait_for(lambda: status().get("pid") == daemon.pid, 15)
               and wait_for(lambda: since(at, "nothing is changed until it reads"), 10)
               and not since(at, "set aside before the host last stopped") and os.path.isfile(kept) and os.path.isfile(lifted),
@@ -1039,7 +1283,10 @@ def main():
               and wait_for(lambda: not os.path.exists(lifted), 5),
               "a kept record the operator lifted since is taken up, let go at the first turn, and dropped with the lift: %s",
               kept_ones())
-        check(wait_for(lambda: svc(uid_).get("state") != "quarantined" or svc(uid_).get("pid"), 12, poll=0.5) is None
+        # The status the host writes at the end of a turn whose sync could not read the state lists no service at all:
+        # the 12 s are counted from a status that lists this one, set aside.
+        listed = wait_for(lambda: svc(uid_).get("state") == "quarantined", 10)
+        check(listed and wait_for(lambda: svc(uid_).get("state") != "quarantined" or svc(uid_).get("pid"), 12, poll=0.5) is None
               and not remembered(uid_) and not since(at, "%s: started as" % uid_) and "may hold" in svc(uid_).get("reason", ""),
               "unwritten for 12 s under the new host: still set aside with no process and never started, state.json "
               "does not say so, and the reason is the one it was set aside for: %s", svc(uid_))
@@ -1069,45 +1316,6 @@ def main():
                        and svc("org.example.beat")["pid"] not in (0, old), 20),
               "the heartbeat runs again, from the new install")
 
-        print("destinations the operator names")
-        oid, where = "org.example.opdial", "%s:%d" % (PEER_ADDR, pport)
-        at = mark()
-        package(oid, "python", OPDIAL, caps=["net.outbound.operator"], args=[PEER_ADDR, str(pport)])
-        check(wait_for(lambda: since(at, "ext %s: opdial self 200 []" % oid), 30),
-              "it runs, and may reach nothing: no destination is named")
-        check(wait_for(lambda: since(at, "ext %s: opdial dial errno" % oid), 10) and not since(at, "opdial dial ok"),
-              "and it does not reach the peer")
-        first = svc(oid).get("pid")
-        for args, words in (((oid, "add", "127.0.0.1:80"), "is this machine"),
-                            ((oid, "add", "peer.test"), "a destination is host:port"),
-                            ((oid, "remove", where), "is not one of the destinations"),
-                            (("org.example.dial", "add", where), "does not ask for destinations"),
-                            (("org.example.nothere", "add", where), "is not installed")):
-            r = fx("dest", *args)
-            check(r.get("ok") is False and words in r.get("error", ""), "dest %s -> %s", " ".join(args), r.get("error"))
-        at = mark()
-        r = fx("dest", oid, "add", where)
-        check(r.get("ok") is True and r.get("destinations") == [where], "the operator names the peer: %s", r)
-        check(fx("dest", oid, "add", where).get("ok") is False, "the same destination twice is refused")
-        listed = {x["id"]: x.get("destinations") for x in fx("list").get("packages", [])}
-        check(listed.get(oid) == [where] and listed.get("org.example.dial") == [], "the list names them: %s", listed)
-        check(wait_for(lambda: since(at, "ext %s: opdial self 200 [%s]" % (oid, where)), 30),
-              "it is started again with its new way out, and its own answer names it")
-        check(wait_for(lambda: since(at, "ext %s: opdial dial ok" % oid), 10), "and it reaches the peer")
-        s = svc(oid)
-        check(s.get("state") == "running" and s.get("pid") != first
-              and since(at, "%s: stopping (started again: it was installed again, or its destinations changed)" % oid),
-              "a new process, said in the log, and no crash: %s", s)
-        at = mark()
-        r = fx("dest", oid, "remove", where)
-        check(r.get("ok") is True and r.get("destinations") == [], "the operator takes it away: %s", r)
-        check(wait_for(lambda: since(at, "ext %s: opdial self 200 []" % oid), 30)
-              and wait_for(lambda: since(at, "ext %s: opdial dial errno" % oid), 10),
-              "started again, it reaches nothing again")
-        st = json.load(open(os.path.join(root, "state.json")))["packages"][oid]
-        check(st.get("destinations") == [] and not st.get("quarantined"), "state.json: %s", st)
-        check(fx("remove", oid).get("ok") is True and wait_for(lambda: oid not in running(), 10), "and it goes")
-
         print("the host's own word on the armed window, to a service with the grant")
         wid = "org.example.watch"
         package(wid, "python", LIFE, caps=["events", "job_time.run"], grants=["job_time.run"])
@@ -1127,6 +1335,9 @@ def main():
         check(fx("remove", wid).get("ok") is True and wait_for(lambda: wid not in running(), 10), "and it goes")
 
         print("the host's own word before it stops a service")
+        # The others are out of the way for this one's restarts out of safe mode: started alone, it starts at once.
+        for id_ in ("org.example.beat", "org.example.dial", "org.example.jobtime"):
+            check(fx("disable", id_).get("ok") is True, "%s disabled for the cases below", id_)
         lid_ = "org.example.life"
         package(lid_, "python", LIFE, caps=["events"])
         check(wait_for(lambda: svc(lid_).get("state") == "running" and os.path.exists(os.path.join(root, "data", lid_, "ready")),
@@ -1145,9 +1356,23 @@ def main():
         check(not since(at, "%s: frozen for the armed window" % lid_),
               "nobody is frozen in that last second for a window that is not open")
         os.unlink(safe)
+        # Inside the grace (held open here for 4 s, where the machine's is 1 s) an armed window still freezes what is
+        # left running, and so does a window that cannot be read: the stand-in not answering. The grace asks for the
+        # window on its own (machine_armed), so this is the one case of that question unanswered.
+        for what, key in (("an armed window", "armed"), ("a machine that does not answer", "down")):
+            check(wait_for(lambda: svc(lid_).get("state") == "running", 40), "out of safe mode it runs again: %s", svc(lid_))
+            open(safe, "w").close()
+            facts[key] = True
+            frozen = wait_for(lambda: "frozen 1" in cg(lid_, "cgroup.events") and svc(lid_).get("state") == "running", 3,
+                              poll=0.1)
+            check(frozen, "safe mode and %s inside the grace: the service is frozen before it is stopped: %s", what,
+                  svc(lid_))
+            check(wait_for(lambda: svc(lid_).get("state") != "running", 10), "and stopped at the grace's end: %s", svc(lid_))
+            facts[key] = False
+            os.unlink(safe)
         check(fx("remove", lid_).get("ok") is True, "and it goes")
-        check(wait_for(lambda: all(s_ in running() for s_ in ("org.example.beat", "org.example.dial", "org.example.jobtime")),
-                       40), "out of safe mode the others run again: %s", running())
+        for id_ in ("org.example.beat", "org.example.dial", "org.example.jobtime"):
+            check(fx("enable", id_).get("ok") is True, "%s enabled again", id_)
 
         print("the operator's switch for one package")
         r = fx("disable", "org.example.crash")
@@ -1203,13 +1428,16 @@ def main():
         check(stale and stale["age"] > 2.0 and stale["required"], "a killed host's required hold stays and goes stale, which "
               "is what forgectrl holds on: %s", stale)
         alive = [i for i, pid in mine.items() if os.path.exists("/proc/%d" % pid)]
+        groups = [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))]
         chains = subprocess.run([NFT, "list", "chains", "inet"], capture_output=True, text=True).stdout
-        check(alive and "chain u8" in chains, "a killed daemon leaves its services running and their chains in place "
-              "(what the sweep is for): alive %s", alive)
+        # A service that writes to its log ends at its next line once the host that read the pipe is gone (SIGPIPE, as
+        # any program started anew has it); one that writes nothing runs on. Either way its group and its chain stay.
+        check(groups and "chain u8" in chains, "a killed daemon leaves its services' groups and their chains in place "
+              "(what the sweep is for): groups %s, still running %s", groups, alive)
         with open(conf, "w") as f:
             f.write("ext_enabled=0\n")                    # the next daemon starts nothing: what ends them is the sweep
         at = mark()
-        daemon = start_daemon()
+        daemon = start_daemon(grace=True)               # its own stop, at the end, waits the machine's second all the same
         check(wait_for(lambda: since(at, "a previous extension host left"), 15), "the next daemon says what it found")
         check(wait_for(lambda: status().get("pid") == daemon.pid, 10), "and the status file is the new host's word")
         check(since(at, "%s: current cannot be turned to 1.0.0" % notree) and daemon.poll() is None
@@ -1238,6 +1466,181 @@ def main():
 
         check(wait_for(lambda: held("org.example.crash") is not None, 10), "on again: the required hold has its file again")
 
+        # Room for the starts below, under the cap of four running.
+        for id_ in ("org.example.crash", "org.example.dial", "org.example.beat", "org.example.jobtime"):
+            check(fx("disable", id_).get("ok") is True, "%s disabled for the cases below", id_)
+
+        print("a predecessor's removal put off by the root's lock is taken up once the lock is let go")
+        # Version 2 of a package turns healthy, 60 s after its start, while the test holds the root's lock: the
+        # removal of version 1 is put off, and it goes at the first turn after the lock is let go. (That the
+        # removal takes only the predecessor of the install it was put off for is super_test's.) The cases below
+        # run while it waits; the lock is taken once the unanswered-name case has installed its package, whose own
+        # waits need no lock, and 56 s on at the latest.
+        loop = "#!/bin/sh\nwhile true; do sleep 1; done\n"
+        upd2 = "org.example.updated2"
+        package(upd2, "shell", loop, version="1.0.0")
+        package(upd2, "shell", loop, version="2.0.0")
+        upd2pkg = os.path.join(root, "pkg", upd2)
+        # Running before the cases below take the starts.
+        check(wait_for(lambda: svc(upd2).get("state") == "running", 30), "version 2 runs: %s", svc(upd2))
+        upd_started = time.monotonic()
+        upd_result = {}
+        lock_free = threading.Event()
+
+        def hold_across_healthy():
+            lock_free.wait(max(0.0, upd_started + 56 - time.monotonic()))
+            with open(os.path.join(root, "lock"), "a") as lf:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                upd_result["held_at"] = time.monotonic() - upd_started
+                upd_result["healthy"] = wait_for(lambda: svc(upd2).get("healthy"), 40)
+                time.sleep(1.5)                     # past the turn that put the removal off
+                upd_result["v1_kept_meanwhile"] = os.path.isdir(os.path.join(upd2pkg, "1.0.0"))
+                fcntl.flock(lf, fcntl.LOCK_UN)
+
+        holder = threading.Thread(target=hold_across_healthy, daemon=True)
+        holder.start()
+
+        print("destinations the operator names")
+        # While the predecessor case waits for its healthy mark (its own thread), with room under the cap.
+        oid, where = "org.example.opdial", "%s:%d" % (PEER_ADDR, pport)
+        at = mark()
+        package(oid, "python", OPDIAL, caps=["net.outbound.operator"], args=[PEER_ADDR, str(pport)])
+        check(wait_for(lambda: since(at, "ext %s: opdial self 200 []" % oid), 30),
+              "it runs, and may reach nothing: no destination is named")
+        check(wait_for(lambda: since(at, "ext %s: opdial dial errno" % oid), 10) and not since(at, "opdial dial ok"),
+              "and it does not reach the peer")
+        first = svc(oid).get("pid")
+        for args, words in (((oid, "add", "127.0.0.1:80"), "is this machine"),
+                            ((oid, "add", "peer.test"), "a destination is host:port"),
+                            ((oid, "remove", where), "is not one of the destinations"),
+                            (("org.example.dial", "add", where), "does not ask for destinations"),
+                            (("org.example.nothere", "add", where), "is not installed")):
+            r = fx("dest", *args)
+            check(r.get("ok") is False and words in r.get("error", ""), "dest %s -> %s", " ".join(args), r.get("error"))
+        at = mark()
+        r = fx("dest", oid, "add", where)
+        check(r.get("ok") is True and r.get("destinations") == [where], "the operator names the peer: %s", r)
+        check(fx("dest", oid, "add", where).get("ok") is False, "the same destination twice is refused")
+        listed = {x["id"]: x.get("destinations") for x in fx("list").get("packages", [])}
+        check(listed.get(oid) == [where] and listed.get("org.example.dial") == [], "the list names them: %s", listed)
+        check(wait_for(lambda: since(at, "ext %s: opdial self 200 [%s]" % (oid, where)), 30),
+              "it is started again with its new way out, and its own answer names it")
+        check(wait_for(lambda: since(at, "ext %s: opdial dial ok" % oid), 10), "and it reaches the peer")
+        s = svc(oid)
+        check(s.get("state") == "running" and s.get("pid") != first
+              and since(at, "%s: stopping (started again: it was installed again, or its destinations changed)" % oid),
+              "a new process, said in the log, and no crash: %s", s)
+        at = mark()
+        r = fx("dest", oid, "remove", where)
+        check(r.get("ok") is True and r.get("destinations") == [], "the operator takes it away: %s", r)
+        check(wait_for(lambda: since(at, "ext %s: opdial self 200 []" % oid), 30)
+              and wait_for(lambda: since(at, "ext %s: opdial dial errno" % oid), 10),
+              "started again, it reaches nothing again")
+        st = json.load(open(os.path.join(root, "state.json")))["packages"][oid]
+        check(st.get("destinations") == [] and not st.get("quarantined"), "state.json: %s", st)
+        # A name the operator types may lead into the machine's own network: the operator chose that host.
+        at = mark()
+        check(fx("dest", oid, "add", "broker.lan:1883").get("ok") is True, "the operator names broker.lan:1883")
+        ouid = 800 + int(svc(oid).get("account", "ffx0")[3:])
+        check(wait_for(lambda: since(at, "ext %s: opdial self 200 [broker.lan:1883]" % oid), 30)
+              and "ip daddr 192.168.1.20 tcp dport 1883 accept" in subprocess.run(
+                  [NFT, "list", "chain", "inet", "ffx", "u%d" % ouid], capture_output=True, text=True).stdout,
+              "a LAN name the operator typed is taken: started with it, as the address it answers (192.168.1.20)")
+        check(fx("remove", oid).get("ok") is True and wait_for(lambda: oid not in running(), 10), "and it goes")
+
+        print("a listener opens only with the operator's grant, read at each start")
+        lis = "org.example.listen"
+        package(lis, "python", "import json, os, socket, time\ns = socket.socket()\ntry:\n    s.bind(('0.0.0.0', 18765))\n"
+                "    word = 'ok'\nexcept OSError as e:\n    word = e.errno\nopen(os.path.join(os.environ['FFX_DATA'], 'bound.%d' % "
+                "os.getpid()), 'w').write(json.dumps(word))\nwhile True:\n    time.sleep(1)\n",
+                caps=["net.listen:18765"], grants=["net.listen:18765"])
+
+        def bound():
+            pid_ = svc(lis).get("pid") or 0
+            try:
+                return json.load(open(os.path.join(root, "data", lis, "bound.%d" % pid_)))
+            except (OSError, ValueError):
+                return None
+
+        def listen_rule():
+            luid = 800 + int(svc(lis).get("account", "ffx0")[3:])
+            return "sport 18765" in subprocess.run([NFT, "list", "chain", "inet", "ffx", "u%d" % luid], capture_output=True,
+                                                   text=True).stdout
+
+        check(wait_for(lambda: bound() == "ok", 40) and listen_rule(), "granted: it binds its port, and the table answers "
+              "from it: %s", bound())
+        check(fx("disable", lis).get("ok") is True and wait_for(lambda: svc(lis).get("state") != "running", 10), "disabled")
+        with open(os.path.join(root, "lock"), "a") as lf:  # the record as an install made before the grant existed
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            sp = os.path.join(root, "state.json")
+            state_ = json.load(open(sp))
+            state_["packages"][lis]["grants"] = [g for g in state_["packages"][lis]["grants"] if not g.startswith("net.listen")]
+            with open(sp + ".test", "w") as f:
+                json.dump(state_, f)
+            os.rename(sp + ".test", sp)
+        check(fx("enable", lis).get("ok") is True, "enabled again, with no grant")
+        check(wait_for(lambda: bound() == errno.EACCES, 40) and not listen_rule(),
+              "with no grant: its bind is refused (%s) and the table has no rule for the port", bound())
+        check(fx("remove", lis).get("ok") is True, "and it goes")
+
+        print("a start the machine is not ready for counts against nobody; one its own files fail is counted")
+        tam = "org.example.tampered"
+        package(tam, "shell", loop)
+        check(wait_for(lambda: svc(tam).get("state") == "running", 40), "it runs: %s", svc(tam))
+        check(fx("disable", tam).get("ok") is True and wait_for(lambda: svc(tam).get("state") != "running", 10), "disabled")
+        # Its data directory on a full file system (a tmpfs with no inode to spare): the machine's to put right.
+        tdata = os.path.join(root, "data", tam)
+        subprocess.run(["mount", "-t", "tmpfs", "-o", "size=64k,nr_inodes=1", "ffx-full", tdata], check=True)
+        at = mark()
+        check(fx("enable", tam).get("ok") is True, "enabled on a full /data")
+        full = wait_for(lambda: since(at, "%s: not started: the machine is not ready for it" % tam), 20)
+        check(full and since(at, "No space left on device") and not since(at, "%s: it did not start" % tam),
+              "a full /data: not ready, and not counted: %s", svc(tam))
+        check(fx("disable", tam).get("ok") is True, "disabled again")
+        subprocess.run(["umount", tdata], check=True)
+        with open(os.path.join(root, "pkg", tam, "1.0.0", "bin", "run.sh"), "a") as f:
+            f.write("# changed by hand\n")
+        check(fx("enable", tam).get("ok") is True, "enabled again")
+        bad = wait_for(lambda: "did not start" in svc(tam).get("reason", "") and dict(svc(tam)), 20)
+        check(bad and "changed since it was installed" in bad.get("reason", "") and "not ready" not in bad.get("reason", ""),
+              "its tree changed by hand: a start that fails for the package's own reason, counted toward its quarantine: %s",
+              bad or svc(tam))
+        check(fx("remove", tam).get("ok") is True, "and it goes")
+        # The same LAN name the operator may type, named in a manifest: refused, the machine's to put right.
+        lan = "org.example.lanname"
+        at = mark()
+        package(lan, "python", "import time\nwhile True:\n    time.sleep(1)\n", caps=["net.outbound:broker.lan:1883"])
+        check(wait_for(lambda: since(at, "%s: not started: the machine is not ready for it (broker.lan answers "
+                                         "192.168.1.20, a private or local address" % lan), 30),
+              "a LAN name in a manifest is refused: %s", svc(lan))
+        check(fx("remove", lan).get("ok") is True, "and it goes")
+        # The namespace's resolver takes every query and answers none. The start is put off while the name is looked
+        # up (the turn goes on), and not ready once the lookup has had its 5 s; never counted. Once the package is
+        # installed these waits need no lock, so the predecessor case's hold of the root's lock runs over them.
+        una = "org.example.unanswered"
+        at = mark()
+        package(una, "python", "import time\nwhile True:\n    time.sleep(1)\n", caps=["net.outbound:nowhere.test:443"])
+        lock_free.set()
+        looking = wait_for(lambda: "not started yet: looking up nowhere.test" in svc(una).get("reason", ""), 30, poll=0.1)
+        unanswered = wait_for(lambda: since(at, "%s: not started: the machine is not ready for it (cannot resolve "
+                                                "nowhere.test: the resolver did not answer in 5 s)" % una), 30)
+        state_ = svc(una)
+        check(looking and unanswered and state_.get("state") == "waiting" and not since(at, "%s: it did not start" % una)
+              and json.load(open(os.path.join(root, "state.json")))["packages"][una]["quarantined"] is False,
+              "a name the resolver never answers: put off while it is looked up, then not ready, never counted: %s, %s, %s",
+              looking, unanswered, state_)
+
+        holder.join(timeout=100)
+        check(not holder.is_alive() and upd_result.get("healthy") and upd_result.get("v1_kept_meanwhile"),
+              "version 2 healthy under the held lock, its predecessor's removal put off: %s", upd_result)
+        check(wait_for(lambda: not os.path.isdir(os.path.join(upd2pkg, "1.0.0")), 5)
+              and os.path.isdir(os.path.join(upd2pkg, "2.0.0")),
+              "the lock let go, the removal put off is taken up: version 1 goes, version 2 stays: %s",
+              sorted(os.listdir(upd2pkg)))
+        check(fx("remove", una).get("ok") is True and fx("remove", upd2).get("ok") is True, "and they go")
+        for id_ in ("org.example.crash", "org.example.dial", "org.example.beat", "org.example.jobtime"):
+            check(fx("enable", id_).get("ok") is True, "%s enabled again", id_)
+
         print("safe mode, and the end")
         open(safe, "w").close()
         check(wait_for(lambda: not running() and "safe mode" in status().get("off_reason", ""), 10), "safe mode stops everything")
@@ -1247,12 +1650,16 @@ def main():
         check(not left and "chain u8" not in chains, "no group and no chain stays behind: %s", left)
         os.unlink(safe)
         check(wait_for(lambda: len(running()) >= 1, 20), "out of safe mode they start again")
+        t_term = time.monotonic()
         daemon.send_signal(signal.SIGTERM)
         rc = daemon.wait(timeout=30)
+        took = time.monotonic() - t_term
         left = [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))]
         chains = subprocess.run([NFT, "list", "table", "inet", "ffx"], capture_output=True, text=True).stdout
         check(rc == 0 and not left and "chain u8" not in chains and not running(),
               "SIGTERM: exit %s, groups left %s, the status says nothing runs", rc, left)
+        # No turn runs in the host's own last wait, so it is the machine's second, whatever its grace (4 s here) says.
+        check(1.0 <= took < 3.0, "its own stop waited the machine's second, not its grace: %.1f s", took)
         check(not os.listdir(api_dir), "and no API socket: %s", os.listdir(api_dir))
         check(os.listdir(holds_dir) == ["org.example.crash.json"], "a clean stop takes the advisory hold's file and leaves the "
               "required one to go stale: %s", os.listdir(holds_dir))
@@ -1271,10 +1678,10 @@ def main():
         with open(launcher, "w") as f:
             f.write("#!/bin/sh\nexec env FFLOG_STDERR=1 FFLOG_SOCK=/nonexistent FORGEEXT_HOST_TOKEN_FILE=%s %s --root %s "
                     "--fwup %s --nft %s \"$@\" --conf %s --safe-file %s --forgectrl 127.0.0.1:%d --cg-parent %s "
-                    "--run-dir %s --holds-dir %s --api-dir %s\n"
+                    "--run-dir %s --holds-dir %s --api-dir %s --call-dir %s\n"
                     % (shlex.quote(token_file), shlex.quote(FORGEEXT), shlex.quote(root), shlex.quote(FWUP),
                        shlex.quote(NFT), shlex.quote(conf), shlex.quote(safe), fport, shlex.quote(CG_PARENT),
-                       shlex.quote(run_dir), shlex.quote(holds_dir), shlex.quote(api_dir)))
+                       shlex.quote(run_dir), shlex.quote(holds_dir), shlex.quote(api_dir), shlex.quote(call_dir)))
         os.chmod(launcher, 0o755)
         os.mkfifo(fifo, 0o600)
         with open(script, "w") as f:
@@ -1294,14 +1701,80 @@ def main():
         check(wait_for(lambda: svc(beat).get("state") == "running" and svc(beat).get("pid") not in (None, beat1), 40),
               "and the heartbeat runs again under a new pid: %s, was %d", svc(beat).get("pid"), beat1)
         host2 = status().get("pid", 0)
+        os.kill(host2, signal.SIGTERM)                  # a stray TERM of the host, not of its wrapper: it ends with 0
+        check(wait_for(lambda: status().get("pid") not in (None, host2) and os.path.exists("/proc/%d" % status()["pid"]), 30),
+              "a host ended by a TERM of its own (pid %d) is started again by the wrapper: pid %s", host2, status().get("pid"))
+        host2 = status().get("pid", 0)
         wrapper.send_signal(signal.SIGTERM)
         wrapper.wait(timeout=10)
         check(wait_for(lambda: not os.path.exists("/proc/%d" % host2), 30)
               and wait_for(lambda: not [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))], 10),
               "stopping the wrapper stops the host (pid %d) and its services: groups %s", host2,
               [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))])
-        check(time.time() - t0 < 400, "the whole run took %.0f s", time.time() - t0)
+        print("the init script itself: a second start, a stray TERM of the host, a stop with the wrapper gone")
+        # The script with its four paths moved under this run, and a stand-in for the host that sleeps until a TERM.
+        idir = os.path.join(top, "init")
+        os.makedirs(os.path.join(idir, "pool"))
+        with open(os.path.join(idir, "host.c"), "w") as f:
+            f.write("#include <signal.h>\n#include <unistd.h>\nstatic void done(int s) { (void)s; _exit(0); }\n"
+                    "int main(void) { signal(SIGTERM, done); for (;;) pause(); }\n")
+        stand_in = os.path.join(idir, "forgeext")
+        built = subprocess.run(["cc", "-o", stand_in, os.path.join(idir, "host.c")], capture_output=True).returncode == 0
+        script_ = open(os.path.join(HERE, "..", "init", "forgeext.init")).read()
+        for name, value in (("DAEMON", stand_in), ("PIDFILE", os.path.join(idir, "forgeext.pid")),
+                            ("FIFO", os.path.join(idir, "forgeext.stderr")), ("POOL", os.path.join(idir, "pool"))):
+            script_ = re.sub(r"(?m)^%s=.*$" % name, "%s=%s" % (name, value), script_)
+        init_sh = os.path.join(idir, "forgeext.init")
+        with open(init_sh, "w") as f:
+            f.write(script_)
+
+        def stand_ins():
+            pids = []
+            for d in os.listdir("/proc"):
+                try:
+                    if d.isdigit() and os.readlink("/proc/%s/exe" % d) == stand_in:
+                        pids.append(int(d))
+                except OSError:
+                    pass
+            return pids
+
+        def fifo_inode():
+            try:
+                return os.stat(os.path.join(idir, "forgeext.stderr")).st_ino
+            except OSError:
+                return None
+
+        def init(*args):
+            return subprocess.run(["sh", init_sh] + list(args), capture_output=True, text=True, timeout=40).stdout
+
+        init("start")
+        h1 = wait_for(lambda: stand_ins(), 10) or []
+        ino1 = fifo_inode()
+        said = init("start")
+        check(built and h1 and "already running" in said and fifo_inode() == ino1 and stand_ins() == h1,
+              "a second start finds the wrapper and touches nothing: %r, fifo %s then %s, host %s then %s", said.strip(),
+              ino1, fifo_inode(), h1, stand_ins())
+        if h1:
+            os.kill(h1[0], signal.SIGTERM)
+        h2 = wait_for(lambda: [p for p in stand_ins() if p not in h1], 15) or []
+        check(h2, "a stray TERM of the host: the wrapper starts it again: %s", stand_ins())
+        try:
+            os.kill(int(open(os.path.join(idir, "forgeext.pid")).read()), signal.SIGKILL)  # the wrapper gone, its host left
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.5)
+        t_stop = time.monotonic()
+        init("stop")
+        check(not stand_ins() and time.monotonic() - t_stop < 10, "a stop with the wrapper gone sends the host its TERM: "
+              "%s left after %.1f s", stand_ins(), time.monotonic() - t_stop)
+        for p_ in stand_ins():
+            os.kill(p_, signal.SIGKILL)
+        # The killed wrapper's logger relay holds its fifo open and so outlives it: the test ends it.
+        kill_relays(idir)
+        check(wait_for(lambda: not relays(idir), 5), "the killed wrapper's relay is ended: %s", relays(idir))
+        print("the whole run took %.0f s" % (time.time() - t0))
     finally:
+        kill_relays(top)                                # a logger relay a wrapper left, on any path out
         if daemon.poll() is None:
             daemon.kill()
         if wrapper is not None and wrapper.poll() is None:
@@ -1323,10 +1796,14 @@ def main():
                     os.rmdir(p)
                 except OSError:
                     pass
-        try:
-            os.rmdir(CG_PARENT)
-        except OSError:
-            pass
+        for g in (CG_PARENT + "-side", CG_PARENT):
+            try:
+                if g.endswith("-side") and os.path.isdir(g):
+                    open(g + "/cgroup.kill", "w").write("1")
+                    time.sleep(0.3)
+                os.rmdir(g)
+            except OSError:
+                pass
         peer.stdin.close()
         server.shutdown()
         shutil.rmtree(top, ignore_errors=True)

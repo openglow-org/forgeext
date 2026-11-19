@@ -53,10 +53,18 @@ kill_pool() {
 
 case "$1" in
   start)
+    # A wrapper that runs already keeps its fifo: making a new one under it
+    # would leave its next respawn writing where nobody reads.
+    if start-stop-daemon -K -t -q -p $PIDFILE -x /bin/sh 2>/dev/null; then
+      echo "forgeext is already running"
+      exit 0
+    fi
     echo "Starting forgeext"
     rm -f "$FIFO"
     mkfifo -m 600 "$FIFO"
     start-stop-daemon -S -q -p $PIDFILE -m -b -x /bin/sh -- -c "
+      # Its own TERM is the one way it ends: whatever else ends the host,
+      # a stray TERM of the host's own included, it is started again.
       trap 'kill \$CHILD \$RELAY 2>/dev/null; exit 0' TERM
       # The wrapper must survive memory pressure to respawn the host; the
       # host outranks every service it runs (they are at 900) and ranks
@@ -69,7 +77,6 @@ case "$1" in
         CHILD=\$!
         wait \$CHILD
         RC=\$?
-        [ \$RC -eq 0 ] && { kill \$RELAY 2>/dev/null; exit 0; }
         for k in $POOL/*/cgroup.kill; do
           [ -e \"\$k\" ] && echo 1 > \"\$k\" 2>/dev/null
         done
@@ -83,7 +90,11 @@ case "$1" in
     echo "Stopping forgeext"
     start-stop-daemon -K -q -p $PIDFILE
     # The wrapper passes the TERM on and the host stops its services
-    # before it ends: give it the time, then take what is left.
+    # before it ends; a host whose wrapper is gone is told the same way.
+    # Give it the time, then take what is left.
+    for p in $(hosts); do
+      kill -TERM $p 2>/dev/null
+    done
     n=0
     while [ -n "$(hosts)" ] && [ $n -lt 20 ]; do
       sleep 1

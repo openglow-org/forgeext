@@ -14,6 +14,7 @@
 
 #include <jansson.h>
 #include <stdio.h>
+#include <sys/inotify.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -106,8 +107,24 @@ int main(void)
     CHECK(look("org.example.filter", &req, &up, why, sizeof(why), &age) && !req && up &&
           !strcmp(why, "filter life under 5 percent"), "the advisory hold is on disk at once");
 
-    /* the thread keeps them fresh between the main loop's turns */
+    /* the thread keeps them fresh between the main loop's turns, a write
+     * each HOLDKEEP_PERIOD_MS and no more often: on one core a keeper that
+     * did not sleep would take the core from everything else */
+    int ino = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    CHECK(ino >= 0 && inotify_add_watch(ino, dir, IN_MOVED_TO) >= 0, "a watch on the holds directory");
     nap(1.2);
+    int writes = 0;
+    char evbuf[4096];
+    ssize_t got;
+    while ((got = read(ino, evbuf, sizeof(evbuf))) > 0)
+        for (char *q = evbuf; q < evbuf + got;) {
+            struct inotify_event *ev = (struct inotify_event *)q;
+            writes += ev->len && strcmp(ev->name, "org.example.badge.json") == 0;      /* one rename into place per write */
+            q += sizeof(*ev) + ev->len;
+        }
+    close(ino);
+    CHECK(writes >= 1 && writes <= 1200 / HOLDKEEP_PERIOD_MS + 2,
+          "%d writes of one hold in 1.2 s, at a period of %d ms", writes, HOLDKEEP_PERIOD_MS);
     CHECK(look("org.example.badge", &req, &up, why, sizeof(why), &age) && age < 0.9, "kept fresh between turns: age %.2f", age);
     /* a main loop that goes silent: the files stop */
     nap(2.5);

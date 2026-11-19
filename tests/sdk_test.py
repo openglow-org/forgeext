@@ -215,6 +215,8 @@ def main():
     os.chmod(top, 0o755)
     root, run_dir, conf, safe = (os.path.join(top, n) for n in ("root", "run", "forgefirm.conf", "ext-safe"))
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
+    # Shared, as the image's root mount is: the host starts no service where a namespace would keep the mounts.
+    subprocess.run(["mount", "--make-rshared", "/"], check=True)
     subprocess.run([NFT, "-f", RULES], check=True)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Forgectrl)
     fport = server.server_address[1]
@@ -222,6 +224,8 @@ def main():
     os.makedirs(CG_PARENT, exist_ok=True)
     with open(CG_PARENT + "/cgroup.subtree_control", "w") as f:
         f.write("+cpu +memory +pids")
+    with open(CG_PARENT + "/cpu.idle", "w") as f:       # an idle group, as the image's ffx is
+        f.write("1")
 
     def fx(*args):
         p = subprocess.run([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "--no-reserve"] + list(args),

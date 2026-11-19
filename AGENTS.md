@@ -18,8 +18,9 @@ space with the cooling engine and the supervisor.
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Werror
 cmake --build build
-./build/caps_test && ./build/manifest_test && ./build/state_test && ./build/super_test && ./build/holdkeep_test
-./build/httpreq_test && ./build/api_test
+./build/caps_test && ./build/manifest_test && ./build/version_test && ./build/state_test && ./build/super_test
+./build/holdkeep_test && ./build/httpreq_test && ./build/api_test && ./build/evfeed_test && ./build/lookups_test
+./build/settings_test && ./build/quota_test && sudo ./build/quota_test
 FWUP=/path/to/fwup python3 -B tests/install_test.py
 sudo ./build/sandbox_test
 sudo FORGEEXT=build/forgeext python3 -B tests/netrules_test.py
@@ -37,14 +38,18 @@ runs the kit's three service clients (`sdk/python/ffx.py`, `sdk/sh/ffx.sh`,
 
 A warning is a failure. `tests/install_test.py` drives the built binary
 against real archives made with fwup and throwaway keys, hostile ones
-included; it needs fwup 1.x and exits 77 without it. `sandbox_test` starts a
+included; it needs fwup 1.x and exits 77 without it, and preloads the
+build's `race_hook.so` into a wipe to race its removal. `sandbox_test` starts a
 real child under the launcher and looks at it from inside and from outside;
 it needs root and cgroup v2 and exits 77 without them. What it cannot see on
 a kernel without landlock's TCP rules (ABI 4) it sees on the machine.
 `tests/netrules_test.py` loads the image's rule file (`ffx.nft`, from a
 sibling `forgefirm` checkout or `FFX_RULES`) into a network namespace with a
 peer on a veth pair and drives `net-check`, `net-allow`, and `net-revoke`;
-it needs root, nft, ip, and nsenter. `tests/run_test.py` runs the daemon
+it needs root, nft, ip, and nsenter. `lookups_test` holds the answers table
+those names are looked up in to its bounds, over a stand-in resolver and a
+fake clock (`net_lookup_seams`), and reads a route table of its own as the
+host reads the kernel's (`net_on_link6`). `tests/run_test.py` runs the daemon
 itself in the same kind of namespace, against a stand-in for forgectrl's
 read-only routes and four real packages, a second daemon and a killed one
 included.

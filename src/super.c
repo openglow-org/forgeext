@@ -80,6 +80,11 @@ int super_running(const super_t *sv)
     return n;
 }
 
+int super_answers_mcodes(const svc_t *s)
+{
+    return s->state == SVC_RUNNING && s->job_time && !s->frozen;
+}
+
 static void why(svc_t *s, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 static void why(svc_t *s, const char *fmt, ...)
@@ -341,7 +346,10 @@ void super_tick(super_t *sv, const super_inputs_t *in, double now)
             stop(sv, s, "started again: it was installed again, or its destinations changed");
             continue;
         }
-        if (!s->healthy && now - s->started >= SUPER_HEALTHY_S) {
+        /* Healthy is the install it was started from: one installed anew
+         * inside a window runs on from the old tree until the window
+         * closes, and is not the version whose predecessor may go. */
+        if (!s->healthy && now - s->started >= SUPER_HEALTHY_S && s->conf_started == s->conf_wanted) {
             s->healthy = 1;
             s->backoff_s = 0;
             s->ncrashes = 0;
@@ -368,8 +376,31 @@ void super_tick(super_t *sv, const super_inputs_t *in, double now)
     if (!pick)
         return;
     char err[200] = "";
+    double before = sv->last_start;
     sv->last_start = now;
     pid_t pid = sv->ops->start(sv->ctx, pick, err, sizeof(err));
+    if (pid == SUPER_START_PENDING) {
+        /* Its names are being looked up: nothing is counted, no backoff
+         * grows, the stagger is not spent, and it is tried again a moment
+         * later from the answer. */
+        sv->last_start = before;
+        pick->state = SVC_BACKOFF;
+        pick->next_start = now + SUPER_PENDING_S;
+        why(pick, "not started yet: %s", err);
+        return;
+    }
+    if (pid == SUPER_START_NOT_READY) {
+        /* The machine's fault, not the package's: nothing is counted, and
+         * it waits as long as an end would have it wait. */
+        pick->backoff_s = pick->backoff_s < SUPER_BACKOFF_MIN_S ? SUPER_BACKOFF_MIN_S : pick->backoff_s * 2;
+        if (pick->backoff_s > SUPER_BACKOFF_MAX_S)
+            pick->backoff_s = SUPER_BACKOFF_MAX_S;
+        pick->state = SVC_BACKOFF;
+        pick->next_start = now + pick->backoff_s;
+        why(pick, "not started: the machine is not ready for it (%s); again in %.0f s", err, pick->backoff_s);
+        say(sv, LOG_WARNING, "%s: %s", pick->id, pick->reason);
+        return;
+    }
     if (pid <= 0) {
         char how[240];
         snprintf(how, sizeof(how), "it did not start (%s)", err);

@@ -134,6 +134,23 @@ int ext_ui_html(const ext_env_t *env, const char *id, char **html, size_t *len, 
 /* An installed package's manifest, from its current version. */
 int ext_manifest_of(const ext_env_t *env, const char *id, manifest_t *m, char *err, size_t elen);
 
+/* A package's data directory (and its tmp/), made where missing: root's,
+ * with the package's group, 0770, so that the service writes in it and
+ * cannot open it to another account. What it holds from an install under
+ * another account is handed to this one, entry by entry, through
+ * descriptors and never through a link. Needs root. 0, or -1 with the
+ * reason (errno kept). */
+#define EXT_DATA_DEPTH_MAX 256
+int ext_data_own(const char *datadir, uid_t uid, gid_t gid, char *err, size_t elen);
+
+/* A staging directory under tmp/ (<prefix>.XXXXXX into out), locked for as
+ * long as the caller keeps the returned descriptor open: the root's
+ * preparation removes what is under tmp/ and locked by nobody, once it is
+ * EXT_STAGING_GRACE_S old, as left by a process that ended before it could.
+ * The descriptor, or -1 with the reason. */
+#define EXT_STAGING_GRACE_S 10
+int ext_staging_make(const ext_env_t *env, const char *prefix, char *out, size_t olen, char *err, size_t elen);
+
 /* Does an installed package's tree still match what was installed? */
 int ext_check(const ext_env_t *env, const state_pkg_t *p, char *err, size_t elen);
 
@@ -151,7 +168,13 @@ void ext_unlock(int lock);
  * it reads under the lock: 1, with nothing written, when `still` refuses
  * it or the package is not installed. The operator's enable lets a
  * package out of quarantine (ext_set_enabled). */
-int ext_drop_previous(const ext_env_t *env, const char *id, char *err, size_t elen);
+/* The predecessor `previous` of an installed package goes, and the record
+ * forgets it, while the record is still the install stamped `stamp` and
+ * still names that one as its predecessor: 1, with nothing written, when
+ * a later install wrote the record (whatever predecessor it names), or it
+ * names another or none. */
+int ext_drop_previous(const ext_env_t *env, const char *id, const char *previous, const char *stamp, char *err,
+                      size_t elen);
 int ext_quarantine_if(const ext_env_t *env, const char *id, int (*still)(const state_pkg_t *p, void *arg), void *arg,
                       char *err, size_t elen);
 
@@ -192,6 +215,13 @@ int ext_set_hold_required(const ext_env_t *env, const char *id, int on, char *er
  * started again with its new way out at the host's next turn. 0, or -1
  * with the words. */
 int ext_dest(const ext_env_t *env, const char *id, int add, const char *dest, char *err, size_t elen);
+
+/* Where a package's service may connect, as its start installs it and as
+ * GET /v0/self serves it: its manifest's destinations, then the operator's
+ * when it asks for them, at most EXT_DESTS_MAX in all. The count; out
+ * points into m and p, and *own (when not NULL) is how many of them come
+ * first from the manifest: the rest the operator typed. */
+int ext_reach(const manifest_t *m, const state_pkg_t *p, const char *out[EXT_DESTS_MAX], int *own);
 
 /* <root>/required-holds holds one empty file named after each enabled
  * package whose hold is granted and marked required, and nothing else.
