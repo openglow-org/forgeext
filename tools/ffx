@@ -849,14 +849,123 @@ RECORD_KEYS = ("id", "version", "name", "author", "description", "license", "hom
                "core", "url", "sha256", "size")
 
 
-def archive_manifest(path):
-    """The manifest inside an .ffx: its payload's manifest.json, read out of the archive as it is."""
-    import zipfile
+ENTRY_SIG, ENTRY_META, ENTRY_PAYLOAD = "meta.conf.ed25519", "meta.conf", "data/payload.tar.gz"
+_ZIP_LOCAL, _ZIP_CENTRAL, _ZIP_END, _ZIP_DESC = b"PK\x03\x04", b"PK\x01\x02", b"PK\x05\x06", b"PK\x07\x08"
+# The extra fields the reader accepts: the extended timestamp (0x5455) and Info-ZIP's uid/gid (0x7875), which no
+# reader takes an entry's sizes, name or kind from. Measured: fwup 1.16.0 (libarchive 3.8.5 linked in) writes 0x5455
+# on meta.conf and no other field; libarchive 3.7.2's zip writer, given the fields fwup sets, writes 0x5455 and 0x7875
+# on every entry. Other libarchive releases are not measured. Any other field (zip64's sizes, Info-ZIP's second name,
+# its Unix attributes that make an entry a link) is refused.
+_ZIP_EXTRA_ALLOWED = (0x5455, 0x7875)
+
+
+def _archive_entries(path):
+    """An archive's entries, {name: bytes}, read the way the machine reads it: the local headers in order
+    from the first byte, as fwup and the extension host stream it (src/pkg.c), and only when the central
+    directory, which zip tools read, names those same entries, in that order, each once, with nothing between
+    them or after them. An archive whose two readings could differ is refused, so what is recorded is what
+    installs.
+
+    Each entry is checked as the streaming reader ends it: a deflated one decompresses to its end exactly at
+    the size the directory gives; a stored one with its sizes after the data (fwup writes them so) holds no
+    data descriptor's signature before its own, which is where that reader ends it. No entry carries an
+    extra field but the extended timestamp and Info-ZIP's uid/gid."""
+    import struct
+    import zlib
     try:
-        with zipfile.ZipFile(path) as z:
-            data = z.read("data/payload.tar.gz")
-    except (OSError, KeyError, zipfile.BadZipFile) as e:
+        data = open(path, "rb").read()
+    except OSError as e:
         raise Refused("%s is not an extension archive: %s" % (path, e))
+
+    def bad(why):
+        return Refused("%s is not an extension archive the machine reads as zip tools do: %s" % (path, why))
+
+    def extra(name, x):
+        # The extra field as its records, each a type, a length and that many bytes, and nothing else.
+        i = 0
+        while i < len(x):
+            # A record cut short reads as one of the greatest length, which runs past the field.
+            kind, n = struct.unpack("<HH", x[i:i + 4].ljust(4, b"\xff"))
+            if i + 4 + n > len(x):
+                raise bad("the extra field of %s is not whole" % name)
+            if kind not in _ZIP_EXTRA_ALLOWED:
+                raise bad("%s carries an extra field of type 0x%04x; an entry may carry only the extended timestamp "
+                          "(0x5455) and Info-ZIP's uid/gid (0x7875)" % (name, kind))
+            i += 4 + n
+
+    # The end of the central directory: the archive's last 22 bytes, with no comment, and no zip64.
+    if len(data) < 22 or data[-22:-18] != _ZIP_END:
+        raise bad("it does not end with the central directory's end, with no comment")
+    disk, cd_disk, n_here, n_all, cd_size, cd_off, clen = struct.unpack("<HHHHIIH", data[-18:])
+    if disk or cd_disk or n_here != n_all or clen or cd_off + cd_size != len(data) - 22 or 0xFFFFFFFF in (cd_size, cd_off):
+        raise bad("its central directory's end does not close the file on the directory just before it")
+    central, p = [], cd_off
+    for _ in range(n_all):
+        if p + 46 > len(data) - 22:
+            raise bad("its central directory ends inside an entry")
+        if data[p:p + 4] != _ZIP_CENTRAL:
+            raise bad("its central directory holds something that is no entry")
+        (flags, method, crc, csize, usize, nlen, xlen, klen, local) = struct.unpack("<4xHH4xIIIHHH8xI",data[p + 4:p + 46])
+        name = data[p + 46:p + 46 + nlen].decode("utf-8", "replace")
+        extra(name, data[p + 46 + nlen:p + 46 + nlen + xlen])
+        central.append((name, flags, method, crc, csize, usize, local))
+        p += 46 + nlen + xlen + klen
+    if p != len(data) - 22:
+        raise bad("its central directory is not the size its end gives")
+
+    # The local headers, from the first byte, each where the one before it ended.
+    out, at = {}, 0
+    for name, flags, method, crc, csize, usize, local in central:
+        if local != at or data[at:at + 4] != _ZIP_LOCAL:
+            raise bad("%s is not the entry that follows the one before it" % name)
+        if at + 30 > cd_off:
+            raise bad("the local header of %s runs into the central directory" % name)
+        (lflags, lmethod, lcrc, lcsize, lusize, nlen, xlen) = struct.unpack("<2xHH4xIIIHH", data[at + 4:at + 30])
+        if data[at + 30:at + 30 + nlen].decode("utf-8", "replace") != name or (lflags, lmethod) != (flags, method):
+            raise bad("the local header of %s is not the central directory's" % name)
+        extra(name, data[at + 30 + nlen:at + 30 + nlen + xlen])
+        if 0xFFFFFFFF in (csize, usize) or flags & 1 or method not in (0, 8):
+            raise bad("%s is encrypted, zip64, or compressed in a way an extension archive is not" % name)
+        start = at + 30 + nlen + xlen
+        raw = data[start:start + csize]
+        if len(raw) != csize:
+            raise bad("%s runs past the end of the archive" % name)
+        if method == 8:
+            d = zlib.decompressobj(-15)
+            try:
+                body = d.decompress(raw) + d.flush()
+            except zlib.error as e:
+                raise bad("%s does not decompress: %s" % (name, e))
+            if not d.eof or d.unused_data or d.unconsumed_tail:
+                raise bad("%s does not end where the central directory says it does" % name)
+        else:
+            body = raw
+            if flags & 8 and _ZIP_DESC in raw:
+                raise bad("%s holds a data descriptor's signature inside its data" % name)
+        if len(body) != usize or zlib.crc32(body) & 0xFFFFFFFF != crc:
+            raise bad("%s is not the size or the CRC the central directory gives" % name)
+        at = start + csize
+        if flags & 8:
+            # The sizes after the data, with the signature fwup writes, and the same as the directory's.
+            if data[at:at + 16] != _ZIP_DESC + struct.pack("<III", crc, csize, usize):
+                raise bad("the data descriptor after %s is not the central directory's" % name)
+            at += 16
+        elif (lcrc, lcsize, lusize) != (crc, csize, usize):
+            raise bad("the local header of %s is not the central directory's" % name)
+        out[name] = body
+    if at != cd_off:
+        raise bad("something lies between its last entry and its central directory")
+    # The directory's names, each as often as it names it: an entry named twice is refused, not read once.
+    names = [c[0] for c in central]
+    if names not in ([ENTRY_META, ENTRY_PAYLOAD], [ENTRY_SIG, ENTRY_META, ENTRY_PAYLOAD]):
+        raise Refused("%s: an extension archive holds its metadata and one resource, in that order, and this one "
+                      "holds %s" % (path, ", ".join(names) or "nothing"))
+    return out
+
+
+def archive_manifest(path):
+    """The manifest inside an .ffx: its payload's manifest.json, read out of the archive as the machine reads it."""
+    data = _archive_entries(path)[ENTRY_PAYLOAD]
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
         # mkffx.sh writes the members as ./path, a packer by hand may not.
         info = next((i for i in t.getmembers() if i.isfile() and i.name in ("manifest.json", "./manifest.json")), None)
@@ -868,12 +977,7 @@ def archive_manifest(path):
 
 def _archive_meta(path):
     """The meta-* lines of an archive's meta.conf, as {name: value}."""
-    import zipfile
-    try:
-        with zipfile.ZipFile(path) as z:
-            conf = z.read("meta.conf").decode("utf-8", "replace")
-    except (OSError, KeyError, zipfile.BadZipFile) as e:
-        raise Refused("%s is not an extension archive: %s" % (path, e))
+    conf = _archive_entries(path)[ENTRY_META].decode("utf-8", "replace")
     out = {}
     for ln in conf.splitlines():
         # fwup quotes a value only when it has to: meta-product="ForgeFIRM extension", meta-version=1.0.0
@@ -885,9 +989,7 @@ def _archive_meta(path):
 
 def _unpack_payload(path, d):
     """The archive's payload unpacked into d, regular files and directories only, nothing outside d."""
-    import zipfile
-    with zipfile.ZipFile(path) as z:
-        data = z.read("data/payload.tar.gz")
+    data = _archive_entries(path)[ENTRY_PAYLOAD]
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
         for info in t.getmembers():
             rel = info.name[2:] if info.name.startswith("./") else info.name
@@ -1298,9 +1400,28 @@ def cmd_lint(a):
 
 # ---------------------------------------------------------------- a machine
 
+class _PinnedConnection(http.client.HTTPSConnection):
+    """An HTTPS connection that sends nothing until the peer's certificate is the one remembered: the check
+    is made in connect(), on every connection, before the first byte of a request."""
+
+    def __init__(self, host, port, fingerprint, where, **kw):
+        super().__init__(host, port, **kw)
+        self.fingerprint, self.where = fingerprint, where
+
+    def connect(self):
+        super().connect()
+        fp = hashlib.sha256(self.sock.getpeercert(binary_form=True)).hexdigest()
+        if fp != self.fingerprint:
+            self.sock.close()
+            self.sock = None
+            raise Refused("%s presents a certificate that is not the one it presented before (%s, now %s): nothing "
+                          "was sent over it" % (self.where, self.fingerprint[:16], fp[:16]))
+
+
 class Machine:
     """A machine's panel over HTTPS, logged in as its owner. Its certificate is its own, made on the machine,
-    so it is trusted on first use: the fingerprint is shown once and remembered."""
+    so it is trusted on first use: the fingerprint is shown once and remembered, and every connection after
+    that is checked against it before anything is sent."""
 
     def __init__(self, addr, user):
         self.host, _, port = addr.partition(":")
@@ -1310,16 +1431,20 @@ class Machine:
         self.cx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self.cx.check_hostname = False
         self.cx.verify_mode = ssl.CERT_NONE
+        self.fingerprint = None
         self._pin()
         self.cookie = None
         self.token = None
         self._login(user)
 
     def _conn(self):
-        return http.client.HTTPSConnection(self.host.strip("[]"), self.port, timeout=60, context=self.cx)
+        return _PinnedConnection(self.host.strip("[]"), self.port, self.fingerprint, "%s:%d" % (self.host, self.port),
+                                 timeout=60, context=self.cx)
 
     def _pin(self):
-        c = self._conn()
+        """The certificate the machine presents, against the one remembered for it, or the owner's word on
+        first use. Only this connection, which sends nothing, is made before the fingerprint is known."""
+        c = http.client.HTTPSConnection(self.host.strip("[]"), self.port, timeout=60, context=self.cx)
         c.connect()
         der = c.sock.getpeercert(binary_form=True)
         c.close()
@@ -1343,6 +1468,7 @@ class Machine:
             seen[key] = fp
             os.makedirs(os.path.dirname(known), exist_ok=True)
             json.dump(seen, open(known, "w"), indent=1)
+        self.fingerprint = fp
 
     def request(self, method, path, body=None, ctype=None, token=True):
         hdrs = {"Host": "%s:%d" % (self.host, self.port) if self.port != 443 else self.host}
@@ -1476,7 +1602,7 @@ def main(argv=None):
     q.add_argument("catalog", help="the catalog: packages/<id>/key.pub, <version>.json, withdrawn.json")
     q.add_argument("--version", required=True, help="the index's own version, YYYY.MDD.N (the month times 100 plus "
                    "the day, unpadded: 2026.928.1): a machine never keeps one older than the index it has")
-    q.add_argument("--key", help="the OpenGlow extension key's private half: no machine keeps an index signed otherwise")
+    q.add_argument("--key", help="the OpenGlow index key's private half: no machine keeps an index signed otherwise")
     q.add_argument("--out", required=True)
     q.set_defaults(fn=cmd_index_build)
     p = sub.add_parser("keygen", help="an Ed25519 key pair for signing")

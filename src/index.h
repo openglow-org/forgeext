@@ -5,8 +5,9 @@
  * SPDX-License-Identifier: MIT
  *
  * The index is an archive of the extension container's own form, with the
- * product "ForgeFIRM extension index", signed with the OpenGlow extension
- * key and by nothing else, holding one file, index.json. It lists packages
+ * product "ForgeFIRM extension index", signed with the OpenGlow index key
+ * (pkg_trust_t.index_key) and by nothing else - not with the extension key
+ * that signs OpenGlow's packages - holding one file, index.json. It lists packages
  * - each one's id, what it is, and every listed version of it with where
  * to fetch it, its SHA-256 and size, and the firmware it runs on - and
  * binds an id to its author's public key. A package signed by that key for

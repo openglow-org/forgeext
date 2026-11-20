@@ -66,6 +66,7 @@ static int usage(void)
             "  --root <dir>            the extension root (default " EXT_ROOT_DEFAULT ")\n"
             "  --fwup <path>           the fwup binary (default: fwup on PATH)\n"
             "  --official-key <file>   the OpenGlow extension public key\n"
+            "  --index-key <file>      the OpenGlow index public key, the one key index-verify takes\n"
             "  --firmware-key <path>   a key, or a directory of keys, that signs firmware (twice at most)\n"
             "  --nft <path>            the nft binary (default /usr/sbin/nft)\n"
             "  --budget-mib <n>        what every installed package may hold together (default %lld)\n"
@@ -328,6 +329,8 @@ int main(int argc, char **argv)
             snprintf(env.core_version, sizeof(env.core_version), "%s", manifest_version_text(val));
         } else if (strcmp(opt, "--official-key") == 0) {
             env.trust.official_key = val;
+        } else if (strcmp(opt, "--index-key") == 0) {
+            env.trust.index_key = val;
         } else if (strcmp(opt, "--firmware-key") == 0 && nfw < 2) {
             if (nfw == 0)
                 env.trust.firmware_keys[1] = NULL;

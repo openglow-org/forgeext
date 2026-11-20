@@ -81,7 +81,7 @@ jobs:
           sudo FORGEEXT=build/forgeext FWUP="$(command -v fwup)" \
             FFX_RULES=forgefirm-rules/meta-forgefirm/recipes-forgefirm/forgefirm-sandbox/files/ffx.nft \
             python3 -B tests/sdk_test.py
-      - name: "ffx_test (the author's tool: ffx lint agrees with forgeext inspect on every fixture, pack, keygen, new)"
+      - name: "ffx_test (the author's tool: ffx lint agrees with forgeext inspect on every fixture, pack, keygen, new; no record of an archive that reads two ways; the machine's certificate checked on every connection)"
         run: FORGEEXT=build/forgeext FWUP="$(command -v fwup)" python3 -B tests/ffx_test.py
       - name: install_test (the built binary against real archives, hostile ones included)
         run: |

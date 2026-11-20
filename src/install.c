@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #define KEY_EXT_OFFICIAL  "/etc/forgefirm/keys/ext/forgefirm-ext.pub"
+#define KEY_EXT_INDEX     "/etc/forgefirm/keys/ext/forgefirm-index.pub"
 #define KEY_FW_RELEASE    "/etc/forgefirm/keys/forgefirm-release.pub"
 #define KEY_FW_FACTORY    "/etc/forgefirm/keys/gf"
 
@@ -51,6 +52,7 @@ void ext_env_defaults(ext_env_t *env)
     env->root = EXT_ROOT_DEFAULT;
     env->trust.fwup = "fwup";
     env->trust.official_key = KEY_EXT_OFFICIAL;
+    env->trust.index_key = KEY_EXT_INDEX;
     env->trust.owner_keys_dir = EXT_ROOT_DEFAULT "/keys";
     env->trust.endorsed_dir = EXT_ROOT_DEFAULT "/index/keys";
     env->trust.firmware_keys[0] = KEY_FW_RELEASE;

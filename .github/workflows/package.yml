@@ -4,19 +4,34 @@
 
 # The shared workflow of an extension package's repository. The package's own
 # workflow calls it on every push and pull request
-# (uses: openglow-org/forgeext/.github/workflows/package.yml@main, with
-# secrets: inherit, and contents: write for the release):
+# (uses: openglow-org/forgeext/.github/workflows/package.yml@<ref>, with
+# secrets: inherit, and the permission contents: write, which the release job
+# asks for; GitHub starts no run of a calling workflow that grants less, on any
+# push or pull request):
 #
 #   build     the package's own tests; the package staged as it ships, linted
 #             as the machine judges it, and packed; and a test under the real
 #             extension host, as root.
-#   release   on a push to the default branch whose manifest names a version
-#             with no release yet: the package signed with
-#             EXTENSION_SIGNING_KEY, the secret of the repository's signing
-#             environment, checked against the public key the repository
-#             carries, and published as release v<version> with its catalog
-#             record (ffx index record), for a pull request to the catalog.
-#             A version already released publishes nothing.
+#   stage     on a push to the default branch whose manifest names a version
+#             with no release yet: the package staged again and linted, and
+#             handed on as the artifact "staged". This job runs the package's
+#             own commands, and holds no secret.
+#   release   the staged package signed with EXTENSION_SIGNING_KEY, the secret
+#             of the repository's signing environment, checked against the
+#             public key the repository carries, and published as release
+#             v<version> with its catalog record (ffx index record), for a pull
+#             request to the catalog. This job runs none of the package's
+#             commands, and two actions: forgeext's kit (the kit at
+#             forgeext-ref, fetched with git; fwup checked by its SHA-256, gh,
+#             and Python) and actions/download-artifact, pinned by its commit,
+#             which fetches the artifact and unpacks its zip. The job's own
+#             steps read what it unpacked only once the folder holds one
+#             regular file, staged.tar. A version already released publishes
+#             nothing.
+#
+# A caller that wants the signing job to run only code it chose pins both the
+# workflow (@<commit>) and forgeext-ref to one forgeext commit; OpenGlow's own
+# packages do.
 
 name: package
 
@@ -24,7 +39,7 @@ on:
   workflow_call:
     inputs:
       forgeext-ref:
-        description: The forgeext revision whose kit judges and packs the package
+        description: The forgeext revision whose kit judges, packs and signs the package
         type: string
         default: main
       apt:
@@ -62,9 +77,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0, pinned by commit
       - name: forgeext, for its kit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0, pinned by commit
         with:
           repository: openglow-org/forgeext
           ref: ${{ inputs.forgeext-ref }}
@@ -100,17 +115,20 @@ jobs:
           sudo env PATH="$PATH" FORGEEXT="$FORGEEXT" FWUP="$FWUP" FFX="$FFX" MKFFX="$MKFFX" FFX_RULES="$FFX_RULES" \
             sh -c "$CMD"
 
-  release:
+  stage:
     needs: build
     if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      id: ${{ steps.pkg.outputs.id }}
+      version: ${{ steps.pkg.outputs.version }}
+      publish: ${{ steps.pkg.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0, pinned by commit
       - name: forgeext, for its kit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0, pinned by commit
         with:
           repository: openglow-org/forgeext
           ref: ${{ inputs.forgeext-ref }}
@@ -120,8 +138,6 @@ jobs:
         id: pkg
         env:
           GH_TOKEN: ${{ github.token }}
-          DIR: ${{ inputs.dir }}
-          STAGE: ${{ inputs.stage }}
         run: |
           python3 - manifest.json >> "$GITHUB_OUTPUT" <<'EOF'
           import json, sys
@@ -153,43 +169,112 @@ jobs:
           sh -c "$STAGE"
           python3 -B "$FFX" lint "$DIR"
           python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); sys.exit(0 if m["version"] == sys.argv[2] else "the staged manifest is not the version released")' "$DIR/manifest.json" "$VERSION"
-      - name: Signed with the repository's key, and checked against its public half
+          # A tar keeps each file's mode, which an artifact does not.
+          tar -C "$DIR" -cf "$RUNNER_TEMP/staged.tar" .
+      # GitHub's action on its major tag, in this job, which holds no secret. The release job runs none of it: it
+      # fetches the artifact with actions/download-artifact, pinned by its commit, and checks what it holds.
+      - name: Handed to the signing job
         if: steps.pkg.outputs.publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: staged
+          path: ${{ runner.temp }}/staged.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  # This job holds the key, and runs no action but forgeext's own kit and actions/download-artifact, pinned by its
+  # commit: the repository's public key and forgeext come by gh and git; the staged package comes by
+  # download-artifact, which unpacks the artifact's zip, and the folder it unpacks is checked before any other step
+  # reads it.
+  release:
+    needs: stage
+    if: needs.stage.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: write
+    steps:
+      - name: The repository's public key, and forgeext for its kit (nothing of the repository runs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_KEY: ${{ inputs.public-key }}
+          FORGEEXT_REF: ${{ inputs.forgeext-ref }}
+        run: |
+          mkdir repo
+          # The file the public-key input names, kept as repo/key.pub, which the steps below read.
+          gh api -H "Accept: application/vnd.github.raw+json" \
+            "repos/$GITHUB_REPOSITORY/contents/$PUBLIC_KEY?ref=$GITHUB_SHA" > repo/key.pub
+          git init -q .forgeext
+          git -C .forgeext fetch -q --depth 1 https://github.com/openglow-org/forgeext.git "$FORGEEXT_REF"
+          git -C .forgeext checkout -q --detach FETCH_HEAD
+      - uses: ./.forgeext/.github/actions/kit
+      # The artifact the stage job uploaded in this run, read with the runner's own token, so the job asks for no
+      # permission beyond contents: write. Its digest is checked; a mismatch or a missing artifact fails the step,
+      # which stops the job before anything is signed.
+      - name: The staged package, fetched
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2, pinned by commit
+        with:
+          name: staged
+          path: ${{ runner.temp }}/staged
+      - name: The staged package, one tar and nothing else
+        run: |
+          # The folder download-artifact unpacked. Its contents come from the package's own commands, so it must
+          # hold exactly one regular file, staged.tar, before any other step reads it.
+          python3 - "$RUNNER_TEMP/staged" <<'EOF'
+          import os, stat, sys
+          d = sys.argv[1]
+          names = os.listdir(d)
+          if names != ["staged.tar"] or not stat.S_ISREG(os.lstat(os.path.join(d, "staged.tar")).st_mode):
+              sys.exit("the staged artifact holds %s, and not one regular file staged.tar" % (sorted(names) or "nothing"))
+          EOF
+      - name: Signed with the repository's key, and checked against its public half
         env:
           KEY: ${{ secrets.EXTENSION_SIGNING_KEY }}
           ENVIRONMENT: ${{ inputs.environment }}
-          PUB: ${{ inputs.public-key }}
-          DIR: ${{ inputs.dir }}
-          ID: ${{ steps.pkg.outputs.id }}
-          VERSION: ${{ steps.pkg.outputs.version }}
+          PUBLIC_KEY: ${{ inputs.public-key }}
+          PUB: repo/key.pub
+          ID: ${{ needs.stage.outputs.id }}
+          VERSION: ${{ needs.stage.outputs.version }}
         run: |
           [ -n "$KEY" ] || { echo "the $ENVIRONMENT environment holds no EXTENSION_SIGNING_KEY"; exit 1; }
-          [ -f "$PUB" ] || { echo "the repository carries no $PUB"; exit 1; }
+          [ -s "$PUB" ] || { echo "the repository's $PUBLIC_KEY is empty or missing"; exit 1; }
+          DIR="$RUNNER_TEMP/staged/pkg"
+          # Regular files and directories inside the folder, and nothing else, as a package holds.
+          python3 - "$RUNNER_TEMP/staged/staged.tar" "$DIR" <<'EOF'
+          import os, sys, tarfile
+          with tarfile.open(sys.argv[1]) as t:
+              for m in t.getmembers():
+                  parts = m.name.split("/")
+                  if not (m.isfile() or m.isdir()) or m.name.startswith("/") or ".." in parts:
+                      sys.exit("the staged package holds %s, which no package may" % m.name)
+              os.makedirs(sys.argv[2])
+              t.extractall(sys.argv[2], filter="data")
+          EOF
+          python3 -c 'import json, sys; m = json.load(open(sys.argv[1])); sys.exit(0 if (m["id"], m["version"]) == (sys.argv[2], sys.argv[3]) else "the staged package is not the one released")' "$DIR/manifest.json" "$ID" "$VERSION"
           umask 077
           k="$RUNNER_TEMP/signing"
           mkdir -p "$k" "$RUNNER_TEMP/out"
           trap 'rm -rf "$k"' EXIT
           printf '%s\n' "$KEY" | tr -d ' \r\t' | grep -v '^$' > "$k/key.priv"
           cp "$PUB" "$k/key.pub"
-          # ffx pack checks the signature against key.pub beside the key before it says so.
+          # ffx pack lints the staged package (it reads it, and runs none of it), and checks the signature against
+          # key.pub beside the key before it says so.
           python3 -B "$FFX" pack "$DIR" --key "$k/key.priv" --out "$RUNNER_TEMP/out/$ID-$VERSION.ffx"
       - name: Its catalog record
-        if: steps.pkg.outputs.publish == 'true'
         env:
-          PUB: ${{ inputs.public-key }}
-          ID: ${{ steps.pkg.outputs.id }}
-          VERSION: ${{ steps.pkg.outputs.version }}
+          PUB: repo/key.pub
+          ID: ${{ needs.stage.outputs.id }}
+          VERSION: ${{ needs.stage.outputs.version }}
         run: |
           url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/$ID-$VERSION.ffx"
           case "$ID" in org.openglow|org.forgefirm|org.openglow.*|org.forgefirm.*) who=--official-key ;; *) who=--key ;; esac
           python3 -B "$FFX" index record "$RUNNER_TEMP/out/$ID-$VERSION.ffx" --url "$url" "$who" "$PUB" \
             --out "$RUNNER_TEMP/out/$VERSION.json"
       - name: Published as release v<version>
-        if: steps.pkg.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          ID: ${{ steps.pkg.outputs.id }}
-          VERSION: ${{ steps.pkg.outputs.version }}
+          ID: ${{ needs.stage.outputs.id }}
+          VERSION: ${{ needs.stage.outputs.version }}
         run: |
           gh release create "v$VERSION" "$RUNNER_TEMP/out/$ID-$VERSION.ffx" "$RUNNER_TEMP/out/$VERSION.json" \
             --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$ID $VERSION" \

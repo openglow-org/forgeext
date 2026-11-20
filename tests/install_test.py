@@ -19,7 +19,7 @@ a package serves
 (as it shipped, and none when it is not installed or disabled), removal,
 the wipe a change of
 owner takes (every package, everything under data/ and settings/, every
-key the owner added), and the signed index (kept only under the OpenGlow extension key,
+key the owner added), and the signed index (kept only under the OpenGlow index key, never the extension key,
 held to its form, never older than the one kept, endorsing its author key
 for one id and no other, judged version by version against the firmware
 when read, and what it withdraws). After every refusal the root holds
@@ -64,13 +64,13 @@ def check(ok, what):
 
 
 class World:
-    """One extension root, four key pairs, and the forgeext command line over them."""
+    """One extension root, five key pairs, and the forgeext command line over them."""
 
     def __init__(self, top):
         self.top = top
         self.root = os.path.join(top, "root")
         self.keys = {}
-        for name in ("official", "owner", "stranger", "firmware"):
+        for name in ("official", "index", "owner", "stranger", "firmware"):
             d = os.path.join(top, "key-" + name)
             os.mkdir(d)
             subprocess.run([FWUP, "-g"], cwd=d, check=True, capture_output=True)
@@ -85,7 +85,7 @@ class World:
     def run(self, *args, budget=None, core=None, pre=None, fwup=None):
         """forgeext's answer; pre runs in the child before the exec (limits), fwup is another fwup to use."""
         cmd = [FORGEEXT, "--root", self.root, "--fwup", fwup or FWUP, "--official-key", self.pub("official"),
-               "--firmware-key", self.pub("firmware"), "--no-reserve"]
+               "--index-key", self.pub("index"), "--firmware-key", self.pub("firmware"), "--no-reserve"]
         cmd += (["--budget-mib", str(budget)] if budget else [])
         cmd += (["--core-version", core] if core else []) + list(args)
         p = subprocess.run(cmd, capture_output=True, text=True, preexec_fn=pre)
@@ -369,7 +369,7 @@ def the_index(t):
         return "2026.901.%d" % serial[0]
 
     # Built the way OpenGlow builds it: a record per version from its signed archive, then the catalog.
-    def build(entries, key="official", version=None):
+    def build(entries, key="index", version=None):
         d = t.path("catalog")
         for e in entries:
             p = subprocess.run([sys.executable, "-B", ffx, "index", "record", e, "--url",
@@ -392,7 +392,7 @@ def the_index(t):
 
     idx = build([listed], version="2026.900.1")
     fresh = t.path("fresh-root")
-    p = subprocess.run([FORGEEXT, "--root", fresh, "--fwup", FWUP, "--official-key", t.pub("official"), "--no-reserve",
+    p = subprocess.run([FORGEEXT, "--root", fresh, "--fwup", FWUP, "--index-key", t.pub("index"), "--no-reserve",
                         "index-verify", idx], capture_output=True, text=True)
     check('"ok":true' in p.stdout.replace(" ", ""), "the catalog can be the first thing a root holds: %s" % p.stdout.strip())
     idx = build([listed])
@@ -416,7 +416,9 @@ def the_index(t):
     check(r.get("ok") is True and r.get("tier") == "community", "it installs as community: %s" % r.get("error", r.get("tier")))
 
     # An index the host does not keep, each refused in its words, the kept one left as it was.
-    for key, words in (("owner", "not signed with the OpenGlow extension key"), (None, "not signed with the OpenGlow")):
+    # The extension key that signs OpenGlow's packages signs no index.
+    for key, words in (("official", "not signed with the OpenGlow index key"),
+                       ("owner", "not signed with the OpenGlow index key"), (None, "not signed with the OpenGlow")):
         r = t.run("index-verify", build([listed], key=key))
         check(r.get("ok") is False and words in (r.get("error") or ""), "an index signed by %s -> %s" % (key or "nobody", r.get("error")))
     r = t.run("index-verify", listed)
@@ -424,7 +426,7 @@ def the_index(t):
 
     def raw_index(doc, version=None, extra=None):
         members = [member("index.json", json.dumps(doc).encode())] + (extra or [])
-        return t.pack_raw(t.tar(members), version or next_version(), "official", product="ForgeFIRM extension index")
+        return t.pack_raw(t.tar(members), version or next_version(), "index", product="ForgeFIRM extension index")
 
     def ver(v, **more):
         e = {"version": v, "url": "https://example.org/x-%s.ffx" % v, "sha256": "ab" * 32, "size": 1000,

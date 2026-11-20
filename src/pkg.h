@@ -41,12 +41,14 @@
 typedef enum {
     TIER_UNVERIFIED = 0,    /* no key this machine trusts */
     TIER_COMMUNITY,         /* a key the owner added */
-    TIER_OFFICIAL,          /* the OpenGlow extension key in the image */
+    TIER_OFFICIAL,          /* the OpenGlow extension key in the image (the index key, for an index) */
 } pkg_tier_t;
 
 typedef struct {
     const char *fwup;               /* the fwup binary; NULL is "fwup" on PATH */
     const char *official_key;       /* the image's extension public key; NULL or absent file: no official tier */
+    const char *index_key;          /* the image's index public key, the one key an index is verified with; it
+                                     * signs no package (index_install puts it in official_key's place) */
     const char *owner_keys_dir;     /* owner-added public keys (*.pub); may be NULL */
     const char *endorsed_dir;       /* keys the verified index endorses, one per package id (<id>.pub); may be NULL */
     const char *firmware_keys[4];   /* files or directories of keys that sign firmware, NULL-ended */

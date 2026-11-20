@@ -250,9 +250,11 @@ int index_install(const ext_env_t *env, const char *file, int *npkgs, char *vers
     if (version && vlen)
         version[0] = '\0';
 
-    /* Signed with the OpenGlow extension key and by nothing else: no owner
-     * key and no endorsed key speaks for the index. */
+    /* Signed with the OpenGlow index key and by nothing else: not the
+     * extension key that signs OpenGlow's packages, and no owner key and no
+     * endorsed key speaks for the index. */
     pkg_trust_t trust = env->trust;
+    trust.official_key = env->trust.index_key;
     trust.owner_keys_dir = NULL;
     trust.endorsed_dir = NULL;
     if (ext_root_prepare(env, err, elen) != 0)          /* the catalog can be the first thing a root holds */
@@ -266,7 +268,7 @@ int index_install(const ext_env_t *env, const char *file, int *npkgs, char *vers
     if (pkg_open_product(&trust, file, PKG_INDEX_PRODUCT, payload, &info, err, elen) != 0)
         goto out;
     if (info.tier != TIER_OFFICIAL) {
-        fail(err, elen, "the index is not signed with the OpenGlow extension key");
+        fail(err, elen, "the index is not signed with the OpenGlow index key");
         goto out;
     }
     if (!manifest_version_ok(info.version)) {

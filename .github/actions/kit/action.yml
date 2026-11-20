@@ -34,6 +34,9 @@ runs:
       run: |
         if ! fwup --version 2>/dev/null | grep -qx '1\.16\.0'; then
           curl -fsSL -o "$RUNNER_TEMP/fwup.deb" https://github.com/fwup-home/fwup/releases/download/v1.16.0/fwup_1.16.0_amd64.deb
+          # The package as it was when this checksum was taken, or nothing: a release asset can be replaced, and
+          # fwup is what signs a release.
+          echo "6751e26cc2089cdf3dbefabd9cd2e6d703977bf0c3360c584e05caeab019879b  $RUNNER_TEMP/fwup.deb" | sha256sum -c -
           sudo dpkg -i "$RUNNER_TEMP/fwup.deb" > /dev/null
         fi
         src="$GITHUB_WORKSPACE/$KIT_PATH"
@@ -46,7 +49,7 @@ runs:
         } >> "$GITHUB_ENV"
     - name: The image's deny rules
       if: inputs.host == 'true'
-      uses: actions/checkout@v4
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0, pinned by commit
       with:
         repository: openglow-org/forgefirm
         ref: ${{ inputs.forgefirm-ref }}

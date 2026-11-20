@@ -13,7 +13,10 @@ archive the host takes, the same bytes twice over a second apart, signed or
 not; `ffx new` makes a package
 for each runtime that lints as its template says; `ffx keygen` refuses to
 overwrite a key; `ffx index record` writes a listed version's record only
-for an archive its signer's key verifies; and `ffx index build` makes an
+for an archive its signer's key verifies, and none for an archive that a
+zip tool reads otherwise than the machine; `ffx install` and `ffx logs`
+check the remembered certificate on every connection, before the password
+goes; and `ffx index build` makes an
 index of a catalog directory that the host keeps, the same bytes twice over
 a second apart, and refuses a catalog out of form. The fixtures are one per
 path of the manifest's judgment and of lint's file checks; the index's form
@@ -119,6 +122,247 @@ FIXTURES = [
     ("more directories than a payload holds", with_(), {"__dirs__": "4097",
                                                          "__words__": "the payload holds more than 4096 directory entries"}),
 ]
+
+
+def two_views(first, second):
+    """first's entries and central directory as they are, then second's payload entry and a central directory
+    that names first's metadata and second's payload: a streaming reader stops at first's directory, and a zip
+    tool, which reads the last one, sees second's payload."""
+    import struct
+
+    def central(z):
+        cd_size, cd_off = struct.unpack("<II", z[-10:-2])
+        out, p = [], cd_off
+        while p < cd_off + cd_size:
+            nlen, xlen, klen = struct.unpack("<HHH", z[p + 28:p + 34])
+            out.append((z[p + 46:p + 46 + nlen].decode(), p, z[p:p + 46 + nlen + xlen + klen]))
+            p += 46 + nlen + xlen + klen
+        return cd_off, out
+
+    _, cd1 = central(first)
+    off2, cd2 = central(second)
+    local2 = struct.unpack("<I", cd2[-1][2][42:46])[0]
+    tail = second[local2:off2]                          # second's payload entry, its data descriptor included
+    at = len(first)
+    entries = [e[2] for e in cd1 if e[0] != "data/payload.tar.gz"]
+    entries.append(cd2[-1][2][:42] + struct.pack("<I", at) + cd2[-1][2][46:])
+    cd = b"".join(entries)
+    return (first + tail + cd + b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, len(entries), len(entries), len(cd),
+                                                            at + len(tail), 0))
+
+
+def zip_entries(z):
+    """An archive as its entries, each with the fields of its local header and of its directory entry, so that a
+    row of the archive table can change one thing and zip_join write it back."""
+    import struct
+    cd_size, cd_off = struct.unpack("<II", z[-10:-2])
+    out, p = [], cd_off
+    while p < cd_off + cd_size:
+        (ver, need, flags, method, tm, dt, crc, csize, usize, nlen, xlen, klen, _d, _i, eattr, local) = \
+            struct.unpack("<HHHHHHIIIHHHHHII", z[p + 4:p + 46])
+        lf = struct.unpack("<HHHHHIIIHH", z[local + 4:local + 30])
+        start = local + 30 + lf[8] + lf[9]
+        e = {"ver": ver, "need": need, "flags": flags, "method": method, "tm": tm, "dt": dt, "crc": crc,
+             "csize": csize, "usize": usize, "eattr": eattr, "name": z[p + 46:p + 46 + nlen],
+             "cx": z[p + 46 + nlen:p + 46 + nlen + xlen], "lflags": lf[1], "lmethod": lf[2], "lsizes": lf[5:8],
+             "lname": z[local + 30:local + 30 + lf[8]], "lx": z[local + 30 + lf[8]:start],
+             "data": z[start:start + csize]}
+        e["desc"] = z[start + csize:start + csize + 16] if flags & 8 else b""
+        out.append(e)
+        p += 46 + nlen + xlen + klen
+    return out
+
+
+def zip_join(entries, gap=b"", cd_size_delta=0, comment=b"", cd_tail=b"", disk=0, count_delta=0):
+    """The archive of zip_entries' entries; a key "at" in an entry is the offset its directory entry gives, and
+    "lsig" or "csig" the signature its local header or its directory entry carries. cd_tail is bytes after the
+    directory's last entry that the end counts in the directory's size; disk the disk numbers the end gives;
+    count_delta is added to the number of entries the end gives."""
+    import struct
+    body, cd = b"", b""
+    for e in entries:
+        at = len(body)
+        body += struct.pack("<4sHHHHHIIIHH", e.get("lsig", b"PK\x03\x04"), e["need"], e["lflags"], e["lmethod"], e["tm"],
+                            e["dt"], *e["lsizes"], len(e["lname"]), len(e["lx"])) + e["lname"] + e["lx"] + e["data"] + e["desc"]
+        cd += struct.pack("<4sHHHHHHIIIHHHHHII", e.get("csig", b"PK\x01\x02"), e["ver"], e["need"], e["flags"], e["method"],
+                          e["tm"], e["dt"], e["crc"], e["csize"], e["usize"], len(e["name"]), len(e["cx"]), 0, 0, 0,
+                          e["eattr"], e.get("at", at)) + e["name"] + e["cx"]
+    body += gap
+    cd += cd_tail
+    n = len(entries) + count_delta
+    return body + cd + b"PK\x05\x06" + struct.pack("<HHHHIIH", disk, disk, n, n, len(cd) + cd_size_delta, len(body),
+                                                   len(comment)) + comment
+
+
+def local_header_cut_short():
+    """An archive whose second local header starts 4 bytes before the end of the central directory, so that the
+    file ends 26 bytes short of it. The first entry, stored, runs from its local header over the whole directory up
+    to there; its CRC, which lies inside its own data, is solved for (CRC-32 is affine over GF(2) in the data's bits),
+    so that the entry itself passes every rule."""
+    import struct
+    import zlib
+    a, b = b"meta.conf", b"data/payload.tar.gz"
+    xb = struct.pack("<HH", 0x5455, 5) + b"\x01PK\x03\x04"  # its last 4 bytes are the second local header's start
+    cd_off = 30 + len(a)
+    cd_size = 46 + len(a) + 46 + len(b) + len(xb)
+    second = cd_off + cd_size - 4
+    size = second - cd_off
+
+    def cd(crc, tm):
+        return (struct.pack("<4sHHHHHHIIIHHHHHII", b"PK\x01\x02", 20, 20, 0, 0, tm, 0, crc, size, size, len(a), 0, 0, 0,
+                            0, 0, 0) + a +
+                struct.pack("<4sHHHHHHIIIHHHHHII", b"PK\x01\x02", 20, 20, 0, 0, 0, 0, 0, 0, 0, len(b), len(xb), 0, 0,
+                            0, 0, second) + b + xb)
+
+    for tm in range(64):
+        f0 = zlib.crc32(cd(0, tm)[:size])
+        cols = [zlib.crc32(cd(1 << i, tm)[:size]) ^ f0 ^ (1 << i) for i in range(32)]
+        # Solve (G + I) x = f0 over GF(2): rows are the 32 equations, each a 32-bit mask of x's bits and its value.
+        rows = [(sum(((cols[i] >> r) & 1) << i for i in range(32)), (f0 >> r) & 1) for r in range(32)]
+        x, piv = 0, []
+        for col in range(32):
+            k = next((j for j in range(len(rows)) if (rows[j][0] >> col) & 1), None)
+            if k is None:
+                break
+            pr = rows.pop(k)
+            rows = [(m ^ pr[0], v ^ pr[1]) if (m >> col) & 1 else (m, v) for m, v in rows]
+            piv = [(m ^ pr[0], v ^ pr[1]) if (m >> col) & 1 else (m, v) for m, v in piv] + [pr]
+        else:
+            for m, v in piv:
+                x |= v << (m.bit_length() - 1)
+            d = cd(x, tm)
+            assert zlib.crc32(d[:size]) == x
+            return (struct.pack("<4sHHHHHIIIHH", b"PK\x03\x04", 20, 0, 0, tm, 0, x, size, size, len(a), 0) + a + d +
+                    b"PK\x05\x06" + struct.pack("<HHHHIIH", 0, 0, 2, 2, cd_size, cd_off, 0))
+    raise AssertionError("no CRC solves the archive")
+
+
+def zip_rows(z):
+    """The archive table: (what, archive), one row per rule of ffx's archive reader, each the signed fixture with
+    one thing changed, which the reader must refuse. Two rules have no row. An entry that runs past the archive's
+    end is refused by the size rule (stored), the deflated end (deflated) and the place rules too: the next entry,
+    or the directory, is not where it ends. A compressed size of 0xFFFFFFFF runs past the end; a size of 0xFFFFFFFF
+    is refused by the size rule too, except an entry that decompresses to exactly 4 GiB less one byte, which no
+    test unpacks."""
+    import copy
+    import struct
+    import zlib
+    base = zip_entries(z)
+
+    def row(change, **join):
+        es = copy.deepcopy(base)
+        change(es)
+        return zip_join(es, **join)
+
+    def entry(es, name):
+        return next(e for e in es if e["name"] == name.encode())
+
+    def put(e, body, method, flags=8):
+        # body as the entry's data, stored (0) or deflated (8), its sizes after it as fwup writes them
+        c = zlib.compressobj(9, zlib.DEFLATED, -15)
+        e["data"] = body if method == 0 else c.compress(body) + c.flush()
+        e["method"] = e["lmethod"] = method
+        e["flags"] = e["lflags"] = flags
+        e["crc"], e["csize"], e["usize"] = zlib.crc32(body) & 0xFFFFFFFF, len(e["data"]), len(body)
+        redesc(e)
+
+    def redesc(e):
+        e["desc"] = b"PK\x07\x08" + struct.pack("<III", e["crc"], e["csize"], e["usize"])
+
+    def meta_body(es):
+        return zlib.decompress(entry(es, "meta.conf")["data"], -15)
+
+    def stored_with_signature(es):
+        put(entry(es, "meta.conf"), meta_body(es) + b"# PK\x07\x08\n", 0)
+
+    def trailing(es):
+        e = entry(es, "meta.conf")
+        e["data"] += b"\0\0\0\0"
+        e["csize"] += 4
+        redesc(e)
+
+    def unfinished(es):
+        # meta.conf deflated with a sync flush and no final block: the whole body, but the stream does not end
+        e, body = entry(es, "meta.conf"), meta_body(es)
+        c = zlib.compressobj(9, zlib.DEFLATED, -15)
+        e["data"] = c.compress(body) + c.flush(zlib.Z_SYNC_FLUSH)
+        e["csize"] = len(e["data"])
+        redesc(e)
+
+    def longer(es):
+        # the directory and the descriptor give meta.conf one byte more than its data, its CRC kept
+        e = entry(es, "meta.conf")
+        e["usize"] += 1
+        redesc(e)
+
+    def flip(es):
+        e = entry(es, "meta.conf.ed25519")
+        e["data"] = bytes([e["data"][0] ^ 1]) + e["data"][1:]
+
+    def twice(es):
+        es.insert(2, copy.deepcopy(entry(es, "meta.conf")))
+
+    def other_name(e):
+        n = b"data/payload.tar.xz"
+        return struct.pack("<HHBI", 0x7075, 5 + len(n), 1, zlib.crc32(e["name"]) & 0xFFFFFFFF) + n
+
+    return [
+        ("the directory gives an entry another place than where it is", row(lambda es: es[0].update(at=1))),
+        ("bytes between the last entry and the directory", row(lambda es: None, gap=b"\0" * 8)),
+        ("a stored entry with its sizes after it holds a descriptor's signature", row(stored_with_signature)),
+        ("a deflated entry with bytes after its end", row(trailing)),
+        ("the directory's end gives the directory another size", row(lambda es: None, cd_size_delta=1)),
+        ("a comment after the directory's end", row(lambda es: None, comment=b"note")),
+        ("an entry of another name", row(lambda es: entry(es, "data/payload.tar.gz").update(
+            name=b"data/payload.tar.xz", lname=b"data/payload.tar.xz"))),
+        ("a local header that names another entry than the directory", row(lambda es: entry(es, "meta.conf").update(
+            lname=b"meta.cong"))),
+        ("a data descriptor that is not the directory's", row(lambda es: entry(es, "data/payload.tar.gz").update(
+            desc=b"PK\x07\x08" + struct.pack("<III", entry(es, "data/payload.tar.gz")["crc"] ^ 1,
+                                             entry(es, "data/payload.tar.gz")["csize"],
+                                             entry(es, "data/payload.tar.gz")["usize"])))),
+        ("an entry whose data is not the CRC the directory gives", row(flip)),
+        ("an entry named twice", row(twice)),
+        ("a zip64 field in a local header", row(lambda es: es[0].update(lx=struct.pack("<HH", 1, 16) + b"\0" * 16))),
+        ("a second name in the directory's extra field", row(lambda es: entry(es, "data/payload.tar.gz").update(
+            cx=other_name(entry(es, "data/payload.tar.gz"))))),
+        ("an extra field that is not whole", row(lambda es: entry(es, "meta.conf").update(cx=b"\x01"))),
+        ("an extra field of another type (Info-ZIP's Unix attributes, a link)", row(lambda es: entry(
+            es, "data/payload.tar.gz").update(lx=struct.pack("<HHI", 0x6C78, 4, 0xA1FF0000)))),
+        ("a deflated entry that does not decompress", row(lambda es: entry(es, "meta.conf").update(
+            data=b"\0" + entry(es, "meta.conf")["data"][1:]))),
+        ("an encrypted entry", row(lambda es: entry(es, "meta.conf.ed25519").update(
+            flags=entry(es, "meta.conf.ed25519")["flags"] | 1, lflags=entry(es, "meta.conf.ed25519")["lflags"] | 1))),
+        ("an entry compressed in another way than stored or deflated", row(lambda es: entry(
+            es, "meta.conf.ed25519").update(method=12, lmethod=12))),
+        ("an entry without its sizes after it whose local header gives other sizes", row(
+            lambda es: without_descriptor(entry(es, "meta.conf.ed25519"), 1))),
+        ("an entry without its sizes after it whose local header gives another CRC", row(
+            lambda es: without_descriptor(entry(es, "meta.conf.ed25519"), crc_delta=1))),
+        ("an entry without its sizes after it whose local header gives another compressed size", row(
+            lambda es: without_descriptor(entry(es, "meta.conf.ed25519"), csize_delta=1))),
+        ("a deflated entry that stops before its final block", row(unfinished)),
+        ("an entry whose data is not the size the directory gives", row(longer)),
+        ("a directory entry cut short by the directory's end", row(lambda es: None, cd_tail=b"PK\x01\x02" + b"\0" * 10,
+                                                                   count_delta=1)),
+        ("a local header that gives another method than the directory", row(lambda es: entry(
+            es, "meta.conf.ed25519").update(lmethod=8))),
+        ("a local header that gives other flags than the directory", row(lambda es: entry(
+            es, "meta.conf.ed25519").update(lflags=entry(es, "meta.conf.ed25519")["flags"] & ~8))),
+        ("bytes in the directory after its last entry", row(lambda es: None, cd_tail=b"\0" * 8)),
+        ("a directory entry that is no entry", row(lambda es: es[1].update(csig=b"PK\x01\x03"))),
+        ("a local header that is no entry", row(lambda es: es[1].update(lsig=b"PK\x03\x05"))),
+        ("an end that names another disk", row(lambda es: None, disk=1)),
+    ]
+
+
+def without_descriptor(e, usize_delta=0, crc_delta=0, csize_delta=0):
+    """e with its CRC and sizes in its local header and no data descriptor, the local header's CRC, compressed size
+    and size each off by its delta."""
+    e["flags"] &= ~8
+    e["lflags"] &= ~8
+    e["desc"] = b""
+    e["lsizes"] = (e["crc"] ^ crc_delta, e["csize"] + csize_delta, e["usize"] + usize_delta)
 
 
 def build(top, name, manifest, extra):
@@ -262,6 +506,33 @@ def machine_client(ffx, top, archive):
             rc = ffx.main(["logs", "--machine", addr, "--user", "owner"])
         check(rc == 1 and "not the one it presented before" in out.err, "a changed certificate is refused: %s",
               out.err.strip()[-160:])
+        # A party in the middle that lets the first connection through to the machine and answers the next ones
+        # with its own certificate: the password never goes over them.
+        cert2, key2 = os.path.join(top, "cert2.pem"), os.path.join(top, "key2.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key2, "-out", cert2,
+                        "-subj", "/CN=forgefirm", "-days", "1"], check=True, capture_output=True)
+        cx2 = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        cx2.load_cert_chain(cert2, key2)
+        handshakes = []
+
+        class Swapping(http.server.ThreadingHTTPServer):
+            def get_request(self):
+                sock, peer = self.socket.accept()
+                handshakes.append(peer)
+                return (cx if len(handshakes) == 1 else cx2).wrap_socket(sock, server_side=True), peer
+
+        mitm = Swapping(("127.0.0.1", 0), Forgectrl)
+        threading.Thread(target=mitm.serve_forever, daemon=True).start()
+        seen.clear()
+        answers = iter(["y"])
+        try:
+            with out:
+                rc = ffx.main(["logs", "--machine", "127.0.0.1:%d" % mitm.server_address[1], "--user", "owner"])
+        finally:
+            mitm.shutdown()
+        check(rc == 1 and len(handshakes) >= 2 and not seen,
+              "the certificate is checked on every connection, before anything is sent: rc %s, %d connections, sent %s",
+              rc, len(handshakes), [s[:2] for s in seen])
     finally:
         builtins.input, getpass.getpass = saved[0], saved[1]
         for k, v in (("HOME", saved[2]), ("USERPROFILE", saved[3])):
@@ -469,7 +740,7 @@ def main():
             mk = open(os.path.join(d, "Makefile")).read()
             files = {n: os.path.exists(os.path.join(d, n)) for n in ("Makefile", ".gitignore", "README.md", "key.pub")}
             check(all(files.values()) and "uses: openglow-org/forgeext/.github/workflows/package.yml@main" in wf
-                  and "secrets: inherit" in wf and ("apt: gcc-arm-linux-gnueabihf" in wf) == (runtime == "native")
+                  and "secrets: inherit" in wf and "\npermissions:\n  contents: write\n\n" in wf and ("apt: gcc-arm-linux-gnueabihf" in wf) == (runtime == "native")
                   and "\n\trm -rf build/pkg\n" in mk and ("bin/run:" in mk) == (runtime == "native")
                   and "@@" not in wf + mk + open(os.path.join(d, "README.md")).read()
                   and open(os.path.join(d, "key.pub")).read() == open(key + ".pub").read(),
@@ -505,6 +776,8 @@ def main():
         print("ffx index record and build: a catalog directory, as the host keeps it")
         ogkey = os.path.join(top, "openglow")
         check(ffx.main(["keygen", ogkey]) == 0, "a stand-in for the OpenGlow extension key")
+        ixkey = os.path.join(top, "openglow-index")
+        check(ffx.main(["keygen", ixkey]) == 0, "and one for the OpenGlow index key")
         off = build(top, "an official one", with_(id="org.openglow.fixture"), {})
         official = os.path.join(top, "official.ffx")
         check(ffx.main(["pack", off, "--key", ogkey + ".priv", "--out", official]) == 0, "OpenGlow's own, signed with it")
@@ -530,6 +803,50 @@ def main():
         check(rc == 1 and "endorses no author key" in said, "an official one takes no author key: %s", said)
         rc, said = ffx_run("index", "record", a1, "--url", url, "--key", key + ".pub")
         check(rc == 1 and "is not signed with" in said, "an unsigned archive: %s", said)
+        # Two views of one archive: the fixture as the machine streams it, and, after its central directory, a
+        # second package's payload with a directory naming it, which zip tools read. Both are the author's.
+        other = os.path.join(top, "other-view.ffx")
+        check(ffx.main(["pack", build(top, "the other view", with_(capabilities=["camera.lid"]), {}), "--key",
+                        key + ".priv", "--out", other]) == 0, "a second package, signed by the same author")
+        twoview = os.path.join(top, "two-view.ffx")
+        open(twoview, "wb").write(two_views(open(signed, "rb").read(), open(other, "rb").read()))
+        r = inspect(twoview)
+        check(r.get("ok") is True and (r.get("package") or {}).get("capabilities") == ["machine.read"],
+              "the host reads the first view: %s", r.get("error") or (r.get("package") or {}).get("capabilities"))
+        rc, said = ffx_run("index", "record", twoview, "--url", url, "--key", key + ".pub", "--out",
+                           os.path.join(top, "two-view.json"))
+        check(rc == 1 and not os.path.exists(os.path.join(top, "two-view.json")),
+              "an archive that reads two ways is recorded neither way: %s", said)
+        # The archive reader's rules, a row each: the signed fixture with one thing changed is refused.
+        fixture = open(signed, "rb").read()
+        check(zip_join(zip_entries(fixture)) == fixture, "the archive table writes the fixture back byte for byte")
+        row = os.path.join(top, "row.ffx")
+        es = zip_entries(fixture)
+        without_descriptor(next(e for e in es if e["name"] == b"meta.conf.ed25519"))
+        open(row, "wb").write(zip_join(es))
+        check(sorted(ffx._archive_entries(row)) == sorted(ffx._archive_entries(signed)),
+              "an entry with its sizes in its local header, and no data descriptor, is read")
+        es = zip_entries(fixture)
+        ux = b"\x75\x78\x0b\x00\x01\x04\xe8\x03\x00\x00\x04\xe8\x03\x00\x00"
+        for e in es:
+            # Info-ZIP's uid/gid (0x7875: uid and gid 1000), as libarchive 3.7.2's zip writer puts it on every entry
+            e["lx"] += ux
+            e["cx"] += ux
+        open(row, "wb").write(zip_join(es))
+        try:
+            check(sorted(ffx._archive_entries(row)) == sorted(ffx._archive_entries(signed)),
+                  "an archive with Info-ZIP's uid/gid field on every entry is read")
+        except ffx.Refused as e:
+            check(False, "an archive with Info-ZIP's uid/gid field on every entry is read: %s", e)
+        for what, z in zip_rows(fixture) + [("a local header cut short by the file's end", local_header_cut_short())]:
+            open(row, "wb").write(z)
+            try:
+                ffx._archive_entries(row)
+                check(False, "an archive with %s is refused", what)
+            except ffx.Refused:
+                check(True, "an archive with %s is refused", what)
+            except Exception as e:  # noqa: BLE001 - a crash is no refusal
+                check(False, "an archive with %s is refused: %r", what, e)
         rc, said = ffx_run("index", "record", signed, "--url", url, "--key", key + ".pub", "--out",
                            os.path.join(fxdir, "1.0.0.json"))
         check(rc == 0, "the fixture's record: %s", said)
@@ -547,8 +864,8 @@ def main():
                            *(["--key", signer + ".priv"] if signer else []))
 
         def host(*args):
-            p = subprocess.run([FORGEEXT, "--root", root, "--fwup", FWUP, "--no-reserve", "--official-key", ogkey + ".pub"]
-                               + list(args), capture_output=True, text=True)
+            p = subprocess.run([FORGEEXT, "--root", root, "--fwup", FWUP, "--no-reserve", "--official-key", ogkey + ".pub",
+                                "--index-key", ixkey + ".pub"] + list(args), capture_output=True, text=True)
             try:
                 return json.loads(p.stdout)
             except ValueError:
@@ -593,7 +910,7 @@ def main():
         for o in (i1, i2):
             if o == i2:
                 time.sleep(1.1)                         # a second apart: the clock is no part of the index
-            rc, said = index_build(o, ogkey)
+            rc, said = index_build(o, ixkey)
             check(rc == 0 and "2 packages, 2 versions" in said, "built and signed: %s", said)
         check(open(i1, "rb").read() == open(i2, "rb").read(), "two builds of one catalog are one index")
         r = host("index-verify", i1)
@@ -625,11 +942,11 @@ def main():
         put(os.path.join(fxdir, "withdrawn.json"), {"versions": {"0.9.0": "a flaw"}})
         os.remove(os.path.join(ogdir, "1.0.0.json"))
         put(os.path.join(ogdir, "withdrawn.json"), {"reason": "replaced"})
-        rc, said = index_build(i1, ogkey, version="2026.923.2")
+        rc, said = index_build(i1, ixkey, version="2026.923.2")
         check(rc == 0 and "1 package, 2 versions, 1 withdrawn whole" in said, "the catalog of versions and withdrawals: %s", said)
         r = host("index-verify", i1)
         check(r.get("ok") is True and r.get("packages") == 1, "the host keeps it: %s", r)
-        p = subprocess.run([FORGEEXT, "--root", root, "--fwup", FWUP, "--no-reserve", "--official-key", ogkey + ".pub",
+        p = subprocess.run([FORGEEXT, "--root", root, "--fwup", FWUP, "--no-reserve", "--index-key", ixkey + ".pub",
                             "--core-version", "0.0.8", "index"], capture_output=True, text=True)
         doc = json.loads(p.stdout).get("index") or {}
         fx = (doc.get("packages") or [{}])[0]
