@@ -165,6 +165,9 @@ int main(void)
           "a service that keeps the sender out: %s", err);
     CHECK(refused_with(BASE_HEAD "\"runtime\":\"ui\",\"capabilities\":[\"ui\",\"sender.keep_out\"]}",
                        "belongs to a service"), "a page that keeps the sender out -> %s", err);
+    /* Asking for a press is a service's too: the ask is a call on its API socket. */
+    CHECK(refused_with(BASE_HEAD "\"runtime\":\"ui\",\"capabilities\":[\"ui\",\"button\"]}",
+                       "belongs to a service"), "a page that asks for a press -> %s", err);
 
     CHECK(refused_with(BASE_HEAD SERVICE "\"capabilities\":[],\"modes\":[]}", "grbl, cloud, or both"), "empty modes -> %s", err);
     CHECK(refused_with(BASE_HEAD SERVICE "\"capabilities\":[],\"modes\":[\"grbl\",\"grbl\"]}", "each once"), "grbl twice -> %s", err);

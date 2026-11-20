@@ -264,8 +264,57 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
             json_decref(j);
             return refuse(body, blen, 502, "forgectrl's answer is not a JSON object");
         }
+        /* The button's level is no package's to read: a package gets a
+         * press by asking for one (/v0/button/ask). The status goes on
+         * without it. */
+        json_t *sw = json_object_get(j, "switches");
+        if (json_object_get(sw, "button")) {
+            json_object_del(sw, "button");
+            /* Its numbers keep their values: 15 digits give back the
+             * number a double was read from (12.50 goes on as 12.5). */
+            char *text = json_dumps(j, JSON_COMPACT | JSON_REAL_PRECISION(15));
+            int fits = text && strlen(text) < blen;
+            if (fits)
+                snprintf(body, blen, "%s", text);
+            free(text);
+            if (!fits) {
+                json_decref(j);
+                return refuse(body, blen, 502, "forgectrl's answer does not fit");
+            }
+        }
         json_decref(j);
         return 200;
+    }
+    if (strcmp(p, "/v0/button/ask") == 0) {
+        if (req->method != HTTPREQ_POST)
+            return refuse(body, blen, 405, "POST /v0/button/ask");
+        if (!api_may(who, "button"))
+            return refuse(body, blen, 403, "this package may not ask for a press of the button: the operator did not grant it");
+        if (!world || !world->motion)
+            return refuse(body, blen, 502, "the host cannot reach the machine's button");
+        /* {} asks, or keeps asking; {"end": true} withdraws the ask. The
+         * machine judges it and holds the press: what it says is what the
+         * package is told, in the package's name, which is the host's word. */
+        int end = 0, bad = 0;
+        if (req->body_len) {
+            if (!req->json_body)
+                return refuse(body, blen, 415, "POST /v0/button/ask takes application/json");
+            json_t *b = json_loadb(req->body, req->body_len, JSON_REJECT_DUPLICATES, NULL), *v;
+            const char *key;
+            bad = !json_is_object(b);
+            json_object_foreach(b, key, v) {
+                if (strcmp(key, "end") == 0 && json_is_boolean(v))
+                    end = json_is_true(v);
+                else
+                    bad = 1;
+            }
+            json_decref(b);
+        }
+        if (bad)
+            return refuse(body, blen, 400, "the body is empty, {} or {\"end\": true}, and nothing else");
+        char path[160];
+        snprintf(path, sizeof(path), "/button/ask?id=%s%s", who->id, end ? "&end=1" : "");
+        return world->motion(world->motion_ctx, path, body, blen);
     }
     if (strcmp(p, "/v0/motion/job") == 0 || strcmp(p, "/v0/motion/job/abort") == 0) {
         int abort_ = strcmp(p, "/v0/motion/job/abort") == 0;

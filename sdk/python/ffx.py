@@ -205,6 +205,23 @@ def sender_state():
     return call("GET", "/v0/sender")
 
 
+def button_ask():
+    """button (granted): asks for a press of the machine's button, or keeps asking; the one way a package
+    gets a press. {state}: "waiting" (reserved, and not yet in force, or a job came to wait for the
+    button under the ask: take the prompt down), "ready" (the next press is this package's: ask the
+    operator for it now, and only while this is the answer), "pressed" (that press, said once). Call it a few times a
+    second while it waits: each call keeps the ask ten seconds, and a "pressed" not collected within five
+    seconds of the press is gone. A refusal is an ApiError (409) naming who holds the button: a job that
+    waits for its press or runs, a prompt of the control panel, another package. An ask that stood can
+    end that way too, when one of them comes to wait on the button: a press made then is theirs."""
+    return call("POST", "/v0/button/ask", {})
+
+
+def button_ask_end():
+    """button (granted): withdraws this package's ask."""
+    return call("POST", "/v0/button/ask", {"end": True})
+
+
 def events(since=None, wait=None):
     """events: {next, dropped, connected, events} after `since`, waiting up to `wait` seconds for one."""
     body = {}

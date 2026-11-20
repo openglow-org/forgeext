@@ -182,6 +182,15 @@ static int read_head(int fd, char *buf, size_t blen, size_t *len)
     return -1;
 }
 
+int evfeed_take(evfeed_t *f, evfeed_sse_t *st, const char *line)
+{
+    evfeed_ev_t ev;
+    int rc = evfeed_sse_feed(st, line, &ev);
+    if (rc > 0 && strcmp(ev.name, "button") != 0)
+        evfeed_add(f, ev.name, ev.data);
+    return rc;
+}
+
 /* One stream, until it ends or the host stops wanting it. */
 static void hold_stream(evfeed_t *f, int fd, char *buf, size_t blen, size_t len)
 {
@@ -199,14 +208,10 @@ static void hold_stream(evfeed_t *f, int fd, char *buf, size_t blen, size_t len)
             line[n] = '\0';
             memmove(buf, nl + 1, len - k - 1);
             len -= k + 1;
-            evfeed_ev_t ev;
-            int rc = evfeed_sse_feed(&st, line, &ev);
-            if (rc < 0) {
+            if (evfeed_take(f, &st, line) < 0) {
                 fflog(LOG_INFO, "events: the machine ended this stream; another is asked for");
                 return;
             }
-            if (rc > 0)
-                evfeed_add(f, ev.name, ev.data);
         }
         if (len + 1 >= blen)
             len = 0;                                    /* a line longer than the buffer: start clean */

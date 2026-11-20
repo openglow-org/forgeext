@@ -186,6 +186,22 @@ int main(void)
     CHECK(!strcmp(asked_path, "/cool/status"), "cool asks forgectrl for %s", asked_path);
     call(&reader, &hold, "GET /v0/machine/status HTTP/1.1\r\n\r\n");
     CHECK(!strcmp(asked_path, "/status"), "status asks forgectrl for %s", asked_path);
+    /* The button's level is no package's to read: the status goes on without it. */
+    machine_says = "{\"state\": \"idle\", \"switches\": {\"lid\": true, \"button\": true, \"interlock_ok\": true}}";
+    rc = call(&reader, &hold, "GET /v0/machine/status HTTP/1.1\r\n\r\n");
+    j = json_loads(body, 0, NULL);
+    CHECK(rc == 200 && json_is_true(json_object_get(json_object_get(j, "switches"), "lid")) &&
+          json_is_true(json_object_get(json_object_get(j, "switches"), "interlock_ok")) && !strstr(body, "button"),
+          "the status, relayed without the button's level: %d %s", rc, body);
+    json_decref(j);
+    /* With the button up as with it down, and its numbers as forgectrl wrote them. */
+    machine_says = "{\"temps\": {\"down_c\": 23.1, \"up_c\": 22.85}, \"pos\": {\"x\": 123.456789}, "
+                   "\"switches\": {\"lid\": true, \"button\": false}}";
+    rc = call(&reader, &hold, "GET /v0/machine/status HTTP/1.1\r\n\r\n");
+    CHECK(rc == 200 && !strstr(body, "button") && strstr(body, "\"down_c\":23.1,") && strstr(body, "\"up_c\":22.85}") &&
+          strstr(body, "\"x\":123.456789}"),
+          "the status with the button up: no level, the numbers as written: %d %s", rc, body);
+    machine_says = "{\"mode\": \"grbl\", \"controller\": \"running\"}";
     asked = 0;
     rc = call(&holder, &hold, "GET /v0/machine/mode HTTP/1.1\r\n\r\n");
     CHECK(rc == 403 && asked == 0 && strstr(error_words(), "machine.read"), "without machine.read: %d, the machine asked %d times", rc, asked);
@@ -557,6 +573,35 @@ int main(void)
         CHECK(rc == 502, "with no way to the machine's job route: %d", rc);
         world.job = fake_job;
         #undef JOB
+    }
+
+    /* Asking for a press of the machine's button: the operator's grant, a
+     * closed body, and the package's own name as the host's word. */
+    {
+        char text[400];
+        api_who_t asker = { .id = "org.example.press", .version = "1.0.0", .uid = 808, .caps = { "button" }, .ncaps = 1 };
+        api_hold_t ah = { 0, "", 0 };
+        #define ASK(who_, json_) (snprintf(text, sizeof(text), \
+            "POST /v0/button/ask HTTP/1.1\r\nContent-Type: application/json\r\n" \
+            "Content-Length: %zu\r\n\r\n%s", strlen(json_), json_), call(who_, &ah, text))
+        motion_calls = 0;
+        rc = ASK(&reader, "{}");
+        CHECK(rc == 403 && motion_calls == 0 && strstr(error_words(), "did not grant"),
+              "an ask without the grant: %d, the machine asked %d times", rc, motion_calls);
+        rc = call(&asker, &ah, "POST /v0/button/ask HTTP/1.1\r\nContent-Length: 0\r\n\r\n");
+        CHECK(rc == 200 && motion_calls == 1 && !strcmp(motion_path, "/button/ask?id=org.example.press"),
+              "an ask, in the package's name: %d %s", rc, motion_path);
+        rc = ASK(&asker, "{\"end\": true}");
+        CHECK(rc == 200 && motion_calls == 2 && !strcmp(motion_path, "/button/ask?id=org.example.press&end=1"),
+              "an ask withdrawn: %d %s", rc, motion_path);
+        static const char *const bad[] = { "{\"id\": \"org.example.other\"}", "{\"end\": 1}", "[]",
+                                           "{\"end\": true, \"end\": false}" };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            rc = ASK(&asker, bad[i]);
+            CHECK(rc == 400 && motion_calls == 2, "%s: %d, the machine asked %d times", bad[i], rc, motion_calls);
+        }
+        CHECK(call(&asker, &ah, "GET /v0/button/ask HTTP/1.1\r\n\r\n") == 405 && motion_calls == 2, "an ask is a POST");
+        #undef ASK
     }
 
     /* Keeping the Grbl sender out: the operator's grant, a closed body, the

@@ -45,7 +45,10 @@ A package the operator removes inside the
 turn that measures it, after the host has read the state and before it
 measures, is not set aside by the measurement its removal breaks. A
 package granted sender.keep_out that asks to keep the Grbl sender out has
-its claim kept fresh beside the holds, until it is disabled.
+its claim kept fresh beside the holds, until it is disabled. A package
+granted button that keeps asking for a press has each ask carried to the
+machine in its own name, and none while it is frozen for the armed window
+or once it is disabled: the machine ends an ask nobody keeps.
 A package that holds events has the host hold one stream from forgectrl: a
 poll at the head comes back empty at its deadline, a waiting one as soon as
 the stream carries an event, and with the package disabled the stream is let
@@ -295,6 +298,14 @@ while True:
     time.sleep(1)
 '''
 
+# One that keeps asking for a press of the machine's button.
+ASKER = API_CLIENT + r'''
+import time
+while True:
+    api("POST", "/v0/button/ask", {})
+    time.sleep(0.2)
+'''
+
 # One that polls the host's events when the test says so, and writes down what it was told and when.
 EVPOLL = API_CLIENT + r'''
 import json, os, time
@@ -324,7 +335,7 @@ while True:
 TOKEN = "0123456789abcdef0123456789abcdef"
 failures = []
 facts = {"armed": False, "controller": "running", "motion": "unverified", "mode": "grbl", "diag": False, "updating": False,
-         "down": False, "sender": [], "on_mode": None}
+         "down": False, "sender": [], "asks": [], "on_mode": None}
 streams = []                                    # each /events stream the stand-in holds: the events it has yet to write
 streams_mu = threading.Lock()
 asked_mode = []                                 # when each GET /mode came (time.monotonic()): one a turn
@@ -395,6 +406,10 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
             ok = self.headers.get("X-ForgeFIRM-Token") == TOKEN
             facts["sender"].append((self.path, ok))
             body, code = ({}, 200) if ok else ({"error": "not the extension host's token"}, 403)
+        elif self.path.split("?")[0] == "/button/ask" and not facts["down"]:
+            ok = self.headers.get("X-ForgeFIRM-Token") == TOKEN
+            facts["asks"].append((self.path, ok))
+            body, code = ({"state": "ready"}, 200) if ok else ({"error": "not the extension host's token"}, 403)
         else:
             body, code = {"error": "the stand-in has no such route"}, 404
         data = json.dumps(body).encode()
@@ -980,6 +995,31 @@ def main():
               "disabled, its claim is gone: %s %s", r.get("error", ""), os.listdir(senders_dir))
         check(fx("remove", kid).get("ok") is True, "and it goes")
 
+        print("a package asks for a press of the button: carried in its name, and not while it is frozen or stopped")
+        aid = "org.example.asker"
+        package(aid, "python", ASKER, caps=["button"], grants=["button"])
+
+        def asks():
+            return len([a for a in facts["asks"] if a == ("/button/ask?id=" + aid, True)])
+
+        def quiet():
+            """No ask carried over two seconds: one written as the service was stopped is let through first."""
+            time.sleep(0.5)
+            n = asks()
+            time.sleep(2.0)
+            return asks() == n
+        check(wait_for(lambda: asks() >= 3, 40) and asks() == len(facts["asks"]),
+              "its asks reach the machine in its own name, with the host's token: %s", facts["asks"][:3])
+        facts["armed"] = True
+        check(wait_for(lambda: svc(aid).get("frozen"), 8) and quiet(), "frozen for the armed window: no ask of its own is carried")
+        facts["armed"] = False
+        n = asks()
+        check(wait_for(lambda: asks() > n, 8), "thawed, it asks again")
+        r = fx("disable", aid)
+        check(r.get("ok") is True and wait_for(lambda: svc(aid).get("state") != "running", 8) and quiet(),
+              "disabled: its service is stopped, and no ask is carried: %s", svc(aid))
+        check(fx("remove", aid).get("ok") is True, "and it goes")
+
         print("the machine's events: one stream from forgectrl, held while a package wants it")
         eid = "org.example.events"
         edata = os.path.join(root, "data", eid)
@@ -1004,12 +1044,14 @@ def main():
         time.sleep(0.5)
         with streams_mu:
             for q in streams:
+                q.append(("button", {"pressed": True}))     # the machine's button is no package's: the host holds it for none
                 q.append(("lid", {"open": True}))
         wrote = time.monotonic()
         p2 = wait_for(lambda: jload("poll2.json"), 10) or {}
         check(p2.get("code") == 200 and [e.get("event") for e in p2.get("events") or []] == ["lid"]
               and p2.get("at", wrote + 99) - wrote < 1.0,
-              "a poll with wait 4 is answered %.2f s after the stand-in writes one event: %s", p2.get("at", wrote) - wrote, p2)
+              "a poll with wait 4 is answered %.2f s after the stand-in writes a button event and one other, with that "
+              "one alone: %s", p2.get("at", wrote) - wrote, p2)
         r = fx("disable", eid)
         check(r.get("ok") is True and wait_for(lambda: status().get("events") == {"connected": False, "wanted": 0}
                                                and open_streams() == 0, 10),

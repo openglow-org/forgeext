@@ -129,6 +129,8 @@ note("clear", lambda: ffx.hold(False))
 note("events", ffx.events)
 note("camera", lambda: len(ffx.camera("head")))
 note("jog", lambda: ffx.jog(x=1))
+note("ask", ffx.button_ask)
+note("ask_end", ffx.button_ask_end)
 note("nowhere", lambda: ffx.call("GET", "/v0/nowhere"))
 note("program", lambda: ffx.write_program("p.gcode", "G21\n"))
 note("program_dir", lambda: ffx.write_program("../p.gcode", "G21\n"))
@@ -173,6 +175,20 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
             return
         data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        """An ask for a press, as forgectrl answers one and its withdrawal."""
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        path, _, query = self.path.partition("?")
+        if path != "/button/ask":
+            self.send_error(404)
+            return
+        data = json.dumps({"state": "ended" if "end=1" in query.split("&") else "ready"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -266,7 +282,7 @@ def main():
                        capture_output=True, text=True)
     check(b.returncode == 0, "ffx.h builds static with -Wall -Wextra -Werror: %s", b.stderr[-300:])
     package("org.example.sdkpy", "python", "bin/run.py", {"bin/run.py": PY_SERVICE, "lib/ffx.py": os.path.join(SDK, "python", "ffx.py")},
-            caps=["hold", "machine.read", "settings.own", "events", "ui"], grants=["hold"],
+            caps=["hold", "machine.read", "settings.own", "events", "ui", "button"], grants=["hold", "button"],
             settings={"threshold": {"type": "number", "default": 40, "min": 0, "max": 100}})
     package("org.example.sdksh", "shell", "bin/run.sh", {"bin/run.sh": SH_SERVICE, "lib/ffx.sh": os.path.join(SDK, "sh", "ffx.sh")},
             caps=["hold"], grants=["hold"])
@@ -281,12 +297,18 @@ def main():
         f.write("ext_enabled=1\n")
     log = open(os.path.join(top, "daemon.log"), "w")
     call_dir = os.path.join(top, "call")
+    # The host's machine token, a file of the test's: it carries a package's ask for a press with it.
+    token_file = os.path.join(top, "host.token")
+    with open(token_file, "w") as f:
+        f.write("0123456789abcdef0123456789abcdef\n")
+    os.chmod(token_file, 0o600)
     daemon = subprocess.Popen([FORGEEXT, "--root", root, "--fwup", FWUP, "--nft", NFT, "run", "--conf", conf, "--safe-file", safe,
                                "--forgectrl", "127.0.0.1:%d" % fport, "--cg-parent", CG_PARENT, "--run-dir", run_dir,
                                "--holds-dir", os.path.join(top, "holds"), "--api-dir", os.path.join(top, "api"),
                                "--call-dir", call_dir]
                               + (["--landlock-fs-only"] if abi < 4 else []),
-                              stdout=log, stderr=subprocess.STDOUT)
+                              stdout=log, stderr=subprocess.STDOUT,
+                              env=dict(os.environ, FORGEEXT_HOST_TOKEN_FILE=token_file))
     try:
         def report(id_, name):
             p = os.path.join(root, "data", id_, name)
@@ -313,6 +335,8 @@ def main():
               rep.get("events"))
         check(rep.get("camera", [""])[0] == "refused" and rep["camera"][1] == 403, "a camera it does not hold: %s", rep.get("camera"))
         check(rep.get("jog", [""])[0] == "refused" and rep["jog"][1] == 403, "a jog it does not hold: %s", rep.get("jog"))
+        check(rep.get("ask") == ["ok", {"state": "ready"}] and rep.get("ask_end") == ["ok", {"state": "ended"}],
+              "button_ask asks for a press and button_ask_end withdraws the ask: %s %s", rep.get("ask"), rep.get("ask_end"))
         check(rep.get("nowhere", [""])[0] == "refused" and rep["nowhere"][1] == 404, "a path there is none of: %s", rep.get("nowhere"))
         check(rep.get("program") == ["ok", "p.gcode"] and os.path.isfile(os.path.join(root, "data", "org.example.sdkpy", "p.gcode")),
               "a program written into its own data: %s", rep.get("program"))

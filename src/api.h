@@ -31,6 +31,21 @@
  *   POST /v0/motion/job/abort  end the running job (motion.job, granted)
  *   GET  /v0/sender            its claim on the Grbl sender, as forgectrl has it (sender.keep_out, granted)
  *   POST /v0/sender            {"out": bool}: keep the sender out, or let it back in (sender.keep_out, granted)
+ *   POST /v0/button/ask        ask for a press of the machine's button, or keep asking (button, granted)
+ *
+ * The ask is the one way a package gets a press. The machine refuses it
+ * (409, naming who holds the button) while anybody else waits on the
+ * button: a job that waits for its press or is inside its armed window, a
+ * prompt of the control panel or of a check, another package's ask. Else
+ * it reserves the button against every job, the package's own included,
+ * and answers {"state": "waiting"} until the reservation is in force,
+ * {"state": "ready"} while the next press is the package's, and
+ * {"state": "pressed"} once, for that press. Each call keeps the ask for
+ * ten seconds more, so a package calls again while it waits and an ask
+ * nobody keeps ends by itself; {"end": true} withdraws it. No event and
+ * no status says anything of the button: the machine's `button` events
+ * stay off the feed, and /v0/machine/status goes on without the button's
+ * level.
  *
  * A program is named, not sent: the request reader takes 4 KiB of body
  * and a program is not that, so a package writes it into its own data

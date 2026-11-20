@@ -81,6 +81,11 @@ int evfeed_sse_feed(evfeed_sse_t *st, const char *line, evfeed_ev_t *out);
 /* ---- the ring ---- */
 
 void evfeed_add(evfeed_t *f, const char *name, const char *data);
+/* One line of the machine's stream, taken: the event it completes is added
+ * to the ring, but for the machine's `button` events, which no package is
+ * told (a package gets a press by asking for one, api.h). Returns what
+ * evfeed_sse_feed returns for the line. */
+int evfeed_take(evfeed_t *f, evfeed_sse_t *st, const char *line);
 
 /* What came after `since`, at most max of them into out. Returns the
  * count; *next is the sequence number to ask for next time and *dropped

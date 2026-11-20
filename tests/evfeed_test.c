@@ -396,6 +396,25 @@ int main(void)
         rmdir(dir);
     }
 
+    /* The machine's button events are no package's: a line of the stream
+     * that completes one adds nothing to the ring, and the next event is
+     * added as ever. */
+    {
+        static evfeed_t b;
+        evfeed_sse_t st;
+        memset(&st, 0, sizeof(st));
+        pthread_mutex_init(&b.mu, NULL);
+        pthread_cond_init(&b.news, NULL);
+        evfeed_take(&b, &st, "event: button");
+        evfeed_take(&b, &st, "data: {\"pressed\":true}");
+        evfeed_take(&b, &st, "");
+        CHECK(evfeed_head(&b) == 0, "a button event on the machine's stream: held for no package (head %lu)", evfeed_head(&b));
+        evfeed_take(&b, &st, "event: lid");
+        evfeed_take(&b, &st, "data: {\"open\":true}");
+        evfeed_take(&b, &st, "");
+        CHECK(evfeed_head(&b) == 1, "the event after it: held (head %lu)", evfeed_head(&b));
+    }
+
     printf("%s: evfeed_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
 }

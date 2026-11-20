@@ -103,6 +103,8 @@ FIXTURES = [
     ("a conflict with itself", with_(conflicts=["org.example.fixture"]), {}),
     ("a number default out of bounds", with_(settings={"a": {"type": "number", "default": 9, "max": 5}}), {}),
     ("a ui package without its page", with_(runtime="ui", service=None, capabilities=["ui"]), {"__no_page__": ""}),
+    ("a page that asks for a press", with_(runtime="ui", service=None, capabilities=["ui", "button"]),
+     {"__words__": 'capability "button" belongs to a service, and runtime ui has none'}),
     ("a page that does not ask for ui", with_(), {"ui/index.html": "<!doctype html><p>page</p>",
                                                   "__words__": "this package has a ui/index.html and does not ask for ui"}),
     ("an entry point that is not there", with_(service={"exec": "bin/other.py"}), {}),
