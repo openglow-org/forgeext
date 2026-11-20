@@ -86,8 +86,13 @@ whatever its grace, and --shutdown-grace takes nothing below 1 s or past
 30 s. The M-code of the one with the grant is listed while it runs, and not
 while it is frozen in place of job-time limits that cannot be set. A stop
 whose process outlives its group's kill holds up nothing of the turn. A
-predecessor's removal that the root's lock put off is taken up once the
-lock is let go. A root
+predecessor's removal waits out an armed window open at its successor's
+healthy mark, and then the root's lock, and is taken up once the window
+has closed and the lock is let go. The status file names the window the
+services were frozen for, and none once it closes, inside the shutdown
+grace too; it says quiet when nothing runs, and a host whose file says
+quiet and cannot be written starts nothing. A host the wrapper starts
+again writes its file before any of its groups holds a process. A root
 mount that is not shared (this namespace's, as unshare leaves it) is a
 machine not ready, until the test makes it shared. A start whose name is
 being looked up is put off, the turn going on, and a name the resolver
@@ -346,6 +351,17 @@ def open_streams():
         return len(streams)
 
 
+windows = {"id": 0, "open": False}            # the stand-in's armed windows: each opening it shows is a new one
+
+
+def cool_status():
+    """forgectrl's /cool/status as the host reads it: the window, and its identity while it is open."""
+    if facts["armed"] and not windows["open"]:
+        windows["id"] += 1
+    windows["open"] = facts["armed"]
+    return {"armed": facts["armed"], "window": 1000 + windows["id"] if facts["armed"] else 0}
+
+
 def check(ok, what, *args):
     text = what % args if args else what
     print("  %s  %s" % ("ok  " if ok else "FAIL", text), flush=True)
@@ -361,7 +377,7 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
             asked_mode.append(time.monotonic())
         if self.path == "/mode" and facts["on_mode"]:
             facts["on_mode"]()                      # the host asks this between its read of the state and its measurement
-        body = {"/cool/status": {"armed": facts["armed"]},
+        body = {"/cool/status": cool_status(),
                 "/mode": {"mode": facts["mode"], "controller": facts["controller"], "motion": facts["motion"]},
                 "/status": {"diag": facts["diag"]},
                 "/update/status": {"running": facts["updating"]}}.get(self.path)
@@ -952,12 +968,16 @@ def main():
               and svc("org.example.jobtime").get("job_limited") and cg("org.example.jobtime", "cpu.max").split() == ["3000", "100000"],
               "the kernel agrees, and the one with the grant runs on under job-time limits (cpu.max %s)",
               cg("org.example.jobtime", "cpu.max").strip())
+        check(status().get("window") == 1000 + windows["id"] and status().get("quiet") is False,
+              "the status names the window it froze them for, and is not quiet: %s, %s", status().get("window"),
+              status().get("quiet"))
         before = len(running())
         time.sleep(3)
         facts["armed"] = False
         check(wait_for(lambda: not svc("org.example.beat").get("frozen") and "frozen 0" in cg("org.example.beat", "cgroup.events"), 6)
-              and cg("org.example.jobtime", "cpu.max").split() == ["25000", "100000"] and len(running()) >= before,
-              "disarmed: thawed, and the grant's limits lifted")
+              and cg("org.example.jobtime", "cpu.max").split() == ["25000", "100000"] and len(running()) >= before
+              and status().get("window") == 0,
+              "disarmed: thawed, the grant's limits lifted, and no window named")
         # status.json names an M-code only for a service that answers it: running, with the grant, and not frozen.
         # Its group's cpu.max read-only for one window: the grant's job-time limits cannot be set, the freeze stands
         # in their place, and its code leaves the list until the window closes.
@@ -1409,6 +1429,9 @@ def main():
                               poll=0.1)
             check(frozen, "safe mode and %s inside the grace: the service is frozen before it is stopped: %s", what,
                   svc(lid_))
+            if key == "armed":
+                check(wait_for(lambda: status().get("window") == 1000 + windows["id"], 3, poll=0.1),
+                      "and the status names the window it froze it for: %s", status().get("window"))
             check(wait_for(lambda: svc(lid_).get("state") != "running", 10), "and stopped at the grace's end: %s", svc(lid_))
             facts[key] = False
             os.unlink(safe)
@@ -1512,12 +1535,15 @@ def main():
         for id_ in ("org.example.crash", "org.example.dial", "org.example.beat", "org.example.jobtime"):
             check(fx("disable", id_).get("ok") is True, "%s disabled for the cases below", id_)
 
-        print("a predecessor's removal put off by the root's lock is taken up once the lock is let go")
-        # Version 2 of a package turns healthy, 60 s after its start, while the test holds the root's lock: the
-        # removal of version 1 is put off, and it goes at the first turn after the lock is let go. (That the
-        # removal takes only the predecessor of the install it was put off for is super_test's.) The cases below
-        # run while it waits; the lock is taken once the unanswered-name case has installed its package, whose own
-        # waits need no lock, and 56 s on at the latest.
+        print("a predecessor's removal waits out an armed window and the root's lock")
+        # Version 2 of a package turns healthy, 60 s after its start, inside an armed window: the removal of
+        # version 1 is booked and not done while the window is open. The test then takes the root's lock and closes
+        # the window: the removal is put off by the lock, and it goes at the first turn after the lock is let go.
+        # (That the removal takes only the predecessor of the install it was put off for, and which turns take
+        # removals up, is super_test's.) The cases below run while it waits; the window opens 55 s after the start
+        # was seen, and the case reads the host's status say so before the mark, so a slow turn cannot put the mark
+        # in a turn that read the window closed; it stays open until a turn past the mark, so they see about 7 s of
+        # it at most, and the lock is held for about 3 s.
         loop = "#!/bin/sh\nwhile true; do sleep 1; done\n"
         upd2 = "org.example.updated2"
         package(upd2, "shell", loop, version="1.0.0")
@@ -1527,16 +1553,22 @@ def main():
         check(wait_for(lambda: svc(upd2).get("state") == "running", 30), "version 2 runs: %s", svc(upd2))
         upd_started = time.monotonic()
         upd_result = {}
-        lock_free = threading.Event()
 
         def hold_across_healthy():
-            lock_free.wait(max(0.0, upd_started + 56 - time.monotonic()))
+            time.sleep(max(0.0, upd_started + 55 - time.monotonic()))
+            facts["armed"] = True
+            upd_result["armed_at"] = time.monotonic() - upd_started
+            # The host has read the window before the mark: its status says so while version 2 is not healthy yet.
+            upd_result["window_before_mark"] = (wait_for(lambda: status().get("armed") is True, 10, poll=0.1)
+                                                and not svc(upd2).get("healthy"))
+            upd_result["healthy"] = wait_for(lambda: svc(upd2).get("healthy"), 40)
+            time.sleep(1.5)                         # past the turn after the mark, the window still open
+            upd_result["v1_kept_in_window"] = os.path.isdir(os.path.join(upd2pkg, "1.0.0"))
             with open(os.path.join(root, "lock"), "a") as lf:
                 fcntl.flock(lf, fcntl.LOCK_EX)
-                upd_result["held_at"] = time.monotonic() - upd_started
-                upd_result["healthy"] = wait_for(lambda: svc(upd2).get("healthy"), 40)
-                time.sleep(1.5)                     # past the turn that put the removal off
-                upd_result["v1_kept_meanwhile"] = os.path.isdir(os.path.join(upd2pkg, "1.0.0"))
+                facts["armed"] = False
+                time.sleep(1.5)                     # past a turn with the window closed and the lock held
+                upd_result["v1_kept_under_lock"] = os.path.isdir(os.path.join(upd2pkg, "1.0.0"))
                 fcntl.flock(lf, fcntl.LOCK_UN)
 
         holder = threading.Thread(target=hold_across_healthy, daemon=True)
@@ -1657,12 +1689,10 @@ def main():
               "a LAN name in a manifest is refused: %s", svc(lan))
         check(fx("remove", lan).get("ok") is True, "and it goes")
         # The namespace's resolver takes every query and answers none. The start is put off while the name is looked
-        # up (the turn goes on), and not ready once the lookup has had its 5 s; never counted. Once the package is
-        # installed these waits need no lock, so the predecessor case's hold of the root's lock runs over them.
+        # up (the turn goes on), and not ready once the lookup has had its 5 s; never counted.
         una = "org.example.unanswered"
         at = mark()
         package(una, "python", "import time\nwhile True:\n    time.sleep(1)\n", caps=["net.outbound:nowhere.test:443"])
-        lock_free.set()
         looking = wait_for(lambda: "not started yet: looking up nowhere.test" in svc(una).get("reason", ""), 30, poll=0.1)
         unanswered = wait_for(lambda: since(at, "%s: not started: the machine is not ready for it (cannot resolve "
                                                 "nowhere.test: the resolver did not answer in 5 s)" % una), 30)
@@ -1673,11 +1703,14 @@ def main():
               looking, unanswered, state_)
 
         holder.join(timeout=100)
-        check(not holder.is_alive() and upd_result.get("healthy") and upd_result.get("v1_kept_meanwhile"),
-              "version 2 healthy under the held lock, its predecessor's removal put off: %s", upd_result)
+        check(not holder.is_alive() and upd_result.get("window_before_mark") and upd_result.get("healthy")
+              and upd_result.get("v1_kept_in_window"),
+              "version 2 healthy inside an armed window, its predecessor's removal not done in the window: %s",
+              upd_result)
+        check(upd_result.get("v1_kept_under_lock"), "the window closed, the lock held: put off again: %s", upd_result)
         check(wait_for(lambda: not os.path.isdir(os.path.join(upd2pkg, "1.0.0")), 5)
               and os.path.isdir(os.path.join(upd2pkg, "2.0.0")),
-              "the lock let go, the removal put off is taken up: version 1 goes, version 2 stays: %s",
+              "the window closed and the lock let go, the removal is taken up: version 1 goes, version 2 stays: %s",
               sorted(os.listdir(upd2pkg)))
         check(fx("remove", una).get("ok") is True and fx("remove", upd2).get("ok") is True, "and they go")
         for id_ in ("org.example.crash", "org.example.dial", "org.example.beat", "org.example.jobtime"):
@@ -1690,7 +1723,23 @@ def main():
         left = [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))]
         chains = subprocess.run([NFT, "list", "table", "inet", "ffx"], capture_output=True, text=True).stdout
         check(not left and "chain u8" not in chains, "no group and no chain stays behind: %s", left)
+        # Quiet once the shutdown grace (4 s here) is over: inside it, a service enabled and not yet started again
+        # is one still waiting to start.
+        quiet_ = wait_for(lambda: status().get("quiet") is True and status().get("window") == 0, 10)
+        st_ = status()
+        check(quiet_, "nothing runs: the status says quiet: %s",
+              {k: st_.get(k) for k in ("quiet", "window", "enabled", "armed")}
+              | {"services": [(s["id"], s["state"]) for s in st_.get("services", [])]})
+        # A host whose word cannot be written starts nothing while its file says quiet: the cooling engine takes
+        # quiet as a host that will start nothing. The status file's next copy made a directory: every write fails.
+        blocked = os.path.join(run_dir, "status.json.new")
+        os.mkdir(blocked)
         os.unlink(safe)
+        time.sleep(5)
+        left = [d for d in os.listdir(CG_PARENT) if os.path.isdir(os.path.join(CG_PARENT, d))]
+        check(not left and status().get("quiet") is True,
+              "out of safe mode with its status unwritable, the file still quiet: nothing starts in 5 s: %s", left)
+        os.rmdir(blocked)
         check(wait_for(lambda: len(running()) >= 1, 20), "out of safe mode they start again")
         t_term = time.monotonic()
         daemon.send_signal(signal.SIGTERM)
@@ -1738,8 +1787,30 @@ def main():
         os.kill(host1, signal.SIGKILL)
         check(beat1 > 0 and wait_for(lambda: not os.path.exists("/proc/%d" % beat1), 2, poll=0.05),
               "the host killed (pid %d), its service (pid %d) is gone at once", host1, beat1)
-        check(wait_for(lambda: status().get("pid") not in (None, host1) and os.path.exists("/proc/%d" % status()["pid"]), 20),
-              "the wrapper starts the host again: pid %s, was %d", status().get("pid"), host1)
+
+        def populated():
+            return [d for d in os.listdir(CG_PARENT) if "populated 1" in cg(d, "cgroup.events")]
+
+        check(wait_for(lambda: not populated(), 5, poll=0.05), "and no group holds a process: %s", populated())
+        # The new host starts on a file whose writer is gone, which the cooling engine takes as no word against a
+        # window: it starts nothing before its own file stands. A group read holding a process while the status read
+        # after it is still the old host's was started before that file.
+        early, first = [], {}
+        end = time.monotonic() + 20
+        while time.monotonic() < end and not first:
+            groups = populated()
+            st_ = status()
+            if st_.get("pid") not in (None, host1) and os.path.exists("/proc/%d" % st_["pid"]):
+                first = st_
+            elif groups:
+                early = early or groups
+            time.sleep(0.001)
+        check(first, "the wrapper starts the host again: pid %s, was %d", first.get("pid"), host1)
+        check(not early and first.get("quiet") is False
+              and not [s for s in first.get("services", []) if s.get("state") == "running"],
+              "its first status comes before any group holds a process, runs nothing and is not quiet: early %s, %s",
+              early, {k: first.get(k) for k in ("quiet", "window")}
+              | {"services": [(s["id"], s["state"]) for s in first.get("services", [])]})
         check(wait_for(lambda: svc(beat).get("state") == "running" and svc(beat).get("pid") not in (None, beat1), 40),
               "and the heartbeat runs again under a new pid: %s, was %d", svc(beat).get("pid"), beat1)
         host2 = status().get("pid", 0)

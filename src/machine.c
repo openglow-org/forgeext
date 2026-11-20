@@ -468,10 +468,18 @@ static json_t *get_json(const machine_cfg_t *cfg, const char *path)
     return j;
 }
 
-int machine_armed(const machine_cfg_t *cfg)
+/* The window's identity: an integer above 0 while it reads open, else 0. */
+static unsigned long long window_of(json_t *cool, int armed)
+{
+    json_t *w = json_object_get(cool, "window");
+    return armed == 1 && json_is_integer(w) && json_integer_value(w) > 0 ? (unsigned long long)json_integer_value(w) : 0;
+}
+
+int machine_armed(const machine_cfg_t *cfg, unsigned long long *window)
 {
     json_t *cool = get_json(cfg, "/cool/status");
     int armed = cool && json_is_boolean(json_object_get(cool, "armed")) ? json_is_true(json_object_get(cool, "armed")) : -1;
+    *window = window_of(cool, armed);
     json_decref(cool);
     return armed;
 }
@@ -493,6 +501,7 @@ void machine_read(const machine_cfg_t *cfg, machine_t *m, int with_start_facts)
     json_t *cool = get_json(cfg, "/cool/status");
     if (cool && json_is_boolean(json_object_get(cool, "armed")))
         m->armed = json_is_true(json_object_get(cool, "armed"));
+    m->window = window_of(cool, m->armed);
     json_decref(cool);
     json_t *mode = get_json(cfg, "/mode");
     const char *mm = mode ? json_string_value(json_object_get(mode, "mode")) : NULL;

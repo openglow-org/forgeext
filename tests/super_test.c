@@ -34,13 +34,18 @@
  * looked up is put off a moment, with nothing counted, no backoff grown
  * and the stagger not spent. A service is healthy only on the install it
  * was started from. The status file takes what the host writes whole, at
- * any size. And the removals of predecessors the root's lock put off are
- * kept one per package, the latest predecessor and its install's stamp,
- * until a try ends another way; a removal takes the predecessor only of
+ * any size. And the removals of predecessors due are kept one per
+ * package, the latest predecessor and its install's stamp, until a try
+ * ends another way, and are taken up only in a turn whose armed window
+ * reads closed, the host not stopping; a removal takes the predecessor only of
  * the install it was put off for (ext_drop_previous over a root of the
  * test's): a record a later install wrote, or one that names another
  * predecessor, keeps its own. The healthy mark takes a predecessor only
- * from the record the service was started from.
+ * from the record the service was started from. The host's word on the
+ * armed window names the window a judged turn read open, none after a
+ * closed read, and keeps it through an unreadable one; it is quiet only
+ * with nothing running and nothing to start, and a start waits for a file
+ * that is not quiet.
  */
 #include "../src/super.h"
 #include "../src/install.h"
@@ -382,6 +387,29 @@ int main(void)
         run_drop_due(due, &n, 3, "org.example.e", "1.0.0", STAMP_A, 1);
         CHECK(n == 3 && due[3].id[0] == '\0', "a full book takes no more: %d entries", n);
     }
+
+    /* the removals due are taken up only in a turn whose armed window
+     * reads closed, extensions on or in their grace, the host not stopping */
+    CHECK(run_drops_now(1, 0, 0), "a closed window: the removals due are taken up");
+    CHECK(!run_drops_now(1, 1, 0) && !run_drops_now(1, -1, 0), "a window open, or one that cannot be read: put off");
+    CHECK(!run_drops_now(0, -1, 0) && !run_drops_now(0, 0, 0), "extensions off: put off");
+    CHECK(!run_drops_now(1, 0, 1), "the last pass after a TERM: put off");
+
+    /* the host's word on the armed window: a judged turn that read it open
+     * names it; closed, not judged, or extensions off, none; unreadable
+     * (every service frozen) keeps what was named */
+    CHECK(run_window_word(0, 1, 1, 1, 7) == 7, "a turn that read window 7 open names it");
+    CHECK(run_window_word(7, 1, 1, 0, 0) == 0, "a turn that read the window closed names none");
+    CHECK(run_window_word(7, 1, 1, -1, 0) == 7, "a turn that could not read it keeps the window named");
+    CHECK(run_window_word(7, 0, 1, 1, 7) == 0 && run_window_word(7, 1, 0, 1, 7) == 0,
+          "the last pass after a TERM, or extensions off: none");
+    /* quiet: nothing running, and nothing to start or extensions off; a
+     * start only while the file in force does not say quiet */
+    CHECK(run_quiet(0, 0, 1) && run_quiet(0, 1, 0), "nothing running, nothing waiting or extensions off: quiet");
+    CHECK(!run_quiet(1, 0, 1) && !run_quiet(1, 0, 0) && !run_quiet(0, 1, 1),
+          "a service running, or one waiting to start with extensions on: not quiet");
+    CHECK(run_may_start(1, 0) && !run_may_start(1, 1) && !run_may_start(0, 0),
+          "a start only while the file in force does not say quiet");
 
     /* a removal put off is one install's: a record a later install wrote
      * keeps its predecessor, the same version though it names, and so does

@@ -32,6 +32,7 @@ typedef struct {
     int enabled;                /* the master switch is on and safe mode is not */
     char off_reason[96];
     int armed;                  /* 1, 0, or -1 when it could not be read */
+    unsigned long long window;  /* the open window's identity, as /cool/status names it, or 0 */
     int mode_cloud;             /* 1 cloud, 0 grbl, -1 when it could not be read */
     int may_start;              /* the controller up, motion verified, no diagnostic, no flash */
     char not_ready[96];         /* why may_start is 0 */
@@ -41,9 +42,9 @@ void machine_cfg_defaults(machine_cfg_t *cfg);
 
 /* The armed window alone, as forgectrl's /cool/status says it: 1 open,
  * 0 closed, -1 when it cannot be read (which the supervisor takes as
- * open). For a turn on which machine_read() asked nothing because
- * extensions are off. */
-int machine_armed(const machine_cfg_t *cfg);
+ * open); *window its identity while it reads open, else 0. For a turn on
+ * which machine_read() asked nothing because extensions are off. */
+int machine_armed(const machine_cfg_t *cfg, unsigned long long *window);
 
 /* with_start_facts: also ask what a start needs to know (two more
  * requests); without it may_start is 0. */

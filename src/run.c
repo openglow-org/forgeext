@@ -62,9 +62,12 @@ typedef struct {
     char dropped[SUPER_MAX_SERVICES][64];       /* the advisory holds dropped at the last turn, each said once */
     int ndropped;
     int window, enabled;                        /* at the last turn: the armed window, and extensions on */
-    run_drop_t drop_due[SUPER_MAX_SERVICES];    /* predecessors put off while a command held the root's lock */
+    run_drop_t drop_due[SUPER_MAX_SERVICES];    /* predecessors due to go: booked at a healthy mark, or put off
+                                                 * by the root's lock or an armed window */
     int ndrop_due;
     double grace_until;                         /* services stop after this: ext.shutdown's second to be read */
+    unsigned long long window_word;             /* the window the host names as paused for (run_window_word) */
+    int file_quiet;                             /* status.json says quiet, or what it says is not known */
 } run_t;
 
 /* The M-codes a manifest answers, as the service record's bits. */
@@ -585,6 +588,11 @@ const state_pkg_t *run_healthy_record(state_t *st, const char *id, unsigned long
     return p && p->previous[0] && run_conf_digest(p) == started ? p : NULL;
 }
 
+/* The healthy mark books the removal; the turn's loop takes it up after
+ * the judgment (run_drops_now), so no tree is walked in a turn that reads
+ * a window open or unknown. One under way when a window opens makes that
+ * window's freeze late, never its first fire: the cooling engine
+ * acknowledges the window only once the host has paused its services. */
 static void op_healthy(void *ctx, svc_t *s)
 {
     run_t *r = ctx;
@@ -593,7 +601,30 @@ static void op_healthy(void *ctx, svc_t *s)
     const state_pkg_t *p = state_load(r->cfg->ext.root, &st, err, sizeof(err)) == 0
                                    ? run_healthy_record(&st, s->id, s->conf_started) : NULL;
     if (p)
-        drop_previous(r, s->id, p->previous, p->stamp);
+        run_drop_due(r->drop_due, &r->ndrop_due, SUPER_MAX_SERVICES, s->id, p->previous, p->stamp, 1);
+}
+
+int run_drops_now(int enabled, int armed, int stopping)
+{
+    return enabled && armed == 0 && !stopping;
+}
+
+unsigned long long run_window_word(unsigned long long word, int judged, int enabled, int armed,
+                                   unsigned long long window)
+{
+    if (!judged || !enabled || armed == 0)
+        return 0;
+    return armed == 1 ? window : word;
+}
+
+int run_quiet(int running, int waiting, int enabled)
+{
+    return !running && (!waiting || !enabled);
+}
+
+int run_may_start(int may_start, int file_quiet)
+{
+    return may_start && !file_quiet;
 }
 
 static void op_log(void *ctx, int prio, const char *text)
@@ -1069,7 +1100,10 @@ static int sync_installed(run_t *r, super_t *sv, state_t *st)
     return 0;
 }
 
-static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
+/* quiet: run_quiet's answer for the turn. r->file_quiet follows what the
+ * file says once this returns: quiet when the file says so, kept as it was
+ * when a write fails. */
+static void write_status(run_t *r, const super_t *sv, const machine_t *mc, int quiet)
 {
     json_t *top = json_object(), *list = json_array();
     /* The file is written when it changes and outlives a host that was
@@ -1078,6 +1112,8 @@ static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
     json_object_set_new(top, "enabled", json_boolean(mc->enabled));
     json_object_set_new(top, "off_reason", json_string(mc->off_reason));
     json_object_set_new(top, "armed", mc->armed < 0 ? json_null() : json_boolean(mc->armed));
+    json_object_set_new(top, "window", json_integer((json_int_t)r->window_word));
+    json_object_set_new(top, "quiet", json_boolean(quiet));
     json_object_set_new(top, "not_ready", json_string(mc->not_ready));
     json_object_set_new(top, "events", json_pack("{s:b, s:i}", "connected", evfeed_connected(&r->feed),
                                                  "wanted", api_events_wanted(&r->api)));
@@ -1111,9 +1147,12 @@ static void write_status(run_t *r, const super_t *sv, const machine_t *mc)
     json_decref(top);
     if (!text)
         return;
-    if ((!r->last_status || strcmp(text, r->last_status) != 0) && run_status_file(r->cfg->run_dir, text) == 0) {
+    if (r->last_status && strcmp(text, r->last_status) == 0) {
+        r->file_quiet = quiet;                          /* the file says it already */
+    } else if (run_status_file(r->cfg->run_dir, text) == 0) {
         free(r->last_status);
         r->last_status = text;                          /* kept: it is what the file says now */
+        r->file_quiet = quiet;
         text = NULL;
     }
     free(text);
@@ -1170,6 +1209,7 @@ int run_daemon(const run_cfg_t *cfg)
 
     memset(&r, 0, sizeof(r));
     r.cfg = cfg;
+    r.file_quiet = 1;                                   /* what the last host's file says is not known */
     if (geteuid() != 0) {
         fprintf(stderr, "forgeext run: needs root\n");
         return 2;
@@ -1340,6 +1380,7 @@ int run_daemon(const run_cfg_t *cfg)
          * starts and nothing is stopped yet; an armed window still freezes
          * them, as it would any other turn. */
         super_inputs_t tick = in;
+        unsigned long long tick_window = mc.window;
         if (!mc.enabled && mono() < r.grace_until) {
             tick.enabled = 1;
             tick.may_start = 0;
@@ -1347,11 +1388,15 @@ int run_daemon(const run_cfg_t *cfg)
              * window is asked for here: a service is frozen inside the
              * grace for a window that is open or cannot be read, and
              * never for want of the question. */
-            tick.armed = machine_armed(&cfg->machine);
+            tick.armed = machine_armed(&cfg->machine, &tick_window);
         }
+        /* A start waits for a status file that does not say quiet: the
+         * cooling engine takes quiet as a host that will start nothing. */
+        tick.may_start = run_may_start(tick.may_start, r.file_quiet);
         if (!stopping)
             super_tick(&sv, &tick, mono());
-        for (int i = r.ndrop_due - 1; i >= 0; i--) {
+        r.window_word = run_window_word(r.window_word, !stopping, tick.enabled, tick.armed, tick_window);
+        for (int i = r.ndrop_due - 1; i >= 0 && run_drops_now(tick.enabled, tick.armed, stopping); i--) {
             run_drop_t due = r.drop_due[i];
             drop_previous(&r, due.id, due.previous, due.stamp);
         }
@@ -1366,7 +1411,10 @@ int run_daemon(const run_cfg_t *cfg)
          * when nobody does: forgectrl samples its own state only while a
          * stream is open. */
         evfeed_want(&r.feed, mc.enabled ? api_events_wanted(&r.api) : 0);
-        write_status(&r, &sv, &mc);
+        waiting = 0;
+        for (int i = 0; i < sv.n; i++)
+            waiting |= sv.svc[i].wanted && sv.svc[i].state != SVC_RUNNING;
+        write_status(&r, &sv, &mc, run_quiet(super_running(&sv) > 0, waiting, tick.enabled));
         if (cfg->ticks && ++turns >= cfg->ticks)
             stopping = 1;
     }
@@ -1386,7 +1434,8 @@ int run_daemon(const run_cfg_t *cfg)
     memset(&off, 0, sizeof(off));
     snprintf(off.off_reason, sizeof(off.off_reason), "the extension host is not running");
     off.armed = -1;
-    write_status(&r, &sv, &off);
+    r.window_word = 0;
+    write_status(&r, &sv, &off, 1);                     /* every service stopped: quiet */
     free(r.last_status);
     r.last_status = NULL;
     fflog(LOG_NOTICE, "stopped");

@@ -56,8 +56,8 @@ int run_daemon(const run_cfg_t *cfg);
  * or -1 with the file as it was. */
 int run_status_file(const char *run_dir, const char *text);
 
-/* A predecessor whose removal the root's lock put off: the one the record
- * named, and the stamp of the install that ran healthy. */
+/* A predecessor due to go, booked at its successor's healthy mark: the one
+ * the record named, and the stamp of the install that ran healthy. */
 typedef struct {
     char id[64], previous[33], stamp[17];
 } run_drop_t;
@@ -68,6 +68,37 @@ typedef struct {
  * that ends any other way takes the package's entry out. *n entries in
  * due, at most max. */
 void run_drop_due(run_drop_t due[], int *n, int max, const char *id, const char *previous, const char *stamp, int busy);
+
+/* Whether a turn takes up the removals due, after its judgment: only one
+ * of a running host whose armed window reads closed (armed 0), with
+ * extensions on or inside their grace (enabled, the turn's own inputs).
+ * A window open or that cannot be read (armed 1 or -1), extensions off,
+ * and the last pass after a TERM (stopping) put them off: a tree walked
+ * there would make the next freeze late by its time. */
+int run_drops_now(int enabled, int armed, int stopping);
+
+/* The host's word on the armed window, in status.json at the end of every
+ * turn; forgectrl's cooling engine reads it before it acknowledges a
+ * window. "window" names the open window the host has frozen or held every
+ * service for, with no turn since that could have started or thawed one;
+ * "quiet" says no service runs and none starts before the file says
+ * otherwise.
+ *
+ * run_window_word: the window a turn leaves named, from the one named
+ * before (word), whether the turn was judged (judged: not the last pass
+ * after a TERM), and the turn's own inputs (enabled, armed, window). A
+ * judged turn that read the window open names it; one that read it closed,
+ * or did not judge, names none (0); one that could not read it froze every
+ * service and keeps the word it had. */
+unsigned long long run_window_word(unsigned long long word, int judged, int enabled, int armed,
+                                   unsigned long long window);
+
+/* run_quiet: no service running, and none waiting to start or extensions
+ * off (the turn's enabled). run_may_start: a turn starts a service only
+ * while the status file in force does not say quiet, so a quiet word on
+ * file never stands while a service starts. */
+int run_quiet(int running, int waiting, int enabled);
+int run_may_start(int may_start, int file_quiet);
 
 /* What a service runs with, as the supervisor compares it (svc_t's
  * conf_wanted and conf_started): its install and the operator's
