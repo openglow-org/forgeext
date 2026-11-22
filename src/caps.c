@@ -25,7 +25,7 @@ static const cap_def_t defs[] = {
     { "motion.jog",     0, 0, 1, "jog the head, laser off, inside the jog bounds" },
     { "motion.offsets", 0, 1, 0, "change the work offsets" },
     { "motion.job",     0, 1, 1, "run a program as the machine's one sender" },
-    { "hold",           0, 1, 1, "hold a job until it clears the hold" },
+    { "hold",           0, 1, 1, "hold a running job until it clears the hold (a job that first fires under it is refused)" },
     { "job_time.run",   0, 1, 1, "keep running while a job is armed" },
     { "ui",             0, 0, 1, "show a card of its own on the control panel's Extensions tab" },
     { "ui.background",  0, 1, 1, "keep its page running while the control panel shows another tab" },
