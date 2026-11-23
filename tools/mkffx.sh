@@ -12,7 +12,7 @@
 # (payload.tar.gz), and no task. With a private key (made with `fwup -g`)
 # it is signed and the signature is checked against <private-key>'s .pub
 # before the script reports success; without one the output is unsigned,
-# which a machine installs only with the button held.
+# which a machine installs only with its button pressed for it.
 #
 #   FWUP   the fwup binary (default: fwup on PATH)
 #

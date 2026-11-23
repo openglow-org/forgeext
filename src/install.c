@@ -897,10 +897,18 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
     }
     const manifest_t *m = &res->manifest;
 
+    /* The archive the operator was shown, judged on the bytes this install
+     * read: another one staged since is refused before anything else. */
+    if (opts->digest && strcmp(opts->digest, res->info.payload_b2) != 0) {
+        fail(err, elen, "this archive is not the one that was shown (its digest differs): upload it again");
+        goto out;
+    }
+
     /* The operator's part: consent for the tier, and a grant for every
      * capability that needs one and for nothing the package did not ask. */
     if (res->info.tier == TIER_UNVERIFIED && !opts->consent_unverified) {
-        fail(err, elen, "nobody this machine trusts signed this package: installing it takes the button held");
+        fail(err, elen, "nobody this machine trusts signed this package: installing it takes the machine's button "
+                        "pressed for it");
         goto out;
     }
     if (res->info.tier == TIER_COMMUNITY && !opts->consent_community) {

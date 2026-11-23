@@ -65,7 +65,11 @@ typedef struct {
     const char *grants[MANIFEST_MAX_CAPS];  /* what the operator granted, of the capabilities that need it */
     int ngrants;
     int consent_community;                  /* the operator typed the consent for a community package */
-    int consent_unverified;                 /* the button was held for an unverified one */
+    int consent_unverified;                 /* the button was pressed for an unverified one */
+    /* The payload's blake2b-256 the operator was shown (the inspect's
+     * "digest"), or NULL: the archive read for the install must carry that
+     * payload, or nothing is installed. */
+    const char *digest;
 } install_opts_t;
 
 typedef struct {
@@ -184,7 +188,7 @@ int ext_quarantine_if(const ext_env_t *env, const char *id, int (*still)(const s
 /* The owner's keys: the trust anchor the owner may replace. A key file
  * under <root>/keys is what makes a package community rather than
  * unverified, so adding one is the operator's own act (forgectrl asks for
- * the machine's button to be held, as for unsigned firmware).
+ * the machine's button pressed for it, as for unsigned firmware).
  *
  * name is what the key is called: letters, digits, dash, underscore, dot,
  * at most 48 bytes, no path. text is the key as fwup writes it (base64) or

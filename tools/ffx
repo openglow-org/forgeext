@@ -812,7 +812,7 @@ def cmd_pack(a):
             print("signed: %s (%s %s)" % (out, m["id"], m["version"]))
         else:
             shutil.copyfile(raw, out)
-            print("UNSIGNED: %s (%s %s) - a machine installs it only with its button held" % (out, m["id"], m["version"]))
+            print("UNSIGNED: %s (%s %s) - a machine installs it only with its button pressed for it" % (out, m["id"], m["version"]))
     except subprocess.CalledProcessError as e:
         raise Refused("fwup failed: %s" % (e.stderr or b"").decode("utf-8", "replace").strip())
     finally:
@@ -1521,6 +1521,38 @@ def _multipart(field, name, data):
     return body, "multipart/form-data; boundary=%s" % b
 
 
+PRESS_WAIT_S = 120     # the machine's own bound on one consent (forgectrl src/btnres.h, BTNRES_CONSENT_S)
+
+
+def _press(mc, what):
+    """The machine's button pressed for one consent, as the panel's dialog asks for it (forgectrl's POST
+    /button/reserve): the consent registered under a name of this run's own and renewed every half second; the owner
+    is asked to press once the machine says it is ready, and the press is the one the machine read after that. The
+    name, which the action that takes the press carries; or Refused, with the consent withdrawn."""
+    nonce = "ffx" + os.urandom(8).hex()
+    q = urllib.parse.urlencode(dict(what, on="1", id=nonce))
+    said = waits = ""
+    end = time.monotonic() + PRESS_WAIT_S
+    try:
+        while time.monotonic() < end:
+            r = mc.json("POST", "/button/reserve?" + q)
+            if r.get("pressed"):
+                print("The press is taken.")
+                return nonce
+            if r.get("ready") and not said:
+                said = "Press the machine's button once now."
+                print(said)
+            elif not r.get("ready") and r.get("waits") and r.get("waits") != waits:
+                waits = r.get("waits")
+                print("Not yet: %s" % waits)
+            time.sleep(0.5)
+    except Refused:
+        mc.request("POST", "/button/reserve?on=0&id=" + nonce)
+        raise
+    mc.request("POST", "/button/reserve?on=0&id=" + nonce)
+    raise Refused("the machine's button was not pressed within %d s" % PRESS_WAIT_S)
+
+
 def cmd_install(a):
     data = open(a.file, "rb").read()
     mc = Machine(a.machine, a.user)
@@ -1539,17 +1571,23 @@ def cmd_install(a):
         if g not in (j.get("needs_grant") or []):
             mc.request("POST", "/ext/upload/discard")
             raise Refused("%s is not something this package needs a grant for" % g)
-    form = {"grants": ",".join(grants)}
+    # The install names the archive this upload was answered for: the machine installs that one or nothing.
+    form = {"grants": ",".join(grants), "digest": j.get("digest") or ""}
     consent = j.get("consent")
-    if consent == "typed":
-        form["phrase"] = input("A community package: type I UNDERSTAND to install it: ")
-    elif consent == "button":
-        input("An unverified package: hold the machine's button, and press Enter while you hold it. ")
+    nonce = None
     try:
+        if consent == "typed":
+            form["phrase"] = input("A community package: type I UNDERSTAND to install it: ")
+        elif consent == "button":
+            print("An unverified package: the machine's button, pressed for it, is your consent.")
+            nonce = form["consent"] = _press(mc, {"for": "install", "digest": form["digest"]})
         j = mc.json("POST", "/ext/install", urllib.parse.urlencode(form).encode(), "application/x-www-form-urlencoded")
     except Refused:
         mc.request("POST", "/ext/upload/discard")
         raise
+    finally:
+        if nonce:
+            mc.request("POST", "/button/reserve?on=0&id=" + nonce)
     print("installed: %s" % pkg.get("id"))
     return 0
 

@@ -16,7 +16,8 @@ overwrite a key; `ffx index record` writes a listed version's record only
 for an archive its signer's key verifies, and none for an archive that a
 zip tool reads otherwise than the machine; `ffx install` and `ffx logs`
 check the remembered certificate on every connection, before the password
-goes; and `ffx index build` makes an
+goes, and `ffx install` names the archive it was answered for and takes an
+unverified package's press through its consent; and `ffx index build` makes an
 index of a catalog directory that the host keeps, the same bytes twice over
 a second apart, and refuses a catalog out of form. The fixtures are one per
 path of the manifest's judgment and of lint's file checks; the index's form
@@ -400,7 +401,8 @@ def machine_client(ffx, top, archive):
     """ffx install and ffx logs against a stand-in for forgectrl's HTTPS routes, answered as the daemon answers
     them (the login, the page that carries the token, the upload, the install, the log's tail), so what the tool
     sends is held to the contract: the cookie and the token on every write, an address-literal Host, the archive
-    as the file part, the grants and the phrase."""
+    as the file part, the grants and the phrase, the digest of the archive the upload was answered for, and an
+    unverified package's consent registered and pressed before its install."""
     import builtins
     import getpass
     import http.server
@@ -414,6 +416,8 @@ def machine_client(ffx, top, archive):
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
                     "-subj", "/CN=forgefirm", "-days", "1"], check=True, capture_output=True)
     seen = []
+    tier, consent, nonce, polls = ["community"], ["typed"], [], []
+    DIGEST = "ab" * 32
 
     class Forgectrl(http.server.BaseHTTPRequestHandler):
         def reply(self, code, body, headers=()):
@@ -453,13 +457,28 @@ def machine_client(ffx, top, archive):
                 return self.reply(403, {"error": "authentication required"})
             if u.path == "/ext/upload":
                 ok = b'name="file"' in body and open(archive, "rb").read() in body
-                return self.reply(200 if ok else 400, {"tier": "community", "consent": "typed", "update": False,
-                                                       "needs_grant": ["hold"], "new_capabilities": [],
+                return self.reply(200 if ok else 400, {"tier": tier[0], "consent": consent[0], "update": False,
+                                                       "needs_grant": ["hold"], "new_capabilities": [], "digest": DIGEST,
                                                        "package": {"id": "org.example.fixture", "version": "1.0.0",
                                                                    "author": "Test", "capabilities": ["hold", "machine.read"]}})
+            if u.path == "/button/reserve":
+                # The consent's registration and its renewals: not ready, then ready, then the press taken.
+                q = dict(urllib.parse.parse_qsl(u.query))
+                if q.get("on") == "0":
+                    return self.reply(200, {"reserved": False, "ready": False, "pressed": False, "waits": ""})
+                ok = q.get("for") == "install" and q.get("digest") == DIGEST and q.get("id", "").startswith("ffx")
+                if not ok or (nonce and q["id"] != nonce[0]):
+                    return self.reply(400, {"error": "not the consent: %s" % q})
+                nonce[:] = [q["id"]]
+                polls.append(q["id"])
+                n = len(polls)
+                return self.reply(200, {"reserved": True, "ready": n >= 2, "pressed": n >= 3,
+                                        "waits": "" if n >= 2 else "a job waits for the button press: cancel it first"})
             if u.path == "/ext/install":
                 f = dict(urllib.parse.parse_qsl(body.decode()))
-                ok = f == {"grants": "hold", "phrase": "I UNDERSTAND"}
+                want = ({"grants": "hold", "phrase": "I UNDERSTAND", "digest": DIGEST} if consent[0] == "typed"
+                        else {"grants": "hold", "digest": DIGEST, "consent": nonce[0] if nonce else "?"})
+                ok = f == want
                 return self.reply(200 if ok else 400, {"enabled": True} if ok else {"error": "not the consent: %s" % f})
             if u.path == "/ext/upload/discard":
                 return self.reply(200, {"discarded": True})
@@ -493,8 +512,21 @@ def machine_client(ffx, top, archive):
         check(posts[1][3].startswith("multipart/form-data; boundary="), "the archive goes as a file part")
         known = json.load(open(os.path.join(home, ".ffx", "machines.json")))
         check(list(known) == [addr], "the certificate is remembered after the owner said yes")
+        # An unverified package: the consent registered for this archive and renewed, the press asked for once the
+        # machine is ready, the install carrying the press's name and the digest, and the consent withdrawn after.
+        tier[0], consent[0] = "unverified", "button"
         seen.clear()
         answers = iter([])
+        with out:
+            rc = ffx.main(["install", archive, "--machine", addr, "--user", "owner", "--grant", "hold"])
+        posts = [p[1] for p in seen if p[0] == "POST"]
+        check(rc == 0 and "installed: org.example.fixture" in out.text and "Press the machine's button once now." in out.text,
+              "an unverified package installed on the press: rc %s, %s", rc, out.text[-300:])
+        check(0 <= out.text.find("Not yet:") < out.text.find("Press the machine's button once now."),
+              "the press asked for only once the machine is ready, after it named who waits: %s", out.text[-300:])
+        check(posts == ["/login", "/ext/upload"] + ["/button/reserve"] * 3 + ["/ext/install", "/button/reserve"],
+              "login, upload, the consent until pressed, install, the consent withdrawn: %s", posts)
+        seen.clear()
         with out:
             rc = ffx.main(["logs", "--machine", addr, "--user", "owner", "--id", "org.example.fixture"])
         check(rc == 0 and "a line of org.example.fixture" in out.text and "somebody else" not in out.text,

@@ -9,7 +9,8 @@ Drives the built binary (FORGEEXT, default build/forgeext) against real
 archives made with fwup (FWUP, default fwup on PATH) and throwaway keys:
 the three tiers and what each needs from the operator, the product gate
 in both of its directions, a firmware key on an extension, a payload that
-is not the one the signed metadata names, payloads that try to leave the
+is not the one the signed metadata names, an install bound to the payload
+the operator was shown (the inspect's digest), payloads that try to leave the
 package, the namespace, key pinning across an update, the capability diff,
 conflicts, the budget, the integrity check, `current` left by a crash on
 a version the state does not name and turned back at the next prepare
@@ -969,9 +970,18 @@ def run_all(w, top):
     check(w.run("install", b, "--consent-unverified").get("ok") is False, "the button is not the typed consent")
     check(w.run("install", b, "--consent-community").get("ok") is True, "a community package with consent")
     c = w.pack(w.tree(manifest(C, runtime="data")))
-    check("button held" in w.run("install", c).get("error", ""), "an unsigned package with no button")
+    check("button pressed" in w.run("install", c).get("error", ""), "an unsigned package with no button")
     check(w.run("install", c, "--consent-community").get("ok") is False, "typed consent is not the button")
-    check(w.run("install", c, "--consent-unverified").get("ok") is True, "an unsigned package with the button")
+    # The install is bound to the archive the operator was shown: the inspect names its payload's digest, and an
+    # install given another one (another archive staged since) refuses and leaves nothing.
+    shown = w.run("inspect", c).get("digest", "")
+    swapped = w.run("inspect", w.pack(w.tree(manifest(C, "1.0.1", runtime="data")))).get("digest", "")
+    r = w.run("install", c, "--consent-unverified", "--digest", swapped)
+    check(len(shown) == 64 and len(swapped) == 64 and shown != swapped and r.get("ok") is not True
+          and C not in [p["id"] for p in w.run("list")["packages"]] and not w.leftovers(),
+          "an install given the digest of another archive: refused, nothing installed: %s" % r.get("error"))
+    check(w.run("install", c, "--consent-unverified", "--digest", shown).get("ok") is True,
+          "an unsigned package with the button, the archive it was shown")
     d = w.pack(w.tree(manifest(D, runtime="data")), "stranger")
     r = w.run("inspect", d)
     check(r.get("ok") and r["tier"] == "unverified" and r["key"] == "", "a stranger's signature is nobody's: %s" % r)
@@ -1111,7 +1121,7 @@ def run_all(w, top):
     r = w.run("inspect", resigned)
     check(r.get("ok") and r["tier"] == "unverified", "rewritten metadata under the old signature is nobody's: %s" % r)
     r = w.run("install", resigned)
-    check("button held" in r.get("error", ""), "and installs only as an unverified package -> %s" % r.get("error"))
+    check("button pressed" in r.get("error", ""), "and installs only as an unverified package -> %s" % r.get("error"))
 
     print("payloads that try to leave the package")
     E = "org.example.escape"

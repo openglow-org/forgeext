@@ -33,6 +33,7 @@ static int usage(void)
             "usage: forgeext [options] <command>\n"
             "  inspect <file.ffx>                 what the archive is and what it asks for; changes nothing\n"
             "  install <file.ffx> [--grant <capability>]... [--consent-community] [--consent-unverified]\n"
+            "          [--digest <blake2b-256>]  the archive must carry the payload the inspect named\n"
             "  list                               what is installed\n"
             "  check [<id>]                       do the installed files still match what was installed\n"
             "  remove <id> [--keep-data]\n"
@@ -171,6 +172,9 @@ static json_t *result_json(install_result_t *r)
     json_object_set_new(j, "package", manifest_json(&r->manifest));
     json_object_set_new(j, "tier", json_string(pkg_tier_name(r->info.tier)));
     json_object_set_new(j, "key", json_string(r->info.key_id));
+    /* What the operator is shown is this payload: an install given it
+     * (--digest) installs this archive or nothing. */
+    json_object_set_new(j, "digest", json_string(r->info.payload_b2));
     /* The key is the one the signed index endorses for this id, and no
      * key of the owner's: what makes it community here. */
     json_object_set_new(j, "endorsed", json_boolean(r->info.endorsed_id[0] != '\0'));
@@ -474,6 +478,8 @@ int main(int argc, char **argv)
                 opts.consent_community = 1;
             else if (strcmp(argv[i], "--consent-unverified") == 0)
                 opts.consent_unverified = 1;
+            else if (strcmp(argv[i], "--digest") == 0 && i + 1 < argc)
+                opts.digest = argv[++i];
             else
                 return usage();
         }
