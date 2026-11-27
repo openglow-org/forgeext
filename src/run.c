@@ -783,7 +783,11 @@ static int job_call(void *ctx, const char *id, const char *program, const char *
     int rc;
 
     if (!program) {
-        rc = machine_post(&cfg->machine, "/job/abort", answer, sizeof(answer));
+        /* In the package's name: the machine ends its own job and no one
+         * else's. */
+        char abort_path[120];
+        snprintf(abort_path, sizeof(abort_path), "/job/abort?id=%.63s", id);
+        rc = machine_post(&cfg->machine, abort_path, answer, sizeof(answer));
     } else {
         if (strchr(program, '/') || strstr(program, "..") || !program[0])
             return say_json(out, olen, 400,
@@ -791,7 +795,16 @@ static int job_call(void *ctx, const char *id, const char *program, const char *
                                                         "with no directory in it"));
         snprintf(data, sizeof(data), "%.255s/data/%.63s", cfg->ext.root, id);
         int dirfd = open(data, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        int prog_fd = dirfd < 0 ? -1 : openat(dirfd, program, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        /* O_NONBLOCK: a FIFO the package made under that name would hold
+         * the open until a writer came, and the package is the only one
+         * that could be the writer. A regular file ignores the flag. The
+         * descriptor must be a regular file before anything reads it. */
+        int prog_fd = dirfd < 0 ? -1 : openat(dirfd, program, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        struct stat psb;
+        if (prog_fd >= 0 && (fstat(prog_fd, &psb) != 0 || !S_ISREG(psb.st_mode))) {
+            close(prog_fd);
+            prog_fd = -1;
+        }
         if (dirfd >= 0)
             close(dirfd);
         if (prog_fd < 0)
@@ -965,6 +978,29 @@ static int settings_call(void *ctx, const char *id, const char *patch, size_t pl
 
 /* ---- one turn ---------------------------------------------------------------- */
 
+/* A service has ended: a required hold of its stands in the host's words
+ * now, before the stop's waits and the next turn. */
+static void raise_ended(run_t *r, const super_t *sv, pid_t pid)
+{
+    for (int i = 0; i < sv->n; i++)
+        if (pid > 0 && sv->svc[i].pid == pid && sv->svc[i].hold_required)
+            holdkeep_raise(&r->holds, sv->svc[i].id, "the extension is not running");
+}
+
+/* The broker's word for a package that has just changed it, on the
+ * broker's thread, before the package is answered: a hold raised is on
+ * disk at once (holdkeep_raise(): an entry the turn already keeps, only
+ * toward raised), and so is a claim on the sender the machine granted.
+ * A clear, and a claim let go, wait for the turn. */
+static void broker_said(void *ctx, const char *id, int raised, const char *reason, int sender_out)
+{
+    run_t *r = ctx;
+    if (raised)
+        holdkeep_raise(&r->holds, id, reason);
+    if (sender_out)
+        holdkeep_claim(&r->senders, id, "keeps the Grbl sender out");
+}
+
 /* The holds, as they stand after this turn's policy. A package that is
  * enabled and runs in this controller mode has a file while extensions are
  * on; every other case has none, and that is the operator's exit. The
@@ -977,7 +1013,12 @@ static void holds_turn(run_t *r, const super_t *sv, const super_inputs_t *in)
     int n = 0, nd = 0;
     for (int i = 0; in->enabled && i < sv->n && n < HOLDKEEP_MAX; i++) {
         const svc_t *s = &sv->svc[i];
-        int mode_ok = in->mode_cloud < 0 ? 1 : in->mode_cloud ? s->mode_cloud : s->mode_grbl;
+        /* A required hold of a package whose modes are not known (its
+         * manifest has not read since this host started) is raised in the
+         * host's words, whatever the mode: the host cannot say it does not
+         * apply. */
+        int known = s->mode_grbl || s->mode_cloud;
+        int mode_ok = !known ? s->hold_required : in->mode_cloud < 0 ? 1 : in->mode_cloud ? s->mode_cloud : s->mode_grbl;
         if (!s->present || !s->hold || !s->pkg_enabled || !mode_ok)
             continue;
         api_hold_t said;
@@ -1297,6 +1338,7 @@ int run_daemon(const run_cfg_t *cfg)
         close(lfd);
         return 1;
     }
+    api_set_said(&r.api, broker_said, &r);
     super_init(&sv, &OPS, &r);
     /* What the last host kept is taken up before anything runs, from
      * the state as it reads now; one that does not read now is left for
@@ -1333,8 +1375,10 @@ int run_daemon(const run_cfg_t *cfg)
         }
         int status;
         pid_t pid;
-        while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+        while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            raise_ended(&r, &sv, pid);
             super_child_exited(&sv, pid, status, mono());
+        }
         if (mono() < next && !stopping)
             continue;
         next = mono() + 1.0;
@@ -1425,6 +1469,11 @@ int run_daemon(const run_cfg_t *cfg)
         struct timespec grace = { (time_t)RUN_SHUTDOWN_GRACE_S, 0 };
         nanosleep(&grace, NULL);                        /* the broker's thread answers the polls meanwhile */
     }
+    /* Every required hold stands in the host's words before its package
+     * is stopped, and is left to go stale raised (holdkeep_stop()). */
+    for (int i = 0; i < sv.n; i++)
+        if (sv.svc[i].hold_required)
+            holdkeep_raise(&r.holds, sv.svc[i].id, "the extension host is stopping");
     super_stop_all(&sv, "the extension host is stopping");
     holdkeep_stop(&r.holds);
     holdkeep_stop(&r.senders);

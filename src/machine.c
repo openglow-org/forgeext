@@ -23,6 +23,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fflog.h"
+
 #define HTTP_TIMEOUT_MS 2000
 #define HTTP_MAX        (64 * 1024)
 
@@ -41,7 +43,9 @@ int machine_conf_value(const char *conf, const char *key, char *out, size_t olen
     int found = 0;
     size_t klen = strlen(key);
     out[0] = '\0';
-    while (f && fgets(line, sizeof(line), f)) {
+    if (!f)
+        return errno == ENOENT ? 0 : -1;
+    while (fgets(line, sizeof(line), f)) {
         char *s = line;
         while (isspace((unsigned char)*s))
             s++;
@@ -61,8 +65,11 @@ int machine_conf_value(const char *conf, const char *key, char *out, size_t olen
         snprintf(out, olen, "%s", v);
         found = 1;                                      /* the last one wins, as a settings reader has it */
     }
-    if (f)
-        fclose(f);
+    if (ferror(f)) {
+        found = -1;
+        out[0] = '\0';
+    }
+    fclose(f);
     return found;
 }
 
@@ -486,12 +493,28 @@ int machine_armed(const machine_cfg_t *cfg, unsigned long long *window)
 
 void machine_read(const machine_cfg_t *cfg, machine_t *m, int with_start_facts)
 {
+    /* A settings file that cannot be read is not "extensions off": the
+     * value last read stands until it reads again, as it does in
+     * forgectrl's cooling engine, so a hold a package raised and a claim
+     * on the sender are not taken away by one failed read. Before any
+     * read (a host start), it is off. */
+    static int conf_last = -1, conf_named;
     char v[32];
     memset(m, 0, sizeof(*m));
     m->armed = m->mode_cloud = -1;
+    int got = machine_conf_value(cfg->conf, "ext_enabled", v, sizeof(v));
+    if (got < 0) {
+        if (!conf_named)
+            fflog(LOG_WARNING, "the settings file %s could not be read: %s", cfg->conf,
+                  conf_last == 1 ? "extensions stay on" : "extensions stay off");
+        conf_named = 1;
+    } else {
+        conf_named = 0;
+        conf_last = got == 1 && strcmp(v, "1") == 0;
+    }
     if (access(cfg->safe_file, F_OK) == 0)
         snprintf(m->off_reason, sizeof(m->off_reason), "safe mode (%s exists)", cfg->safe_file);
-    else if (!machine_conf_value(cfg->conf, "ext_enabled", v, sizeof(v)) || strcmp(v, "1") != 0)
+    else if (conf_last != 1)
         snprintf(m->off_reason, sizeof(m->off_reason), "extensions are off (ext_enabled)");
     else
         m->enabled = 1;

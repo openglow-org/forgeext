@@ -42,6 +42,9 @@ typedef struct {
      * stamp, which is no version at all, and then the range cannot be
      * judged and is not. */
     char core_version[33];
+    /* The hold files forgectrl reads (holdkeep.h): a disable, a removal
+     * and a hold made advisory take the package's file away at once. */
+    const char *holds_dir;
 } ext_env_t;
 
 #define EXT_VERSION_FILE "/etc/forgefirm-version"
@@ -223,11 +226,14 @@ int ext_dest(const ext_env_t *env, const char *id, int add, const char *dest, ch
  * first from the manifest: the rest the operator typed. */
 int ext_reach(const manifest_t *m, const state_pkg_t *p, const char *out[EXT_DESTS_MAX], int *own);
 
-/* <root>/required-holds holds one empty file named after each enabled
- * package whose hold is granted and marked required, and nothing else.
- * forgectrl reads the names: a required hold nobody speaks for (no host
- * since the boot) stands. Made to match the state, by every command that
- * changes it and by the host on every turn. The directory on the
+/* <root>/required-holds holds one file named after each enabled package
+ * whose hold is granted and marked required, and nothing else; each holds
+ * the controller modes its manifest names (holdkeep_marker_write()), and
+ * none when the manifest does not read. forgectrl reads them: a required
+ * hold nobody speaks for (no host since the boot) stands, unless the
+ * controller the supervisor runs is one its marker does not name. Made to
+ * match the state, by every command that changes it and by the host on
+ * every turn; a marker that already says what it should is not written. The directory on the
  * machine is one literal, EXT_REQUIRED_HOLDS_DIR: forgectrl's
  * holds_wire_test holds its own name for the directory to it. */
 #define EXT_REQUIRED_HOLDS_NAME "required-holds"

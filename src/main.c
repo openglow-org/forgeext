@@ -65,6 +65,8 @@ static int usage(void)
             "options:\n"
             "  --root <dir>            the extension root (default " EXT_ROOT_DEFAULT ")\n"
             "  --fwup <path>           the fwup binary (default: fwup on PATH)\n"
+            "  --holds-dir <dir>       the hold files a disable, a removal or an advisory hold takes away\n"
+            "                          (default " HOLDKEEP_DIR_DEFAULT ")\n"
             "  --official-key <file>   the OpenGlow extension public key\n"
             "  --index-key <file>      the OpenGlow index public key, the one key index-verify takes\n"
             "  --firmware-key <path>   a key, or a directory of keys, that signs firmware (twice at most)\n"
@@ -317,6 +319,8 @@ int main(int argc, char **argv)
             env.trust.endorsed_dir = endorsed_dir;
         } else if (strcmp(opt, "--fwup") == 0) {
             env.trust.fwup = val;
+        } else if (strcmp(opt, "--holds-dir") == 0) {
+            env.holds_dir = val;
         } else if (strcmp(opt, "--nft") == 0) {
             net.nft = val;
         } else if (strcmp(opt, "--budget-mib") == 0) {

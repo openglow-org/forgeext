@@ -56,6 +56,8 @@ def request(method, path, body=None, timeout=60.0):
     head = "%s %s HTTP/1.1\r\nHost: forgeext\r\n" % (method, path)
     if body is not None:
         head += "Content-Type: application/json\r\nContent-Length: %d\r\n" % len(data)
+    elif method != "GET":
+        head += "Content-Length: 0\r\n"         # a POST says its length, an empty one too
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:

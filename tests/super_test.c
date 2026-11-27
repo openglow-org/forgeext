@@ -45,10 +45,12 @@
  * armed window names the window a judged turn read open, none after a
  * closed read, and keeps it through an unreadable one; it is quiet only
  * with nothing running and nothing to start, and a start waits for a file
- * that is not quiet.
+ * that is not quiet. The settings reader behind `on` takes a file that
+ * does not exist as nothing set and one that does not read as unreadable.
  */
 #include "../src/super.h"
 #include "../src/install.h"
+#include "../src/machine.h"
 #include "../src/run.h"
 #include "../src/state.h"
 
@@ -474,6 +476,10 @@ int main(void)
     super_tick(&sv, &READY, 100);
     super_tick(&sv, &READY, 110);
     CHECK(super_running(&sv) == 2, "two running");
+    /* A mode that cannot be read stops nobody, the GRBL-only one included. */
+    const super_inputs_t NO_MODE = { 1, 1, 0, -1, NULL };
+    super_tick(&sv, &NO_MODE, 115);
+    CHECK(super_running(&sv) == 2 && w.stops == 0, "a mode that cannot be read stopped %d service(s)", w.stops);
     super_tick(&sv, &CLOUD, 120);
     CHECK(b->state == SVC_STOPPED && a->state == SVC_RUNNING && w.stops == 1 && strstr(b->reason, "cloud mode"),
           "a GRBL-only service in cloud mode: %s (%s)", super_state_name(b->state), b->reason);
@@ -712,6 +718,21 @@ int main(void)
     CHECK(w.rewrites == 1 && !b->unwritten && b->state == SVC_QUARANTINED && w.starts == 1,
           "the first tick asked for its write and it stayed aside: %d asks, %s, %d starts", w.rewrites,
           super_state_name(b->state), w.starts);
+
+    /* The settings reader whose ext_enabled is the supervisor's `on`: a
+     * file that does not exist sets nothing (extensions off, as forgectrl
+     * reads it); one that opens and does not read is -1 (the last value
+     * stands). */
+    {
+        char d[] = "/tmp/super_conf_XXXXXX", p[64], v[16] = "x";
+        CHECK(mkdtemp(d) != NULL, "a directory for the settings file");
+        snprintf(p, sizeof(p), "%s/none.conf", d);
+        int got = machine_conf_value(p, "ext_enabled", v, sizeof(v));
+        CHECK(got == 0 && !v[0], "a settings file that does not exist sets nothing: %d %s", got, v);
+        got = machine_conf_value(d, "ext_enabled", v, sizeof(v));
+        CHECK(got == -1, "a settings file that does not read: %d", got);
+        rmdir(d);
+    }
 
     printf("%s: super_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

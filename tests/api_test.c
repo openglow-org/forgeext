@@ -538,9 +538,10 @@ int main(void)
         CHECK(rc == 403 && job_calls == 0 && strstr(error_words(), "motion.job"),
               "a job without the capability: %d, the machine asked %d times", rc, job_calls);
 
-        rc = JOB(&runner, "{\"program\": \"j.gcode\", \"lit_within_s\": 30, \"timeout_s\": 600}");
+        /* Its bounds go on as given, a fraction of a second included: 0.4 is not 0, which is no bound. */
+        rc = JOB(&runner, "{\"program\": \"j.gcode\", \"lit_within_s\": 0.4, \"timeout_s\": 600.25}");
         CHECK(rc == 200 && job_calls == 1 && !strcmp(job_program, "j.gcode")
-              && strstr(job_fields, "lit_within_s=30") && strstr(job_fields, "timeout_s=600"),
+              && strstr(job_fields, "lit_within_s=0.400") && strstr(job_fields, "timeout_s=600.250"),
               "a job with its bounds: %d %s %s", rc, job_program, job_fields);
         /* Who the job is from is the host's word: the id, never a name
          * the package chose. */
@@ -652,6 +653,22 @@ int main(void)
         CHECK(SENDER(&keeper, &kh, "{\"out\": true}") == 502, "with no way to the machine");
         world.sender = fake_sender;
         #undef SENDER
+    }
+
+    /* The word a request leaves goes back only into the start of the service it was read from: a
+     * request in flight across a restart says nothing for the new start. */
+    {
+        api_svc_t slot;
+        memset(&slot, 0, sizeof(slot));
+        slot.used = 1;
+        slot.gen = 7;
+        snprintf(slot.who.id, sizeof(slot.who.id), "org.example.keeper");
+        api_hold_t said = { 1, "from the last start", 1 };
+        CHECK(api_word_back(&slot, 6, "org.example.keeper", &said) == 0 && !slot.hold.raised && !slot.hold.sender_out,
+              "a word from an earlier start went into the new one: raised %d, sender out %d", slot.hold.raised,
+              slot.hold.sender_out);
+        CHECK(api_word_back(&slot, 7, "org.example.keeper", &said) == 1 && slot.hold.raised && slot.hold.sender_out,
+              "the word of the start it was read from did not go back");
     }
 
     /* Everything else. */

@@ -97,7 +97,10 @@ int machine_request(const machine_cfg_t *cfg, const char *method, const char *pa
 int machine_post_program(const machine_cfg_t *cfg, const char *path, int fd,
                          const char *fields, char *out, size_t olen);
 
-/* `key=value` out of a settings file: 1 when the key is there. */
+/* `key=value` out of a settings file: 1 when the key is there, 0 when it
+ * is not (a file that does not exist sets nothing), and -1 when the file
+ * is there and cannot be read, which says nothing about the key: forgectrl
+ * reads its settings file the same way (settings_get()). */
 int machine_conf_value(const char *conf, const char *key, char *out, size_t olen);
 
 #endif

@@ -43,9 +43,11 @@ ffx_post() {
 }
 
 # ffx_hold 1|0 [REASON] - raise or clear this package's hold (granted). The
-# reason is at most 95 bytes of printable ASCII without a quote or a backslash,
-# which is what the host takes.
+# host takes a reason of at most 95 bytes of printable ASCII without a quote or
+# a backslash: anything else in it becomes ?, and it is cut at 95 bytes, so
+# the words never keep a hold from being raised.
 ffx_hold() {
     case "$1" in 1 | true) _r=true ;; *) _r=false ;; esac
-    ffx_post /v0/hold "{\"raised\": $_r, \"reason\": \"$2\"}"
+    _w=$(printf '%s' "$2" | tr -c ' -~' '?' | tr '"\\' '??' | cut -c1-95)
+    ffx_post /v0/hold "{\"raised\": $_r, \"reason\": \"$_w\"}"
 }

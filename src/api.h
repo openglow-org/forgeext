@@ -83,12 +83,17 @@
  *
  * The machine routes are forgectrl's read-only loopback routes, relayed:
  * the package itself can reach no listener of the machine. The broker runs
- * on a thread of its own, so that a slow answer from forgectrl delays
- * other packages' requests and never the supervisor's turn, and it gives
- * each package API_RATE_PER_S requests a second.
+ * on a thread of its own, so that a slow answer from forgectrl never
+ * delays the supervisor's turn, and it gives each package API_RATE_PER_S
+ * requests a second. Every request that asks the machine waits on a
+ * second thread, the relay's, one at a time: a slow answer delays other
+ * such requests, and never a hold, an events poll or a capture's start.
+ * No answer waits on its peer longer than API_SEND_S.
  *
  * A package's word on its hold is the host's to keep (holdkeep.h): it
- * starts clear with every start of the service.
+ * starts clear with every start of the service. A hold raised is on disk
+ * before the package is told so (api_said_fn); a clear waits for the
+ * host's turn.
  */
 #ifndef FORGEEXT_API_H
 #define FORGEEXT_API_H
@@ -235,17 +240,37 @@ int api_may(const api_who_t *who, const char *cap);
 
 typedef struct {
     int used;
+    unsigned long long gen;             /* which start of the service this slot is: a new one for every api_open() */
     api_who_t who;
     api_hold_t hold;
     int lfd;                            /* the listening socket */
     double tokens, refilled;            /* the rate limit */
 } api_svc_t;
 
+/* The word a request leaves (its hold, its claim on the sender) goes into
+ * the slot only when the slot is still the start of the service the
+ * request was read from: a request in flight across a restart says
+ * nothing for the new start, whose word starts clear. 1 when it was
+ * written. Called with the broker's lock held. */
+int api_word_back(api_svc_t *s, unsigned long long gen, const char *id, const api_hold_t *hold);
+
+/* What the broker tells the host when a package's word has just changed,
+ * before the package is answered: raised is 1 for a hold just raised (with
+ * its words), sender_out 1 for a claim on the sender just granted. Called
+ * on a broker thread with the broker's lock held, so it takes no lock of
+ * the broker's. */
+typedef void (*api_said_fn)(void *ctx, const char *id, int raised, const char *reason, int sender_out);
+
+#define API_SEND_S          0.5             /* an answer the peer does not read is cut off after this */
+
 typedef struct {
     int fd, svc;
+    unsigned long long gen;             /* which connection this slot holds: a new one at every accept */
     int limited;                        /* over its rate: the request is read, and answered 429 */
     int parked;                         /* an events poll, waiting for an event or its deadline */
     int shooting;                       /* a camera request, waiting for the camera thread */
+    int relaying;                       /* a request that asks the machine, waiting for or on the relay thread */
+    int answering;                      /* another thread is sending its answer: the loop leaves it alone */
     unsigned long ev_since;
     double ev_until;
     double since;
@@ -265,9 +290,21 @@ typedef struct {
      * it. The connection waiting for it is remembered by index. */
     pthread_t cam_thread;
     int cam_started, cam_busy, cam_conn;
+    unsigned long long cam_gen;         /* the connection the capture is for */
     api_shot_t cam_shot;
     api_who_t cam_who;
     pthread_cond_t cam_wake;
+    /* Every request that asks the machine (a relay, a job post, a jog, the
+     * sender, the button, a package's settings) is served on a thread of
+     * its own, one at a time in the order they came: the broker's thread
+     * answers a hold, an events poll and a capture's start without
+     * waiting behind any of them. */
+    pthread_t relay_thread;
+    int relay_started;
+    pthread_cond_t relay_wake;
+    api_said_fn said;
+    void *said_ctx;
+    unsigned long long gens;            /* the last generation handed out, to a slot or a connection */
     api_svc_t svc[API_MAX_SERVICES];
     api_conn_t conn[API_MAX_CONNS];
 } api_t;
@@ -280,6 +317,9 @@ int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t
               api_job_fn job, void *job_ctx,
               api_sender_fn sender, void *sender_ctx, char *err, size_t elen);
 void api_stop(api_t *a);
+
+/* Who is told when a package's word changes (api_said_fn). */
+void api_set_said(api_t *a, api_said_fn fn, void *ctx);
 
 /* A service is about to start: its socket exists before it does, and its
  * word on its hold starts clear. The socket's path into path. */

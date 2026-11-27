@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include "install.h"
 #include "fflog.h"
+#include "holdkeep.h"
 #include "index.h"
 #include "netrules.h"
 
@@ -59,7 +60,21 @@ void ext_env_defaults(ext_env_t *env)
     env->trust.firmware_keys[1] = KEY_FW_FACTORY;
     env->budget_bytes = EXT_BUDGET_DEFAULT;
     env->reserve_bytes = EXT_RESERVE_DEFAULT;
+    env->holds_dir = HOLDKEEP_DIR_DEFAULT;
     ext_read_core_version(env->core_version, sizeof(env->core_version));
+}
+
+/* The operator's exit, taken at once: the package's hold file goes once
+ * the state that ends its hold is saved, so a file a stopped host left
+ * does not stand on its own `required` field. A host that is running and
+ * still names the package rewrites it until its next turn drops it, which
+ * holds rather than lets through. */
+static void hold_file_drop(const ext_env_t *env, const char *id)
+{
+    char p[400];
+    snprintf(p, sizeof(p), "%.299s/%.63s.json", env->holds_dir ? env->holds_dir : HOLDKEEP_DIR_DEFAULT, id);
+    if (unlink(p) != 0 && errno != ENOENT)
+        fflog(LOG_WARNING, "%s: its hold file %s could not be removed: %s", id, p, strerror(errno));
 }
 
 void ext_read_core_version_from(const char *path, char *out, size_t olen)
@@ -966,6 +981,8 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
         snprintf(p->grants[p->ngrants++], CAP_MAX_LEN, "%s", res->needs_grant[i]);
     if (!manifest_has_cap(m, "net.outbound.operator"))
         p->ndests = 0;                                  /* a version that does not ask keeps none of them */
+    if (!state_granted(p, "hold"))
+        p->hold_required = 0;                           /* the mark was for a hold this version does not have */
     if (p->slot >= 0) {
         snprintf(datadir, sizeof(datadir), "%.255s/data/%.63s", env->root, m->id);
         if (geteuid() == 0) {
@@ -980,6 +997,11 @@ int ext_install(const ext_env_t *env, const char *file, const install_opts_t *op
     rc = state_save(env->root, st, err, elen);
     if (rc == 0 && strcmp(kept_prev, m->version) != 0)
         drop_version(pkgdir, kept_prev);                /* the kept predecessor installed again is the new tree */
+    /* The markers follow the state now, not at the host's next turn: a
+     * version that dropped its hold, or runs in other modes. */
+    if (rc == 0 && ext_required_holds_sync(env, st) != 0)
+        fflog(LOG_WARNING, "%s: the required holds under %s could not be made to match; the host tries again",
+              m->id, env->root);
 out:
     if (rc != 0 && turned)
         turn_back(pkgdir, m->version, kept, kept_prev, err, elen);
@@ -1009,16 +1031,21 @@ int ext_remove(const ext_env_t *env, const char *id, int keep_data, char *err, s
             fail(err, elen, "%s is not installed", id);
         } else {
             state_remove(st, id);
-            settings_forget(env->root, id);                 /* its settings are its own: they go with it */
             rc = state_save(env->root, st, err, elen);      /* forgotten first: a half-removed tree is never started */
-            if (rc == 0)
-                ext_required_holds_sync(env, st);           /* and its hold goes with it: removal is the operator's exit */
+            int marks = 0;
+            if (rc == 0) {
+                settings_forget(env->root, id);             /* its settings are its own: they go with it */
+                hold_file_drop(env, id);                    /* and its hold goes with it: removal is the operator's exit */
+                marks = ext_required_holds_sync(env, st);
+            }
             snprintf(p, sizeof(p), "%.255s/pkg/%.63s", env->root, id);
             if (rc == 0 && pkg_rmtree(p) != 0)
                 rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
             snprintf(p, sizeof(p), "%.255s/data/%.63s", env->root, id);
             if (rc == 0 && !keep_data && pkg_rmtree(p) != 0)
                 rc = fail(err, elen, "cannot remove %s: %s", p, strerror(errno));
+            if (rc == 0 && marks != 0)
+                rc = fail(err, elen, "the required holds under %s could not be made to match", env->root);
         }
     }
     ext_unlock(lock);
@@ -1149,12 +1176,30 @@ int ext_required_holds_sync(const ext_env_t *env, const state_t *st)
         const state_pkg_t *pk = &st->pkgs[i];
         if (!(pk->enabled && pk->hold_required && state_granted(pk, "hold")))
             continue;
+        /* The modes it runs in, from its installed manifest; one that does
+         * not read gives a marker with none, which stands in every mode.
+         * A marker that already says this is left alone: the daemon syncs
+         * every turn, and /data is not written for nothing. */
+        static manifest_t m;
+        char merr[200], have[32] = "";
+        int grbl = 0, cloud = 0;
+        if (ext_manifest_of(env, pk->id, &m, merr, sizeof(merr)) == 0) {
+            grbl = m.mode_grbl;
+            cloud = m.mode_cloud;
+        }
+        const char *want = grbl && cloud ? "grbl cloud\n" : grbl ? "grbl\n" : cloud ? "cloud\n" : "";
         snprintf(p, sizeof(p), "%.299s/%.63s", dir, pk->id);
-        int fd = open(p, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
-        if (fd < 0)
-            bad = 1;
-        else
+        int fd = open(p, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+        struct stat sb;
+        ssize_t got = -1;
+        if (fd >= 0 && fstat(fd, &sb) == 0 && S_ISREG(sb.st_mode))
+            got = read(fd, have, sizeof(have) - 1);
+        if (fd >= 0)
             close(fd);
+        if (got >= 0 && (size_t)got == strlen(want) && memcmp(have, want, (size_t)got) == 0)
+            continue;
+        if (holdkeep_marker_write(dir, pk->id, grbl, cloud) != 0)
+            bad = 1;
     }
     DIR *d = opendir(dir);
     if (!d)
@@ -1345,6 +1390,8 @@ int ext_set_enabled(const ext_env_t *env, const char *id, int on, char *err, siz
                 p->enables++;                           /* how the host tells this enable from what came before it */
             }
             rc = state_save(env->root, st, err, elen);
+            if (rc == 0 && !on)
+                hold_file_drop(env, id);
             if (rc == 0 && ext_required_holds_sync(env, st) != 0)
                 rc = fail(err, elen, "the required holds under %s could not be made to match", env->root);
         }
@@ -1423,6 +1470,8 @@ int ext_set_hold_required(const ext_env_t *env, const char *id, int on, char *er
         } else {
             p->hold_required = on ? 1 : 0;
             rc = state_save(env->root, st, err, elen);
+            if (rc == 0 && !on)
+                hold_file_drop(env, id);
             if (rc == 0 && ext_required_holds_sync(env, st) != 0)
                 rc = fail(err, elen, "the required holds under %s could not be made to match", env->root);
         }

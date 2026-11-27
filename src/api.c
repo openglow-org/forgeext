@@ -365,7 +365,7 @@ int api_dispatch(const api_who_t *who, api_hold_t *hold, const httpreq_t *req, c
         /* The name that goes with the job is this host's word for who
          * sent it. A package naming itself would be a package able to
          * say a job came from somewhere else. */
-        snprintf(fields, sizeof(fields), "lit_within_s=%.0f&timeout_s=%.0f", lit, run);
+        snprintf(fields, sizeof(fields), "lit_within_s=%.3f&timeout_s=%.3f", lit, run);
         return world->job(world->job_ctx, who->id, prog, fields, body, blen);
     }
     if (strcmp(p, "/v0/motion/jog") == 0 || strcmp(p, "/v0/motion/cancel") == 0) {
@@ -561,7 +561,8 @@ static const char *status_text(int code)
 }
 
 /* The whole reply, then the connection is done with. The socket is
- * non-blocking: a peer that does not read loses the rest. */
+ * non-blocking: a peer that does not read within API_SEND_S loses the
+ * rest. */
 static void answer_typed(int fd, int status, const char *type, const void *body, size_t blen)
 {
     char head[256];
@@ -579,7 +580,7 @@ static void answer_typed(int fd, int status, const char *type, const void *body,
     if (done < (size_t)n)
         return;                                     /* not even the head went: the peer is gone */
     done -= (size_t)n;
-    double until = mono() + 5.0;
+    double until = mono() + API_SEND_S;
     while (done < blen && mono() < until) {
         struct pollfd pfd = { .fd = fd, .events = POLLOUT };
         if (poll(&pfd, 1, 200) != 1)
@@ -648,6 +649,7 @@ static void *camera_thread(void *arg)
         api_camera_fn fn = a->world.camera;
         void *ctx = a->world.camera_ctx;
         int idx = a->cam_conn;
+        unsigned long long gen = a->cam_gen;
         pthread_mutex_unlock(&a->mu);
 
         unsigned char *jpeg = NULL;
@@ -659,15 +661,30 @@ static void *camera_thread(void *arg)
         if (!fn)
             snprintf(body, sizeof(body), "{\"error\":\"the host cannot reach the cameras\"}");
 
+        /* The frame goes out with the broker's lock let go: a peer that
+         * does not read holds up nobody but itself, for API_SEND_S. It is
+         * sent on a duplicate of the connection's descriptor, taken under
+         * the lock while the connection was still this one (its
+         * generation), so no byte can land on a descriptor number the
+         * broker has since closed and handed to another connection. */
         pthread_mutex_lock(&a->mu);
         api_conn_t *c = idx >= 0 && idx < API_MAX_CONNS ? &a->conn[idx] : NULL;
-        if (c && c->fd > 0 && c->shooting && strcmp(a->svc[c->svc].who.id, who.id) == 0) {
-            if (status == 200 && jpeg)
-                answer_typed(c->fd, 200, ctype[0] ? ctype : "image/jpeg", jpeg, len);
-            else
-                answer(c->fd, status, body);
-            conn_drop(c);
+        int out = -1;
+        if (c && c->fd > 0 && c->shooting && c->gen == gen && strcmp(a->svc[c->svc].who.id, who.id) == 0) {
+            out = fcntl(c->fd, F_DUPFD_CLOEXEC, 0);
+            c->answering = 1;
         }
+        pthread_mutex_unlock(&a->mu);
+        if (out >= 0) {
+            if (status == 200 && jpeg)
+                answer_typed(out, 200, ctype[0] ? ctype : "image/jpeg", jpeg, len);
+            else
+                answer(out, status, body);
+            close(out);
+        }
+        pthread_mutex_lock(&a->mu);
+        if (c && c->fd > 0 && c->gen == gen)
+            conn_drop(c);
         a->cam_busy = 0;
         a->cam_conn = -1;
         pthread_mutex_unlock(&a->mu);
@@ -675,13 +692,58 @@ static void *camera_thread(void *arg)
     }
 }
 
-/* One whole request is in the buffer: judge it and answer. Called with the
- * lock held; the lock is let go for the one call that can wait. */
-/* 0 when the connection was answered and is done with, 1 when it was
- * parked and the loop is to keep it. */
+int api_word_back(api_svc_t *s, unsigned long long gen, const char *id, const api_hold_t *hold)
+{
+    if (!s->used || s->gen != gen || strcmp(s->who.id, id) != 0)
+        return 0;
+    if (s->hold.raised != hold->raised || strcmp(s->hold.reason, hold->reason) != 0) {
+        if (hold->raised)
+            fflog(LOG_NOTICE, "%s: it raised its hold: %s", id, hold->reason[0] ? hold->reason : "(no words)");
+        else
+            fflog(LOG_NOTICE, "%s: it cleared its hold", id);
+    }
+    if (s->hold.sender_out != hold->sender_out)
+        fflog(LOG_NOTICE, "%s: %s", id, hold->sender_out ? "it keeps the Grbl sender out"
+                                                         : "it lets the Grbl sender back in");
+    s->hold = *hold;
+    return 1;
+}
+
+/* The word back into its slot, and the host told of a hold just raised or
+ * a claim just granted, before the request is answered. Lock held. */
+static void word_back(api_t *a, api_svc_t *s, unsigned long long gen, const char *id, const api_hold_t *hold)
+{
+    api_hold_t was = s->hold;
+    if (!api_word_back(s, gen, id, hold) || !a->said)
+        return;
+    int raised = hold->raised && !was.raised, claimed = hold->sender_out && !was.sender_out;
+    if (raised || claimed)
+        a->said(a->said_ctx, id, raised, hold->reason, claimed);
+}
+
+/* What the broker's own thread serves: none of these asks the machine or
+ * touches a file, so none of them can wait. Everything else is the relay
+ * thread's. */
+static int served_here(const httpreq_t *req)
+{
+    return strcmp(req->path, "/v0/hold") == 0 || strcmp(req->path, "/v0/self") == 0
+        || strcmp(req->path, "/v0/events") == 0 || strcmp(req->path, "/v0/camera") == 0;
+}
+
+/* One whole request is in the buffer: judge it and answer, or hand it on.
+ * Called with the lock held, which it keeps: what is judged here does no
+ * I/O but the feed's. 0 when the connection was answered and is done
+ * with, 1 when it waits (a poll, a capture, a relay) and the loop is to
+ * keep it. */
 static int serve(api_t *a, api_conn_t *c, const httpreq_t *req)
 {
     static char body[API_BODY_MAX];
+    if (!served_here(req)) {
+        c->relaying = 1;
+        c->parked = 1;                              /* the loop leaves it alone but for a hang-up; the relay answers it */
+        pthread_cond_signal(&a->relay_wake);
+        return 1;
+    }
     api_svc_t *s = &a->svc[c->svc];
     api_who_t who = s->who;
     api_hold_t hold = s->hold;
@@ -690,24 +752,8 @@ static int serve(api_t *a, api_conn_t *c, const httpreq_t *req)
     int fd = c->fd;
 
     memset(&shot, 0, sizeof(shot));
-    pthread_mutex_unlock(&a->mu);
     int status = api_dispatch(&who, &hold, req, &a->world, &park, &shot, body, sizeof(body));
-    pthread_mutex_lock(&a->mu);
-    /* The service may have ended while forgectrl was being asked. */
-    if (s->used && strcmp(s->who.id, who.id) == 0) {
-        if (s->hold.raised != hold.raised || strcmp(s->hold.reason, hold.reason) != 0) {
-            if (hold.raised)
-                fflog(LOG_NOTICE, "%s: it raised its hold: %s", who.id, hold.reason[0] ? hold.reason : "(no words)");
-            else
-                fflog(LOG_NOTICE, "%s: it cleared its hold", who.id);
-        }
-        if (s->hold.sender_out != hold.sender_out)
-            fflog(LOG_NOTICE, "%s: %s", who.id, hold.sender_out ? "it keeps the Grbl sender out"
-                                                                : "it lets the Grbl sender back in");
-        s->hold = hold;
-    }
-    if (c->fd != fd)
-        return 0;                                       /* it went away while forgectrl was being asked */
+    word_back(a, s, s->gen, who.id, &hold);
     if (status == API_PARK) {
         c->parked = 1;
         c->ev_since = park.since;
@@ -724,6 +770,7 @@ static int serve(api_t *a, api_conn_t *c, const httpreq_t *req)
         a->cam_shot = shot;
         a->cam_who = who;
         a->cam_conn = (int)(c - a->conn);
+        a->cam_gen = c->gen;
         c->shooting = 1;
         c->parked = 1;                              /* the loop leaves it alone; the camera answers it */
         c->ev_until = mono() + API_SHOT_TIMEOUT_S;
@@ -733,6 +780,82 @@ static int serve(api_t *a, api_conn_t *c, const httpreq_t *req)
     }
     answer(fd, status, body);
     return 0;
+}
+
+/* The requests that ask the machine, one at a time, the oldest first. The
+ * request is copied out of its connection before the lock is let go, and
+ * the answer goes out on a duplicate of the connection's descriptor taken
+ * while the connection was still this one (its generation), with the lock
+ * let go; the word it leaves (the sender's claim, never the hold) goes back
+ * only into the start of the service it was read from (api_word_back()). */
+static void *relay_thread(void *arg)
+{
+    api_t *a = arg;
+    static char buf[HTTPREQ_HEAD_MAX + HTTPREQ_BODY_MAX];
+    static char body[API_BODY_MAX];
+    pthread_mutex_lock(&a->mu);
+    for (;;) {
+        api_conn_t *c = NULL;
+        while (!a->stop) {
+            for (int i = 0; i < API_MAX_CONNS; i++) {
+                api_conn_t *k = &a->conn[i];
+                if (k->fd > 0 && k->relaying && !k->answering && (!c || k->since < c->since))
+                    c = k;
+            }
+            if (c)
+                break;
+            pthread_cond_wait(&a->relay_wake, &a->mu);
+        }
+        if (a->stop) {
+            pthread_mutex_unlock(&a->mu);
+            return NULL;
+        }
+        c->answering = 1;
+        unsigned long long cgen = c->gen;
+        api_svc_t *s = &a->svc[c->svc];
+        unsigned long long sgen = s->gen;
+        api_who_t who = s->who;
+        api_hold_t hold = s->hold;
+        size_t len = c->len < sizeof(buf) ? c->len : sizeof(buf);
+        memcpy(buf, c->buf, len);
+        pthread_mutex_unlock(&a->mu);
+
+        httpreq_t req;
+        const char *why = "";
+        int status;
+        if (httpreq_parse(buf, len, &req, &why) > 0) {
+            status = api_dispatch(&who, &hold, &req, &a->world, NULL, NULL, body, sizeof(body));
+        } else {
+            status = 500;
+            snprintf(body, sizeof(body), "{\"error\":\"the request did not read again\"}");
+        }
+
+        /* A relay's word is the sender's claim alone (POST /v0/sender).
+         * The hold is the broker thread's: it may have been raised or
+         * cleared there while this request waited on the machine, and the
+         * copy taken before that never goes back over it. */
+        pthread_mutex_lock(&a->mu);
+        api_hold_t now = s->hold;
+        now.sender_out = hold.sender_out;
+        word_back(a, s, sgen, who.id, &now);
+        int out = c->fd > 0 && c->gen == cgen ? fcntl(c->fd, F_DUPFD_CLOEXEC, 0) : -1;
+        pthread_mutex_unlock(&a->mu);
+        if (out >= 0) {
+            answer(out, status, body);
+            close(out);
+        }
+        pthread_mutex_lock(&a->mu);
+        if (c->fd > 0 && c->gen == cgen)
+            conn_drop(c);
+    }
+}
+
+void api_set_said(api_t *a, api_said_fn fn, void *ctx)
+{
+    pthread_mutex_lock(&a->mu);
+    a->said = fn;
+    a->said_ctx = ctx;
+    pthread_mutex_unlock(&a->mu);
 }
 
 static void *broker(void *arg)
@@ -799,6 +922,7 @@ static void *broker(void *arg)
                 memset(c, 0, sizeof(*c));
                 c->fd = fd;
                 c->svc = what[k];
+                c->gen = ++a->gens;
                 c->since = now;
                 /* Over its rate, the request is still read, and then told so. */
                 if (s->tokens < 1.0)
@@ -848,8 +972,8 @@ static void *broker(void *arg)
         unsigned long head = a->world.feed ? evfeed_head(a->world.feed) : 0;
         for (int i = 0; i < API_MAX_CONNS; i++) {
             api_conn_t *c = &a->conn[i];
-            if (c->fd <= 0)
-                continue;
+            if (c->fd <= 0 || c->relaying || c->answering)
+                continue;                               /* another thread answers it, within its own bounds */
             if (c->shooting) {
                 if (now >= c->ev_until) {
                     answer_error(c->fd, 504, "the capture did not come back in time");
@@ -892,6 +1016,7 @@ int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t
     memset(a, 0, sizeof(*a));
     pthread_mutex_init(&a->mu, NULL);
     pthread_cond_init(&a->cam_wake, NULL);
+    pthread_cond_init(&a->relay_wake, NULL);
     a->cam_conn = -1;
     a->world.feed = feed;
     a->world.machine = upstream_get;
@@ -944,6 +1069,18 @@ int api_start(api_t *a, const char *dir, const machine_cfg_t *upstream, evfeed_t
         return -1;
     }
     a->cam_started = 1;
+    if (pthread_create(&a->relay_thread, NULL, relay_thread, a) != 0) {
+        snprintf(err, elen, "cannot start the relay's thread");
+        pthread_mutex_lock(&a->mu);
+        a->stop = 1;
+        pthread_cond_broadcast(&a->cam_wake);
+        pthread_mutex_unlock(&a->mu);
+        pthread_join(a->thread, NULL);
+        pthread_join(a->cam_thread, NULL);
+        a->cam_started = 0;
+        return -1;
+    }
+    a->relay_started = 1;
     a->started = 1;
     return 0;
 }
@@ -969,11 +1106,15 @@ void api_stop(api_t *a)
     pthread_mutex_lock(&a->mu);
     a->stop = 1;
     pthread_cond_broadcast(&a->cam_wake);
+    pthread_cond_broadcast(&a->relay_wake);
     pthread_mutex_unlock(&a->mu);
     pthread_join(a->thread, NULL);
     if (a->cam_started)
         pthread_join(a->cam_thread, NULL);
     a->cam_started = 0;
+    if (a->relay_started)
+        pthread_join(a->relay_thread, NULL);
+    a->relay_started = 0;
     for (int i = 0; i < API_MAX_SERVICES; i++)
         if (a->svc[i].used)
             svc_shut(a, i);
@@ -1022,6 +1163,7 @@ int api_open(api_t *a, const api_who_t *who, char *path, size_t plen, char *err,
     api_svc_t *s = &a->svc[slot];
     memset(s, 0, sizeof(*s));
     s->used = 1;
+    s->gen = ++a->gens;
     s->who = *who;
     s->lfd = fd;
     s->tokens = API_RATE_PER_S;

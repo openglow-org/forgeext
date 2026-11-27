@@ -106,6 +106,21 @@ the host) finds a running wrapper at a second start, has a stray TERM of
 the host answered by a respawn, and sends TERM to a host whose wrapper is
 gone; the relay of that wrapper, which outlives it, is ended by the test.
 
+The holds and the broker: with motion verified, a controller that is not
+running, a diagnostic and a firmware job each hold every start, in words.
+With forgectrl slow (every GET 1.5 s late), a package's raise is on disk
+before it is answered, and answered at once though its own relay waits; a
+raise, in its words, and a clear each made while the package's own relay
+waits stand after that relay returns; a claim on the sender is on disk as the machine grants it; a required hold
+of a service that ends stands as the end is seen; a clean stop leaves a
+healthy package's required hold raised. A FIFO named as a program is
+refused at once. A frame its package never reads holds up nobody's hold,
+and another package's capture is refused for no longer than the bound.
+A GRBL-only package's marker names its mode, and in cloud mode it has no
+file; a required hold whose package's modes are not known is raised by the
+host. A settings file that does not read leaves every hold file and
+service in place.
+
 Needs root, cgroup v2, nft, ip, nsenter, unshare, fwup (FWUP), the built
 forgeext (FORGEEXT), and the rule file (FFX_RULES). Exits 77 without them.
 """
@@ -209,18 +224,91 @@ d = os.environ["FFX_DATA"]
 with open(os.path.join(d, "job.gcode"), "w") as f:
     for g in ("G21", "G90", "G0 X1"):
         print(g, file=f)
+for left in ("elsewhere.gcode", "pipe.gcode"):     # a start after the first finds them there
+    if os.path.lexists(os.path.join(d, left)):
+        os.unlink(os.path.join(d, left))
 os.symlink("/etc/passwd", os.path.join(d, "elsewhere.gcode"))
-for what, name in (("real", "job.gcode"), ("link", "elsewhere.gcode"), ("dir", "../../state.json")):
+os.mkfifo(os.path.join(d, "pipe.gcode"))         # nobody ever opens it to write
+for what, name in (("real", "job.gcode"), ("link", "elsewhere.gcode"), ("dir", "../../state.json"), ("fifo", "pipe.gcode")):
     code, ans = api("POST", "/v0/motion/job", {"program": name})
     print("api job %s %d %s" % (what, code, (ans or {}).get("error", "")), flush=True)
-cleared = False
+print("api job abort %d" % api("POST", "/v0/motion/job/abort", {})[0], flush=True)
+cleared = raced = False
+def race():
+    # A read of the machine (a relay, which a slow forgectrl holds up), and 0.3 s into it a raise of the hold: when
+    # it was sent and when it was answered, on the monotonic clock the test reads too.
+    import json, threading
+    threading.Thread(target=lambda: api("GET", "/v0/machine/status"), daemon=True).start()
+    time.sleep(0.3)
+    sent = time.monotonic()
+    code = api("POST", "/v0/hold", {"raised": True, "reason": "raced"})[0]
+    answered = time.monotonic()
+    with open(os.path.join(d, "race.json.new"), "w") as f:
+        json.dump({"code": code, "sent": sent, "answered": answered}, f)
+    os.rename(os.path.join(d, "race.json.new"), os.path.join(d, "race.json"))
+    while not os.path.exists(os.path.join(d, "unrace")):
+        time.sleep(0.1)
+    # The other way: a second read of the machine, and 0.3 s into it the hold cleared; when the clear was answered
+    # and when the read returned.
+    t = threading.Thread(target=lambda: api("GET", "/v0/machine/status"), daemon=True)
+    t.start()
+    time.sleep(0.3)
+    code = api("POST", "/v0/hold", {"raised": False})[0]
+    cleared_at = time.monotonic()
+    t.join(10)
+    with open(os.path.join(d, "unrace.json.new"), "w") as f:
+        json.dump({"code": code, "cleared": cleared_at, "returned": time.monotonic()}, f)
+    os.rename(os.path.join(d, "unrace.json.new"), os.path.join(d, "unrace.json"))
+def frame():
+    # One capture, the frame read whole: the answer's code.
+    import socket
+    body = b'{"camera": "lid", "resolution": "full"}'
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect(os.environ["FFX_API"])
+        s.sendall(b"POST /v0/camera HTTP/1.1\r\nHost: forgeext\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        buf = b""
+        while True:
+            c = s.recv(1 << 20)
+            if not c:
+                break
+            buf += c
+        return int(buf.split(None, 2)[1])
+    except (OSError, ValueError, IndexError):
+        return 599
+    finally:
+        s.close()
+def shoot():
+    # Another package's frame waits unread: a frame asked for every 0.1 s until one comes (or 8 s pass), each
+    # answer's code and when it came written down.
+    import json
+    start, codes = time.monotonic(), []
+    while time.monotonic() - start < 8:
+        code = frame()
+        codes.append((code, time.monotonic()))
+        if code == 200:
+            break
+        time.sleep(0.1)
+    with open(os.path.join(d, "shots.json.new"), "w") as f:
+        json.dump({"start": start, "codes": codes}, f)
+    os.rename(os.path.join(d, "shots.json.new"), os.path.join(d, "shots.json"))
+shot = False
 while True:
     if not cleared and os.path.exists(os.path.join(os.environ["FFX_DATA"], "clear")):
         time.sleep(1.5)
         print("api clear %d" % api("POST", "/v0/hold", {"raised": False})[0], flush=True)
         cleared = True
     print("through the job", flush=True)
-    time.sleep(1)
+    for _ in range(50):
+        if not raced and os.path.exists(os.path.join(d, "race")):
+            raced = True
+            race()
+        if not shot and os.path.exists(os.path.join(d, "shoot")):
+            shot = True
+            shoot()
+        time.sleep(0.02)
 '''
 
 DIAL = API_CLIENT + r'''
@@ -294,11 +382,35 @@ print("holding 2 MiB unlinked", flush=True)
 while True:
     time.sleep(1)
 '''
-# One that keeps the Grbl sender out as it starts.
+# One that keeps the Grbl sender out once the test says so.
 KEEPOUT = API_CLIENT + r'''
-import time
+import os, time
+while not os.path.exists(os.path.join(os.environ["FFX_DATA"], "go")):
+    time.sleep(0.05)
 code, ans = api("POST", "/v0/sender", {"out": True})
 print("keepout %d %s" % (code, ans), flush=True)
+while True:
+    time.sleep(1)
+'''
+
+# One that asks for a frame and never reads it, then raises its hold while the frame waits on its socket.
+SHOT = API_CLIENT + r'''
+import json, os, socket, time
+d = os.environ["FFX_DATA"]
+while not os.path.exists(os.path.join(d, "go")):
+    time.sleep(0.05)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(os.environ["FFX_API"])
+body = b'{"camera": "lid", "resolution": "full"}'
+s.sendall(b"POST /v0/camera HTTP/1.1\r\nHost: forgeext\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n"
+          % len(body) + body)
+open(os.path.join(d, "asked"), "w").close()     # another package asks for a frame from here on
+time.sleep(0.3)                                 # inside the frame's send, which may take up to 0.5 s
+sent = time.monotonic()
+code = api("POST", "/v0/hold", {"raised": True, "reason": "shot"})[0]
+with open(os.path.join(d, "shot.json.new"), "w") as f:
+    json.dump({"code": code, "took": time.monotonic() - sent}, f)
+os.rename(os.path.join(d, "shot.json.new"), os.path.join(d, "shot.json"))
 while True:
     time.sleep(1)
 '''
@@ -339,8 +451,9 @@ while True:
 
 TOKEN = "0123456789abcdef0123456789abcdef"
 failures = []
+# slow: seconds the stand-in waits before it answers a GET (a slow forgectrl); sender_at: when each claim came.
 facts = {"armed": False, "controller": "running", "motion": "unverified", "mode": "grbl", "diag": False, "updating": False,
-         "down": False, "sender": [], "asks": [], "on_mode": None}
+         "down": False, "sender": [], "sender_at": [], "asks": [], "aborts": [], "on_mode": None, "slow": 0}
 streams = []                                    # each /events stream the stand-in holds: the events it has yet to write
 streams_mu = threading.Lock()
 asked_mode = []                                 # when each GET /mode came (time.monotonic()): one a turn
@@ -377,6 +490,16 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
             asked_mode.append(time.monotonic())
         if self.path == "/mode" and facts["on_mode"]:
             facts["on_mode"]()                      # the host asks this between its read of the state and its measurement
+        if facts["slow"]:
+            time.sleep(facts["slow"])
+        if self.path.startswith("/cam/snapshot?") and not facts["down"]:
+            frame = b"\xff\xd8" + bytes(4 << 20)        # a 4 MiB "frame": far more than a socket's buffer
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(frame)))
+            self.end_headers()
+            self.wfile.write(frame)
+            return
         body = {"/cool/status": cool_status(),
                 "/mode": {"mode": facts["mode"], "controller": facts["controller"], "motion": facts["motion"]},
                 "/status": {"diag": facts["diag"]},
@@ -421,11 +544,15 @@ class Forgectrl(http.server.BaseHTTPRequestHandler):
         if self.path.split("?")[0] == "/motion/sender" and not facts["down"]:
             ok = self.headers.get("X-ForgeFIRM-Token") == TOKEN
             facts["sender"].append((self.path, ok))
+            facts["sender_at"].append(time.monotonic())
             body, code = ({}, 200) if ok else ({"error": "not the extension host's token"}, 403)
         elif self.path.split("?")[0] == "/button/ask" and not facts["down"]:
             ok = self.headers.get("X-ForgeFIRM-Token") == TOKEN
             facts["asks"].append((self.path, ok))
             body, code = ({"state": "ready"}, 200) if ok else ({"error": "not the extension host's token"}, 403)
+        elif self.path.split("?")[0] == "/job/abort" and not facts["down"]:
+            facts["aborts"].append(self.path)
+            body, code = {"error": "no job is running"}, 409
         else:
             body, code = {"error": "the stand-in has no such route"}, 404
         data = json.dumps(body).encode()
@@ -574,12 +701,14 @@ def main():
         except ValueError:
             return {"ok": None, "error": p.stdout[:200] + p.stderr[:200]}
 
-    def package(id_, runtime, files, caps=(), grants=(), args=(), version="1.0.0"):
+    def package(id_, runtime, files, caps=(), grants=(), args=(), version="1.0.0", modes=None):
         d = os.path.join(top, "src-" + id_)
         os.makedirs(os.path.join(d, "bin"), exist_ok=True)
         exe = "bin/run.py" if runtime == "python" else "bin/run.sh"
         m = {"manifest": 1, "id": id_, "name": id_, "version": version, "author": "Test", "license": "MIT", "api": "0.1",
              "runtime": runtime, "service": {"exec": exe, "args": list(args)}, "capabilities": list(caps)}
+        if modes:
+            m["modes"] = list(modes)
         with open(os.path.join(d, "manifest.json"), "w") as f:
             f.write(json.dumps(m, indent=1) + "\n")
         with open(os.path.join(d, exe), "w") as f:
@@ -596,7 +725,8 @@ def main():
     # included, and the image's table is what refuses the machine.
     package("org.example.dial", "python", DIAL, caps=["net.outbound:peer.test:%d" % pport, "net.outbound:peer.test:%d" % fport],
             args=["peer.test", str(pport), str(fport)])
-    package("org.example.jobtime", "python", JOBTIME, caps=["job_time.run", "machine.read", "hold", "motion.job", "mcode:170"],
+    package("org.example.jobtime", "python", JOBTIME, caps=["job_time.run", "machine.read", "hold", "motion.job", "mcode:170",
+                                                         "camera.lid"],
             grants=["job_time.run", "hold", "motion.job"])
     package("org.example.crash", "shell", "#!/bin/sh\necho about to end\nexit 3\n", caps=["hold"], grants=["hold"])
 
@@ -671,7 +801,7 @@ def main():
     # decides on this and the service sees the same answer at GET /v0/self,
     # so the two are checked against each other below.
     eff = {x["id"]: sorted(x.get("effective") or []) for x in fx("list").get("packages", [])}
-    check(eff.get("org.example.jobtime") == ["hold", "job_time.run", "machine.read", "mcode:170", "motion.job"],
+    check(eff.get("org.example.jobtime") == ["camera.lid", "hold", "job_time.run", "machine.read", "mcode:170", "motion.job"],
           "what jobtime may use: %s", eff.get("org.example.jobtime"))
     check(eff.get("org.example.dial") == sorted(["net.outbound:peer.test:%d" % pport, "net.outbound:peer.test:%d" % fport]),
           "what dial may use: %s", eff.get("org.example.dial"))
@@ -782,6 +912,23 @@ def main():
         check(wait_for(lambda: "motion is unverified" in status().get("not_ready", ""), 10), "shared: %s",
               status().get("not_ready"))
 
+        print("the start gates: a controller that is not running, a diagnostic, a firmware job")
+        # Motion verified, and one gate at a time holding every start, in words that name it. Each next gate is
+        # turned on before the last is turned off, so that no turn finds the machine ready in between.
+        facts["motion"] = "verified"
+        facts["controller"] = "stopped"
+        check(wait_for(lambda: "the controller is stopped" in status().get("not_ready", ""), 10) and not running(),
+              "a controller that is not running: nothing starts, and the host says why: %s", status().get("not_ready"))
+        facts["diag"], facts["controller"] = True, "running"
+        check(wait_for(lambda: "a diagnostic is running" in status().get("not_ready", ""), 10) and not running(),
+              "a diagnostic: nothing starts, and the host says why: %s", status().get("not_ready"))
+        facts["updating"], facts["diag"] = True, False
+        check(wait_for(lambda: "a firmware job is running" in status().get("not_ready", ""), 10) and not running(),
+              "a firmware job: nothing starts, and the host says why: %s", status().get("not_ready"))
+        facts["motion"], facts["updating"] = "unverified", False
+        check(wait_for(lambda: "motion is unverified" in status().get("not_ready", ""), 10) and not running(),
+              "back to unverified motion: %s", status().get("not_ready"))
+
         print("ready: one at a time, each in its own account and group")
         t0 = time.time()
         facts["motion"] = "verified"
@@ -877,9 +1024,9 @@ def main():
         os.waitpid(child, 0)
         check(fifth == b"1" and other == "ok", "five silent connections from one package: the fifth closed at once (%s), "
               "and another package answered meanwhile (%s)", fifth, other)
-        check(",".join(eff["org.example.jobtime"]) == "hold,job_time.run,machine.read,mcode:170,motion.job",
+        check(",".join(eff["org.example.jobtime"]) == "camera.lid,hold,job_time.run,machine.read,mcode:170,motion.job",
               "the list and the socket must answer alike, and the list says %s", eff["org.example.jobtime"])
-        check(logged(jid + "api self 200 org.example.jobtime 0.1 hold,job_time.run,machine.read,mcode:170,motion.job"),
+        check(logged(jid + "api self 200 org.example.jobtime 0.1 camera.lid,hold,job_time.run,machine.read,mcode:170,motion.job"),
               "GET /v0/self: who it is, the API's version, and what it may use (the grants it got, the capabilities that need none)")
         check(logged(jid + "api mode 200 grbl verified"), "GET /v0/machine/mode: forgectrl's answer, relayed")
         check(logged(jid + "api nowhere 404") and logged(jid + "api bad hold 400"), "a path the API does not have, and a hold in no form")
@@ -907,12 +1054,16 @@ def main():
                     continue
                 rest = line.split("api job ", 1)[1].split(" ", 2)
                 out[rest[0]] = (int(rest[1]), rest[2] if len(rest) > 2 else "")
-            return out if len(out) == 3 else None
+            return out if len(out) == 5 else None
 
-        job = wait_for(job_lines, 15) or {}
-        check(set(job) == {"real", "link", "dir"}, "the package did not try all three programs: %s", job)
+        # A FIFO named as the program is refused at once, its open waiting on no writer; the API client gives up
+        # after 5 s (599) on an answer that does not come.
+        job = wait_for(job_lines, 20) or {}
+        check(set(job) == {"real", "link", "dir", "fifo", "abort"}, "the package did not try all four programs and the abort: %s", job)
+        check(facts["aborts"][:1] == ["/job/abort?id=org.example.jobtime"],
+              "the package's abort reaches forgectrl naming the package: %s", facts["aborts"])
         check(job.get("real", (0,))[0] != 400, "the file that is there was refused as a program: %s", job.get("real"))
-        for what in ("link", "dir"):
+        for what in ("link", "dir", "fifo"):
             code, words = job.get(what, (0, ""))
             check(code == 400 and "this package's data" in words, "the %s program was not refused in words: %s %s",
                   what, code, words)
@@ -948,8 +1099,10 @@ def main():
         check(c and c["required"] is True and c["age"] < 1.5
               and c["reason"] in ("the extension is not running", "the extension has only just started"),
               "required and not running: raised by the host, in the host's words: %s", c)
-        check(sorted(os.listdir(holds_dir)) == ["org.example.beat.json", "org.example.crash.json", "org.example.jobtime.json"],
-              "a package without the grant has no file: %s", sorted(os.listdir(holds_dir)))
+        # The host writes each file as .<id>.json.new and renames it into place: a listing can catch one mid-rename.
+        listed = sorted(n for n in os.listdir(holds_dir) if not n.startswith("."))
+        check(listed == ["org.example.beat.json", "org.example.crash.json", "org.example.jobtime.json"],
+              "a package without the grant has no file: %s", listed)
         ages, clear = [], 0
         for _ in range(8):
             time.sleep(0.4)
@@ -959,6 +1112,111 @@ def main():
         check(clear == 0, "the required hold of the package that ends at every start never reads clear: %d of 8 looks did", clear)
         check(svc("org.example.crash").get("hold") == "required" and svc("org.example.beat").get("hold") == "advisory"
               and "hold" not in svc("org.example.dial"), "the status file says which hold is which")
+
+        print("a raise is on disk before the package is told so, with forgectrl slow and a relay of its own waiting")
+        # Every GET of the stand-in answered 1.5 s late: the host's turn takes seconds, and so does a relay of a
+        # machine read. jobtime is told to race just as the host has asked /mode, 1.5 s or more before the turn
+        # reaches its holds: it starts a read of the machine, and raises its hold 0.3 s into it.
+        jdata = os.path.join(root, "data", "org.example.jobtime")
+        once, seen = threading.Lock(), {}
+
+        def race_at_mode():
+            if once.acquire(blocking=False):
+                facts["on_mode"] = None
+                open(os.path.join(jdata, "race"), "w").close()
+
+        def raced():
+            h = held("org.example.jobtime") or {}
+            if h.get("raised") and h.get("reason") == "raced" and "at" not in seen:
+                seen["at"] = time.monotonic()
+            return "at" in seen and os.path.exists(os.path.join(jdata, "race.json"))
+        facts["slow"], facts["on_mode"] = 1.5, race_at_mode
+        wait_for(raced, 30, poll=0.01)
+        facts["slow"], facts["on_mode"] = 0, None
+        try:
+            race = json.load(open(os.path.join(jdata, "race.json")))
+        except (OSError, ValueError):
+            race = {}
+        check(race.get("code") == 200 and race.get("answered", 99) - race.get("sent", 0) < 0.5,
+              "the raise was answered %.2f s after it was sent, with a relay of the same package waiting on a slow "
+              "forgectrl: %s", race.get("answered", 99) - race.get("sent", 0), race)
+        check("at" in seen and seen["at"] - race.get("answered", 0) < 0.25,
+              "the raised file was there %.2f s after the package was told (the turn is seconds away)",
+              seen.get("at", 99) - race.get("answered", 0))
+        # The package's own relay returns about 1.2 s after its raise, and host turns pass: the hold it was told is
+        # raised stands through both, in its own words, until the package clears it.
+        def words(h):
+            return (bool(h.get("raised")), h.get("reason")) if h else None
+        looks = []
+        for _ in range(6):
+            time.sleep(0.5)
+            looks.append(words(held("org.example.jobtime")))
+        check(all(w == (True, "raced") for w in looks),
+              "the raised hold stands in its words after its own relay returns and through the turns after: %s", looks)
+        # The other way: the package clears its hold 0.3 s into another read of its own, with forgectrl slow; the clear
+        # stands after that read returns and through the turns after.
+        facts["slow"] = 1.5
+        open(os.path.join(jdata, "unrace"), "w").close()
+        un = {}
+
+        def unraced():
+            try:
+                un.update(json.load(open(os.path.join(jdata, "unrace.json"))))
+            except (OSError, ValueError):
+                pass
+            return un
+        wait_for(unraced, 20, poll=0.05)
+        facts["slow"] = 0
+        check(un.get("code") == 200 and un.get("returned", 0) - un.get("cleared", 99) > 0.5,
+              "the clear was answered while the package's own read waited, %.2f s before that read returned: %s",
+              un.get("returned", 0) - un.get("cleared", 99), un)
+        check(wait_for(lambda: (held("org.example.jobtime") or {}).get("raised") is False, 10),
+              "and cleared at the turn: %s", held("org.example.jobtime"))
+        looks = []
+        for _ in range(6):
+            time.sleep(0.5)
+            looks.append(words(held("org.example.jobtime")))
+        check(all(w and w[0] is False for w in looks),
+              "the cleared hold stays cleared after the read returns and through the turns after: %s", looks)
+        for n in ("race", "race.json", "unrace", "unrace.json"):   # a later start of jobtime does not race again
+            os.unlink(os.path.join(jdata, n))
+
+        print("a required hold of a package that runs only in GRBL mode, the machine in cloud mode")
+        gid = "org.example.grblonly"
+        package(gid, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["hold"], grants=["hold"], modes=["grbl"])
+
+        def marker(id_):
+            try:
+                return open(os.path.join(marks, id_)).read()
+            except OSError:
+                return None
+        r = fx("hold", gid, "required")
+        check(r.get("ok") is True and marker(gid) == "grbl\n", "marked required: its marker names its one mode: %s %r",
+              r.get("error", ""), marker(gid))
+        check(wait_for(lambda: held(gid) is not None, 10), "in GRBL mode its hold has a file: %s", held(gid))
+        facts["mode"] = "cloud"
+        check(wait_for(lambda: held(gid) is None, 10) and marker(gid) == "grbl\n",
+              "in cloud mode: no file, and the marker forgectrl passes over while the cloud controller runs: %s %r",
+              held(gid), marker(gid))
+        facts["mode"] = "grbl"
+        check(fx("remove", gid).get("ok") is True and marker(gid) is None and held(gid) is None, "and it goes")
+
+        print("a settings file that cannot be read is not extensions off")
+        # A directory in its place: it opens, and does not read. The value last read stands: every hold file stays,
+        # and so does every service.
+        files_before = sorted(n for n in os.listdir(holds_dir) if not n.startswith("."))
+        up_before = [i for i in running() if i != "org.example.crash"]          # it ends at every start
+        os.rename(conf, conf + ".kept")
+        os.mkdir(conf)
+        gone = []
+        for _ in range(30):
+            time.sleep(0.1)
+            gone += [n for n in files_before if not os.path.exists(os.path.join(holds_dir, n))]
+        os.rmdir(conf)
+        os.rename(conf + ".kept", conf)
+        check(not gone and [i for i in running() if i != "org.example.crash"] == up_before,
+              "three seconds of a settings file that does not read: hold files that went %s, running %s",
+              sorted(set(gone)), running())
 
         print("the armed window")
         facts["armed"] = True
@@ -1004,7 +1262,23 @@ def main():
         print("a package keeps the Grbl sender out, by the operator's grant")
         kid, senders_dir = "org.example.keepout", os.path.join(top, "sender-out")     # beside the holds directory
         package(kid, "python", KEEPOUT, caps=["sender.keep_out"], grants=["sender.keep_out"])
-        k = wait_for(lambda: (held(kid, senders_dir) or {}).get("raised") and held(kid, senders_dir), 40)
+        check(wait_for(lambda: svc(kid).get("state") == "running", 40), "it runs: %s", svc(kid))
+        # The claim's file is written as the machine grants it, not at the host's next turn: with forgectrl slow
+        # (every GET 1.5 s late, the turn seconds long) it is there as soon as the claim is answered. The package is
+        # told to claim just as the host has asked /mode, 1.5 s or more before the turn reaches its claims.
+        go_once = threading.Lock()
+
+        def go_at_mode():
+            if go_once.acquire(blocking=False):
+                facts["on_mode"] = None
+                open(os.path.join(root, "data", kid, "go"), "w").close()
+        facts["slow"], facts["on_mode"] = 1.5, go_at_mode
+        k = wait_for(lambda: (held(kid, senders_dir) or {}).get("raised") and held(kid, senders_dir), 20, poll=0.01)
+        seen_at = time.monotonic()
+        facts["slow"], facts["on_mode"] = 0, None
+        granted_at = facts["sender_at"][-1] if facts["sender_at"] else 0
+        check(k and seen_at - granted_at < 0.3, "the claim's file was there %.2f s after the machine granted it",
+              seen_at - granted_at)
         time.sleep(1.0)
         k2 = held(kid, senders_dir)
         check(k and k["reason"] == "keeps the Grbl sender out" and k["age"] < 1.5 and k2 and k2["raised"] and k2["age"] < 1.5,
@@ -1039,6 +1313,47 @@ def main():
         check(r.get("ok") is True and wait_for(lambda: svc(aid).get("state") != "running", 8) and quiet(),
               "disabled: its service is stopped, and no ask is carried: %s", svc(aid))
         check(fx("remove", aid).get("ok") is True, "and it goes")
+
+        print("a frame its package does not read holds up nobody's API")
+        # A 4 MiB frame for a package that never reads it: the camera thread's send waits on that peer alone, with the
+        # broker's lock let go, and the package's own hold, raised 0.3 s into it, is answered at once.
+        # Another package's capture meanwhile (jobtime's) is refused, the host taking one at a time, for no longer
+        # than the bound.
+        shid, sh2 = "org.example.shot", "org.example.jobtime"
+        package(shid, "python", SHOT, caps=["camera.lid", "hold"], grants=["hold"])
+        check(wait_for(lambda: svc(shid).get("state") == "running" and svc(sh2).get("state") == "running", 40),
+              "they run: %s %s", svc(shid), svc(sh2))
+        open(os.path.join(root, "data", shid, "go"), "w").close()
+        wait_for(lambda: os.path.exists(os.path.join(root, "data", shid, "asked")), 10, poll=0.01)
+        open(os.path.join(root, "data", sh2, "shoot"), "w").close()
+        shot = {}
+        for _ in range(100):
+            try:
+                shot = json.load(open(os.path.join(root, "data", shid, "shot.json")))
+                break
+            except (OSError, ValueError):
+                time.sleep(0.1)
+        check(shot.get("code") == 200 and shot.get("took", 99) < 0.15,
+              "a hold raised while the package's own frame waits unread on its socket was answered in %.2f s: %s",
+              shot.get("took", 99), shot)
+        shots = {}
+
+        def shots_in():
+            try:
+                shots.update(json.load(open(os.path.join(root, "data", sh2, "shots.json"))))
+            except (OSError, ValueError):
+                pass
+            return shots
+        wait_for(shots_in, 15, poll=0.1)
+        codes = [c for c, _ in shots.get("codes", [])]
+        took = shots["codes"][-1][1] - shots["start"] if codes else 99
+        check(len(codes) >= 2 and set(codes[:-1]) == {503} and codes[-1] == 200 and took < 2.0,
+              "another package's capture while that frame waits: refused %d times, then taken %.2f s after its first "
+              "ask (the bound is 0.5 s): %s", codes.count(503), took, codes)
+        for n in ("shoot", "shots.json"):               # a later start of jobtime does not shoot again
+            if os.path.exists(os.path.join(root, "data", sh2, n)):
+                os.unlink(os.path.join(root, "data", sh2, n))
+        check(fx("remove", shid).get("ok") is True, "and it goes")
 
         print("the machine's events: one stream from forgectrl, held while a package wants it")
         eid = "org.example.events"
@@ -1077,6 +1392,45 @@ def main():
                                                and open_streams() == 0, 10),
               "disabled, nobody wants events: %s, and the stand-in has %d open", status().get("events"), open_streams())
         check(fx("remove", eid).get("ok") is True, "and it goes")
+
+        print("a required hold stands in the host's words as its service ends, and before a clean stop stops it")
+        # Here, where jobtime and beat have run since well before (a service is healthy after 60 s), each saying
+        # clear; both marked required. One stop and start of the host serves the clean stop's case.
+        for id_ in ("org.example.jobtime", "org.example.beat"):
+            check(fx("hold", id_, "required").get("ok") is True, "%s marked required", id_)
+        check(wait_for(lambda: all((held(i) or {}).get("required") is True and (held(i) or {}).get("raised") is False
+                                   for i in ("org.example.jobtime", "org.example.beat")), 75),
+              "both required, healthy, and clear: %s %s", held("org.example.jobtime"), held("org.example.beat"))
+        # jobtime's service killed just as the host has asked /mode, with forgectrl slow: the host's next judgment is
+        # more than 3 s away, and the hold is raised as soon as the end is seen, at the end of this turn.
+        kill = {}
+        kill_once = threading.Lock()
+
+        def kill_at_mode():
+            if kill_once.acquire(blocking=False):
+                facts["on_mode"] = None
+                kill["at"] = time.monotonic()
+                os.kill(svc("org.example.jobtime")["pid"], signal.SIGKILL)
+        facts["slow"], facts["on_mode"] = 1.5, kill_at_mode
+        up = wait_for(lambda: (held("org.example.jobtime") or {}).get("raised") and time.monotonic(), 15, poll=0.01)
+        facts["slow"], facts["on_mode"] = 0, None
+        check(up and "at" in kill and up - kill["at"] < 2.5,
+              "a required hold of a service that ended stood %.2f s after the end (the next judgment was 3 s away)",
+              (up or 99) - kill.get("at", 0))
+        check(wait_for(lambda: svc("org.example.jobtime").get("state") == "running", 30), "jobtime runs again")
+        # A clean stop with beat healthy and clear: its file is left raised, not clear and stale.
+        daemon.send_signal(signal.SIGTERM)
+        check(daemon.wait(timeout=30) == 0, "the host stopped")
+        b = held("org.example.beat") or {}
+        check(b.get("required") is True and b.get("raised") is True,
+              "a clean stop leaves a healthy package's required hold raised, not as it last said: %s", b)
+        daemon = start_daemon()
+        check(wait_for(lambda: status().get("pid") == daemon.pid, 15)
+              and wait_for(lambda: all(s_ in running() for s_ in ("org.example.beat", "org.example.dial",
+                                                                    "org.example.jobtime")), 60),
+              "a new host runs them again: %s", running())
+        for id_ in ("org.example.jobtime", "org.example.beat"):
+            check(fx("hold", id_, "advisory").get("ok") is True, "%s advisory again", id_)
 
         print("a killed service comes back; one that keeps ending is quarantined")
         walks = opens_of(os.path.join(root, "data", "org.example.beat"))   # the host's measurements, from here on
@@ -1468,7 +1822,8 @@ def main():
         # A second one the same way, enabled again once the host that would start it is killed below: the next
         # host finds it enabled with no manifest to read, and holds it out in words that say so.
         notree2 = "org.example.notree2"
-        package(notree2, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n")
+        package(notree2, "shell", "#!/bin/sh\nwhile true; do sleep 1; done\n", caps=["hold"], grants=["hold"])
+        check(fx("hold", notree2, "required").get("ok") is True, "its hold marked required")
         r = fx("disable", notree2)
         shutil.rmtree(os.path.join(root, "pkg", notree2))
         check(r.get("ok") is True and wait_for(lambda: svc(notree2).get("state") != "running", 10),
@@ -1526,6 +1881,10 @@ def main():
               and not since(at, "%s: started as" % notree2) and since(at, "%s: its manifest could not be read" % notree2),
               "the enabled package with no tree is held out, in words that name its manifest, and never started: %s",
               svc(notree2))
+        # Its modes are not known to this host: its required hold is raised in the host's words, whatever the mode.
+        h2 = wait_for(lambda: (held(notree2) or {}).get("raised") and held(notree2), 10) or {}
+        check(h2.get("required") is True and h2.get("reason") == "the extension is not running",
+              "a required hold whose package's modes are not known is raised by the host, in its words: %s", h2)
         r = fx("remove", notree2)
         check(r.get("ok") is True and wait_for(lambda: not svc(notree2), 10), "and it goes: %s", r.get("error", ""))
 

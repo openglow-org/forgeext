@@ -87,4 +87,27 @@ void holdkeep_set(holdkeep_t *k, const hold_entry_t *e, int n);
  * end them in forgectrl without any host. */
 void holdkeep_stop(holdkeep_t *k);
 
+/* A raise that does not wait for the main loop's next turn: the entry the
+ * last holdkeep_set() named for id is raised, in these words unless it
+ * already stood raised, and its file is written before this returns. Only
+ * toward raised, and only for an entry the table already has: which
+ * packages have a file (enabled, in this controller mode, extensions on)
+ * is the turn's to say, and so is a clear, which must pass hold_decide().
+ * 1 when the entry was there, 0 when it was not (nothing is written). */
+int holdkeep_raise(holdkeep_t *k, const char *id, const char *reason);
+
+/* A claim taken now (the sender-out files, which share this form): the
+ * entry for id is added if the table lacks it, raised, and written before
+ * this returns. The next holdkeep_set() keeps it or takes it away. 0, or
+ * -1 when the table is full or the keeper is stopping. */
+int holdkeep_claim(holdkeep_t *k, const char *id, const char *reason);
+
+/* The required-hold marker of one package (install.h's directory): its
+ * name is the package's id, and it holds the controller modes the package
+ * runs in, "grbl", "cloud" or "grbl cloud", one line. forgectrl lets a
+ * marker go unread while the controller it runs is one the marker does not
+ * name; a marker with no modes in it (modes not known) stands in every
+ * mode. Written whole (a new file renamed over the old). 0, or -1. */
+int holdkeep_marker_write(const char *dir, const char *id, int grbl, int cloud);
+
 #endif

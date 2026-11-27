@@ -42,9 +42,19 @@ static void line(FILE *f, const char *what, const ffx_reply_t *r, int rc)
     fprintf(f, "%s %d %d %s %s\n", what, rc, r->status, r->ctype, body);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     char path[512], reason[128];
+    /* Run by the test on the host, not as a package: one GET of the socket
+     * FFX_API names, whose server sends less than its head says. The
+     * answer is printed: rc and status. */
+    if (argc > 1 && !strcmp(argv[1], "short")) {
+        ffx_reply_t s;
+        int rc = ffx_request("GET", "/v0/self", NULL, &s, 3000);
+        printf("short %d %d\n", rc, s.status);
+        ffx_reply_free(&s);
+        return 0;
+    }
     const char *data = getenv("FFX_DATA");
     if (!data)
         return 2;
@@ -73,6 +83,11 @@ int main(void)
 
     rc = ffx_request("GET", "/v0/machine/mode", NULL, &r, 5000);
     line(f, "mode", &r, rc);
+    ffx_reply_free(&r);
+
+    /* A POST with no body says its length: the route answers it (405), not the reader (411). */
+    rc = ffx_request("POST", "/v0/self", NULL, &r, 5000);
+    line(f, "post_empty", &r, rc);
     ffx_reply_free(&r);
 
     fprintf(f, "call_fd %d\n", ffx_call_fd());

@@ -154,6 +154,70 @@ void holdkeep_set(holdkeep_t *k, const hold_entry_t *e, int n)
     pthread_mutex_unlock(&k->mu);
 }
 
+int holdkeep_raise(holdkeep_t *k, const char *id, const char *reason)
+{
+    int found = 0;
+    if (!k->started)
+        return 0;
+    pthread_mutex_lock(&k->mu);
+    for (int i = 0; !k->stop && i < k->n && !found; i++) {
+        if (strcmp(k->e[i].id, id) != 0)
+            continue;
+        found = 1;
+        if (!k->e[i].raised) {
+            k->e[i].raised = 1;
+            snprintf(k->e[i].reason, sizeof(k->e[i].reason), "%s", reason ? reason : "");
+        }
+        write_one(k->dir, &k->e[i], mono());
+    }
+    pthread_mutex_unlock(&k->mu);
+    return found;
+}
+
+int holdkeep_claim(holdkeep_t *k, const char *id, const char *reason)
+{
+    int rc = -1;
+    if (!k->started)
+        return -1;
+    pthread_mutex_lock(&k->mu);
+    int at = -1;
+    for (int i = 0; i < k->n && at < 0; i++)
+        if (strcmp(k->e[i].id, id) == 0)
+            at = i;
+    if (at < 0 && k->n < HOLDKEEP_MAX) {
+        at = k->n++;
+        memset(&k->e[at], 0, sizeof(k->e[at]));
+        snprintf(k->e[at].id, sizeof(k->e[at].id), "%s", id);
+    }
+    if (!k->stop && at >= 0) {
+        k->e[at].raised = 1;
+        snprintf(k->e[at].reason, sizeof(k->e[at].reason), "%s", reason ? reason : "");
+        write_one(k->dir, &k->e[at], mono());
+        rc = 0;
+    }
+    pthread_mutex_unlock(&k->mu);
+    return rc;
+}
+
+int holdkeep_marker_write(const char *dir, const char *id, int grbl, int cloud)
+{
+    char path[400], tmp[420];
+    snprintf(path, sizeof(path), "%.299s/%.63s", dir, id);
+    snprintf(tmp, sizeof(tmp), "%.299s/.%.63s.new", dir, id);
+    const char *text = grbl && cloud ? "grbl cloud\n" : grbl ? "grbl\n" : cloud ? "cloud\n" : "";
+    int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd < 0)
+        return -1;
+    size_t n = strlen(text);
+    int ok = write(fd, text, n) == (ssize_t)n;
+    ok = close(fd) == 0 && ok;
+    if (!ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
 void holdkeep_stop(holdkeep_t *k)
 {
     if (!k->started)

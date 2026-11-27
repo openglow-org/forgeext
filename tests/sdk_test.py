@@ -35,6 +35,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -132,6 +133,7 @@ note("jog", lambda: ffx.jog(x=1))
 note("ask", ffx.button_ask)
 note("ask_end", ffx.button_ask_end)
 note("nowhere", lambda: ffx.call("GET", "/v0/nowhere"))
+note("post_empty", lambda: ffx.request("POST", "/v0/self")[0])
 note("program", lambda: ffx.write_program("p.gcode", "G21\n"))
 note("program_dir", lambda: ffx.write_program("../p.gcode", "G21\n"))
 note("fds", fds)
@@ -150,6 +152,7 @@ r="$FFX_DATA/report.txt.new"
 : > "$r"
 ffx_get /v0/self > /dev/null; echo "self $? $FFX_STATUS $FFX_BODY" >> "$r"
 ffx_hold 1 "from ffx.sh" > /dev/null; echo "raise $? $FFX_STATUS $FFX_BODY" >> "$r"
+ffx_hold 1 'a "quoted" \ reason' > /dev/null; echo "raise_quoted $? $FFX_STATUS $FFX_BODY" >> "$r"
 mv "$r" "$FFX_DATA/report.txt"
 while true; do sleep 60; done
 '''
@@ -338,6 +341,8 @@ def main():
         check(rep.get("ask") == ["ok", {"state": "ready"}] and rep.get("ask_end") == ["ok", {"state": "ended"}],
               "button_ask asks for a press and button_ask_end withdraws the ask: %s %s", rep.get("ask"), rep.get("ask_end"))
         check(rep.get("nowhere", [""])[0] == "refused" and rep["nowhere"][1] == 404, "a path there is none of: %s", rep.get("nowhere"))
+        check(rep.get("post_empty") == ["ok", 405], "a POST with no body says its length and reaches the route (405, "
+              "not 411): %s", rep.get("post_empty"))
         check(rep.get("program") == ["ok", "p.gcode"] and os.path.isfile(os.path.join(root, "data", "org.example.sdkpy", "p.gcode")),
               "a program written into its own data: %s", rep.get("program"))
         check(rep.get("program_dir", [""])[0] == "broke" and "ValueError" in rep["program_dir"][1],
@@ -461,6 +466,8 @@ def main():
         sh = lines("org.example.sdksh")
         check(sh.get("self", "").startswith("0 200 ") and '"org.example.sdksh"' in sh.get("self", ""), "self: %s", sh.get("self"))
         check(sh.get("raise", "").startswith("0 200 ") and '"from ffx.sh"' in sh.get("raise", ""), "a hold raised: %s", sh.get("raise"))
+        check(sh.get("raise_quoted", "").startswith("0 200 ") and '"a ?quoted? ? reason"' in sh.get("raise_quoted", ""),
+              "a reason with a quote and a backslash still raises the hold, those characters made ?: %s", sh.get("raise_quoted"))
 
         print("the C client, ffx.h (built static)")
         c = lines("org.example.sdkc")
@@ -470,6 +477,23 @@ def main():
         check(c.get("escape_small") == "-1", "and one that does not fit refused: %s", c.get("escape_small"))
         check(c.get("raise", "").startswith("0 200 ") and '"from ffx.h"' in c.get("raise", ""), "a hold raised: %s", c.get("raise"))
         check(c.get("mode", "").startswith("0 200 ") and '"grbl"' in c.get("mode", ""), "the machine's mode: %s", c.get("mode"))
+        check(c.get("post_empty", "").startswith("0 405 "), "a POST with no body says its length (405, not 411): %s",
+              c.get("post_empty"))
+        # On the host, against a socket of the test's whose answer is shorter than its head says: no answer.
+        short_sock = os.path.join(top, "short.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(short_sock)
+        srv.listen(1)
+
+        def cut_short():
+            conn, _ = srv.accept()
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"id\":")
+            conn.close()
+        threading.Thread(target=cut_short, daemon=True).start()
+        s_ = subprocess.run([native, "short"], capture_output=True, text=True, timeout=20, env=dict(os.environ, FFX_API=short_sock))
+        srv.close()
+        check(s_.stdout.strip() == "short -1 0", "an answer cut short is no answer: %s", s_.stdout.strip())
         check(c.get("call_fd") == "4", "its page's calls, at descriptor %s", c.get("call_fd"))
         r = call("org.example.sdkc", "POST", "/echo", '{"x": [1, 2]}')
         check(r.get("ok") is True and r.get("status") == 200

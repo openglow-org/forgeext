@@ -41,10 +41,10 @@ typedef struct {
     size_t len;
 } ffx_reply_t;
 
-/* One request. json may be NULL (a GET); a POST sends it as
- * application/json. 0 when an answer came back (whatever its status), -1
- * with r->status 0 when none did: the socket, the connection, or the
- * timeout. */
+/* One request. json may be NULL (a GET, or a POST with no body); a POST
+ * sends it as application/json. 0 when a whole answer came back (whatever
+ * its status), -1 with r->status 0 when none did: the socket, the
+ * connection, the timeout, or an answer shorter than its head says. */
 int ffx_request(const char *method, const char *path, const char *json, ffx_reply_t *r, int timeout_ms);
 void ffx_reply_free(ffx_reply_t *r);
 
@@ -84,7 +84,7 @@ int ffx_serve_one(ffx_handler_t h, void *ctx, int timeout_ms);
 #include <time.h>
 #include <unistd.h>
 
-#define FFX_ANSWER_MAX (4 * 1024 * 1024)
+#define FFX_ANSWER_MAX (8 * 1024 * 1024 + 65536)       /* the host's largest frame, and its head */
 
 static long ffx_ms_left(const struct timespec *end)
 {
@@ -125,9 +125,11 @@ int ffx_request(const char *method, const char *path, const char *json, ffx_repl
 
     size_t blen = json ? strlen(json) : 0;
     char head[512];
+    /* A POST says its length, an empty one too. */
     int hn = json ? snprintf(head, sizeof(head), "%s %s HTTP/1.1\r\nHost: forgeext\r\nContent-Type: application/json\r\n"
                              "Content-Length: %zu\r\n\r\n", method, path, blen)
-                  : snprintf(head, sizeof(head), "%s %s HTTP/1.1\r\nHost: forgeext\r\n\r\n", method, path);
+                  : snprintf(head, sizeof(head), "%s %s HTTP/1.1\r\nHost: forgeext\r\n%s\r\n", method, path,
+                             strcmp(method, "GET") != 0 ? "Content-Length: 0\r\n" : "");
     if (hn < 0 || (size_t)hn >= sizeof(head))
         return -1;
 
@@ -218,6 +220,19 @@ int ffx_request(const char *method, const char *path, const char *json, ffx_repl
     }
     size_t off = (size_t)(sep + 4 - buf);
     r->len = len - off;
+    /* An answer cut short (a timeout mid-body, the cap) is no answer: the
+     * length the head names is the length that must have come. */
+    for (char *p = buf; (p = strstr(p, "\r\n")) != NULL; p += 2)
+        if (strncasecmp(p + 2, "Content-Length:", 15) == 0) {
+            char *end;
+            unsigned long long want = strtoull(p + 17, &end, 10);
+            if (end == p + 17 || want != (unsigned long long)r->len) {
+                free(buf);
+                memset(r, 0, sizeof(*r));
+                return -1;
+            }
+            break;
+        }
     memmove(buf, sep + 4, r->len + 1);
     r->body = buf;
     return 0;

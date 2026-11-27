@@ -77,6 +77,8 @@ class World:
             self.keys[name] = os.path.join(d, "fwup-key.priv")
         os.makedirs(os.path.join(self.root, "keys"))
         shutil.copy(self.pub("owner"), os.path.join(self.root, "keys", "a-friend.pub"))
+        self.holds = os.path.join(top, "holds")       # the hold files a disable, a removal or an advisory mark takes away
+        os.mkdir(self.holds)
         self.n = 0
 
     def pub(self, name):
@@ -85,7 +87,8 @@ class World:
     def run(self, *args, budget=None, core=None, pre=None, fwup=None):
         """forgeext's answer; pre runs in the child before the exec (limits), fwup is another fwup to use."""
         cmd = [FORGEEXT, "--root", self.root, "--fwup", fwup or FWUP, "--official-key", self.pub("official"),
-               "--index-key", self.pub("index"), "--firmware-key", self.pub("firmware"), "--no-reserve"]
+               "--index-key", self.pub("index"), "--firmware-key", self.pub("firmware"), "--no-reserve",
+               "--holds-dir", self.holds]
         cmd += (["--budget-mib", str(budget)] if budget else [])
         cmd += (["--core-version", core] if core else []) + list(args)
         p = subprocess.run(cmd, capture_output=True, text=True, preexec_fn=pre)
@@ -829,6 +832,65 @@ def run_all(w, top):
           "the kept predecessor installed again: current is its tree, and the replaced version is kept: %s %s" % (r, p))
     r = w.run("check", A)
     check(r.get("ok") is True, "and it checks: %s" % r)
+
+    print("a required hold: its marker names its modes, and the operator's exits take its file and its marker at once")
+    H = "org.example.holder"
+    marks = os.path.join(root, "required-holds")
+
+    def marker():
+        try:
+            return open(os.path.join(marks, H)).read()
+        except OSError:
+            return None
+
+    def stopped_hosts_file():
+        """The file a stopped host leaves for a required hold: stale, and standing on its own field."""
+        p = os.path.join(w.holds, H + ".json")
+        with open(p, "w") as f:
+            f.write('{"id": "%s", "required": true, "raised": false, "reason": "", "ts_mono": 1.0}\n' % H)
+        return p
+
+    def hold_listed():
+        return next((p.get("hold") for p in w.run("list")["packages"] if p["id"] == H), "gone")
+    h1 = w.pack(w.tree(manifest(H, caps=["hold", "motion.job"], modes=["grbl"]), RUN), "official")
+    check(w.run("install", h1, "--grant", "hold", "--grant", "motion.job").get("ok") is True
+          and w.run("hold", H, "required").get("ok") is True and marker() == "grbl\n",
+          "marked required: its marker names its one mode: %r" % marker())
+    f_ = stopped_hosts_file()
+    check(w.run("disable", H).get("ok") is True and not os.path.exists(f_) and marker() is None,
+          "disabled: the file a stopped host left and the marker go: file %s, marker %r" % (os.path.exists(f_), marker()))
+    check(w.run("enable", H).get("ok") is True and marker() == "grbl\n", "enabled: the marker is back")
+    f_ = stopped_hosts_file()
+    check(w.run("hold", H, "advisory").get("ok") is True and not os.path.exists(f_) and marker() is None,
+          "made advisory: the file and the marker go: file %s, marker %r" % (os.path.exists(f_), marker()))
+    check(w.run("hold", H, "required").get("ok") is True and marker() == "grbl\n", "required again")
+    h15 = w.pack(w.tree(manifest(H, "1.0.1", caps=["hold", "motion.job"], modes=["grbl", "cloud"]), RUN), "official")
+    check(w.run("install", h15, "--grant", "hold", "--grant", "motion.job").get("ok") is True
+          and marker() == "grbl cloud\n",
+          "an update that runs in both modes: its marker says so: %r" % marker())
+    h2 = w.pack(w.tree(manifest(H, "1.1.0", caps=["motion.job"], modes=["grbl"]), RUN), "official")
+    check(w.run("install", h2, "--grant", "motion.job").get("ok") is True and marker() is None and hold_listed() is None,
+          "an update that drops the hold: its marker goes with the install: %r, %s" % (marker(), hold_listed()))
+    h3 = w.pack(w.tree(manifest(H, "1.2.0", caps=["hold", "motion.job"], modes=["grbl"]), RUN), "official")
+    check(w.run("install", h3, "--grant", "hold", "--grant", "motion.job").get("ok") is True and marker() is None
+          and hold_listed() == "advisory",
+          "a later version that asks for a hold again: advisory, not the mark set for an older one: %s" % hold_listed())
+    # A removal whose write of state.json fails (a directory where its new copy goes): the package stays, and so
+    # do its settings.
+    kept_settings = os.path.join(root, "settings", H + ".json")
+    os.makedirs(os.path.dirname(kept_settings), exist_ok=True)
+    with open(kept_settings, "w") as f:
+        f.write("{}\n")
+    os.mkdir(os.path.join(root, "state.json.new"))
+    r = w.run("remove", H)
+    os.rmdir(os.path.join(root, "state.json.new"))
+    check(r.get("ok") is False and hold_listed() == "advisory" and os.path.isfile(kept_settings),
+          "a removal that could not write the state: still installed, its settings kept: %s %s"
+          % (r.get("error"), os.path.isfile(kept_settings)))
+    f_ = stopped_hosts_file()
+    check(w.run("remove", H).get("ok") is True and not os.path.isfile(kept_settings) and not os.path.exists(f_)
+          and hold_listed() == "gone", "removed: its settings and its hold file go")
+
     # An install that fails after current has turned, at the write of state.json (a directory where its new copy
     # goes): current turns back to the version the state names, and nothing the state names is deleted. The kept
     # predecessor installed again, an update, and a first install, each refused that way. current is read after the

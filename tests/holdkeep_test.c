@@ -8,7 +8,10 @@
  * the files are there at once, their timestamps stay fresh while the main
  * loop speaks and stop when it goes silent, a package that is no longer
  * named loses its file, a previous host's files stay until this one has
- * spoken, and a clean stop leaves the required ones to go stale.
+ * spoken, and a clean stop leaves the required ones to go stale. A raise
+ * between turns is on disk when it returns, only toward raised and only
+ * for a package the turn named; a claim is on disk when it returns; a
+ * required-hold marker holds the modes it was given.
  */
 #include "../src/holdkeep.h"
 
@@ -38,11 +41,11 @@ static void nap(double s)
     nanosleep(&t, NULL);
 }
 
-/* The file of one package: 1 when it is there, with its fields. */
-static int look(const char *id, int *required, int *raised, char *reason, size_t rlen, double *age)
+/* The file of one package under d: 1 when it is there, with its fields. */
+static int look_at(const char *d, const char *id, int *required, int *raised, char *reason, size_t rlen, double *age)
 {
     char p[400];
-    snprintf(p, sizeof(p), "%s/%s.json", dir, id);
+    snprintf(p, sizeof(p), "%s/%s.json", d, id);
     json_t *j = json_load_file(p, 0, NULL);
     if (!j)
         return 0;
@@ -53,6 +56,11 @@ static int look(const char *id, int *required, int *raised, char *reason, size_t
     int ok = !strcmp(json_string_value(json_object_get(j, "id")) ? json_string_value(json_object_get(j, "id")) : "", id);
     json_decref(j);
     return ok;
+}
+
+static int look(const char *id, int *required, int *raised, char *reason, size_t rlen, double *age)
+{
+    return look_at(dir, id, required, raised, reason, rlen, age);
 }
 
 int main(void)
@@ -149,8 +157,42 @@ int main(void)
     nap(1.2);
     CHECK(look("org.example.badge", &req, &up, why, sizeof(why), &age) && age > 1.0, "and nobody refreshes it after the stop: age %.2f", age);
 
+    /* A raise that does not wait for the turn, on a keeper whose own thread writes nothing (its main
+     * loop is silent from the start): what reaches the disk is the set's write and the raise's own. */
+    static char dir2[] = "/tmp/holdkeep-raise-XXXXXX";
+    static holdkeep_t k2;
+    CHECK(mkdtemp(dir2) && holdkeep_start(&k2, dir2, 0.0, err, sizeof(err)) == 0, "the second keeper did not start: %s", err);
+    hold_decide("org.example.filter", 0, 1, 0, 0, NULL, &e[0]);
+    holdkeep_set(&k2, e, 1);
+    CHECK(look_at(dir2, "org.example.filter", &req, &up, why, sizeof(why), &age) && !up, "the advisory hold is clear");
+    CHECK(holdkeep_raise(&k2, "org.example.filter", "the exhaust is off") == 1 &&
+          look_at(dir2, "org.example.filter", &req, &up, why, sizeof(why), &age) && up && !strcmp(why, "the exhaust is off"),
+          "a raise is not on disk when it returns: raised %d, %s", up, why);
+    CHECK(holdkeep_raise(&k2, "org.example.filter", "other words") == 1 &&
+          look_at(dir2, "org.example.filter", &req, &up, why, sizeof(why), &age) && up && !strcmp(why, "the exhaust is off"),
+          "a raise over a raised hold changed its words: %s", why);
+    CHECK(holdkeep_raise(&k2, "org.example.unnamed", "words") == 0 &&
+          !look_at(dir2, "org.example.unnamed", &req, &up, why, sizeof(why), &age),
+          "a raise added a package the turn does not name");
+    CHECK(holdkeep_claim(&k2, "org.example.claim", "keeps the Grbl sender out") == 0 &&
+          look_at(dir2, "org.example.claim", &req, &up, why, sizeof(why), &age) && up,
+          "a claim is not on disk when it returns");
+    holdkeep_stop(&k2);
+    char mpath[400], mtext[32] = "";
+    snprintf(mpath, sizeof(mpath), "%s/org.example.m", dir2);
+    for (int i = 0; i < 4; i++) {
+        static const char *const want[] = { "", "grbl\n", "cloud\n", "grbl cloud\n" };
+        CHECK(holdkeep_marker_write(dir2, "org.example.m", i & 1, (i >> 1) & 1) == 0, "the marker was not written");
+        FILE *mf = fopen(mpath, "r");
+        size_t n = mf ? fread(mtext, 1, sizeof(mtext) - 1, mf) : 0;
+        mtext[n] = '\0';
+        if (mf)
+            fclose(mf);
+        CHECK(!strcmp(mtext, want[i]), "the marker for grbl %d cloud %d holds '%s'", i & 1, (i >> 1) & 1, mtext);
+    }
+
     char cmd[300];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    snprintf(cmd, sizeof(cmd), "rm -rf %s %s", dir, dir2);
     if (system(cmd) != 0)
         fails++;
     printf("%s: holdkeep_test, %d failure%s\n", fails ? "FAIL" : "PASS", fails, fails == 1 ? "" : "s");
